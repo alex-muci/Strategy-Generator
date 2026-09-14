@@ -45,6 +45,7 @@ def synthetic_ohlc(
     trend_vol: float = 0.010,
     range_vol: float = 0.006,
     trend_drift: float = 0.0009,
+    trend_prob: float = 0.45,
     start_date: str = "2015-01-01",
 ) -> pd.DataFrame:
     """Generate a synthetic daily OHLC series that alternates between
@@ -66,7 +67,7 @@ def synthetic_ohlc(
 
     while len(closes) < n_bars:
         if bars_left <= 0:
-            regime = rng.choice(["trend", "range"], p=[0.45, 0.55])
+            regime = rng.choice(["trend", "range"], p=[trend_prob, 1 - trend_prob])
             bars_left = rng.integers(*regime_len_range)
             direction = rng.choice([-1, 1])
             mean_level = closes[-1]

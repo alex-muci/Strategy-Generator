@@ -4,115 +4,205 @@ portfolio.py
 Ranger's "portfolio concept": don't pick the single best strategy,
 build a family whose return streams don't all rise and fall together.
 
-Given many templates' out-of-sample (walk-forward) equity curves,
+Given many templates' out-of-sample (walk-forward) return streams,
 this module:
-  1. filters out weak/overfit-looking candidates (min Sharpe, min trades)
+  1. filters out weak/overfit-looking candidates (min OOS Sharpe, min
+     windows, optionally Pardo's WFA criteria)
   2. computes the correlation matrix of their daily OOS returns
-  3. greedily builds a subset that maximizes the equal-weight
-     portfolio's Sharpe ratio, only adding candidates that stay below
-     a correlation ceiling with everything already selected
+  3. picks a subset either greedily (best Sharpe first, add only
+     candidates below a correlation ceiling while the portfolio Sharpe
+     improves) or by hierarchical clustering (best member of each
+     correlation cluster)
+  4. weights it equally or with Hierarchical Risk Parity (AFML ch. 16)
+
+The catch -- and the reason for `walk_forward_portfolio` -- is that
+step 1-3 look at the WHOLE out-of-sample history. Selecting the best of
+hundreds of "OOS" curves makes the resulting portfolio curve in-sample
+again. The nested walk-forward re-runs the selection at every window
+boundary using only the OOS history available up to then and applies
+it to the next window: a "doubly out-of-sample" curve, which is the
+honest number to quote.
 """
 
 from __future__ import annotations
 import numpy as np
 import pandas as pd
+from scipy.cluster.hierarchy import linkage, fcluster
+from scipy.spatial.distance import squareform
+
+from strategy import annualized_sharpe
+from robustness import hrp_weights
 
 
-def _returns_frame(wfa_results: dict) -> pd.DataFrame:
-    """wfa_results: {name: walk_forward() output dict} -> DataFrame of
-    daily returns, one column per template, aligned on the union of dates,
-    missing days (before a strategy's first OOS trade window) filled with 0."""
-    series = {}
+def returns_frame(wfa_results: dict) -> pd.DataFrame:
+    """{name: walk_forward() output} -> DataFrame of per-bar OOS returns,
+    one column per template, on the dates every template has covered."""
+    series = {name: res["oos_returns"] for name, res in wfa_results.items() if len(res["oos_returns"]) > 2}
+    if not series:
+        return pd.DataFrame()
+    return pd.concat(series, axis=1, join="inner").fillna(0.0)
+
+
+def candidate_table(wfa_results: dict, rets: pd.DataFrame) -> pd.DataFrame:
+    rows = []
     for name, res in wfa_results.items():
-        eq = res["oos_equity"]
-        if len(eq) < 3:
-            continue
-        series[name] = eq.pct_change().fillna(0.0)
-    return pd.DataFrame(series).fillna(0.0)
+        s = res["summary"]
+        rows.append(dict(
+            template=name,
+            oos_sharpe=annualized_sharpe(rets[name]) if name in rets.columns else 0.0,
+            oos_cagr=s["oos_cagr"], oos_max_dd=s["oos_max_drawdown"],
+            wfe=s["wfe"], pct_profitable_windows=s["pct_profitable_windows"],
+            n_windows=s["n_windows"], n_trades_oos=s["n_trades_oos"],
+            param_change_rate=s["param_change_rate"], pardo_pass=s["pardo_pass"],
+        ))
+    return pd.DataFrame(rows).set_index("template")
 
 
-def _sharpe(rets: pd.Series) -> float:
-    if rets.std() == 0 or rets.empty:
-        return 0.0
-    return rets.mean() / rets.std() * np.sqrt(252)
+def _qualifying(table: pd.DataFrame, min_sharpe, min_windows, require_pardo, min_wfe, min_trades):
+    q = (table["oos_sharpe"] >= min_sharpe) & (table["n_windows"] >= min_windows) & (table["n_trades_oos"] >= min_trades)
+    if require_pardo:
+        q &= table["pardo_pass"]
+    if min_wfe is not None:
+        q &= table["wfe"].fillna(-np.inf) >= min_wfe
+    return list(table.index[q])
+
+
+def select_subset(rets: pd.DataFrame, candidates: list, method: str = "greedy",
+                  max_strategies: int = 8, corr_ceiling: float = 0.6) -> list:
+    """Pick a diversified subset of `candidates` (columns of `rets`)."""
+    if not candidates:
+        return []
+    sharpes = {c: annualized_sharpe(rets[c]) for c in candidates}
+    ranked = sorted(candidates, key=lambda c: sharpes[c], reverse=True)
+    if len(candidates) == 1:
+        return ranked
+
+    if method == "cluster":
+        corr = rets[candidates].corr().fillna(0.0)
+        dist = np.sqrt(0.5 * (1 - corr.clip(-1, 1))).to_numpy().copy()
+        np.fill_diagonal(dist, 0.0)
+        link = linkage(squareform(dist, checks=False), method="average")
+        labels = fcluster(link, t=min(max_strategies, len(candidates)), criterion="maxclust")
+        chosen = {}
+        for name, lab in zip(candidates, labels):
+            if lab not in chosen or sharpes[name] > sharpes[chosen[lab]]:
+                chosen[lab] = name
+        return sorted(chosen.values(), key=lambda c: sharpes[c], reverse=True)
+
+    # greedy: start with the best, add while the equal-weight Sharpe improves
+    corr = rets[candidates].corr()
+    selected = [ranked[0]]
+    for _ in range(max_strategies - 1):
+        current = annualized_sharpe(rets[selected].mean(axis=1))
+        best_c, best_s = None, current
+        for name in ranked:
+            if name in selected:
+                continue
+            if any(abs(corr.loc[name, s]) > corr_ceiling for s in selected):
+                continue
+            sh = annualized_sharpe(rets[selected + [name]].mean(axis=1))
+            if sh > best_s:
+                best_s, best_c = sh, name
+        if best_c is None:
+            break
+        selected.append(best_c)
+    return selected
+
+
+def portfolio_weights(rets: pd.DataFrame, weighting: str = "equal") -> pd.Series:
+    if rets.shape[1] == 0:
+        return pd.Series(dtype=float)
+    if weighting == "hrp":
+        w = hrp_weights(rets)
+        return w / w.sum()
+    return pd.Series(1.0 / rets.shape[1], index=rets.columns)
 
 
 def select_portfolio(
     wfa_results: dict,
     min_sharpe: float = 0.2,
     min_windows: int = 3,
+    min_trades: int = 10,
     max_strategies: int = 8,
     corr_ceiling: float = 0.6,
-):
-    """Returns dict with:
-      selected      : list of template names chosen for the portfolio
-      corr_matrix   : full correlation matrix (all qualifying candidates)
-      portfolio_returns : equal-weight daily returns of the selected set
-      portfolio_equity  : cumulative equity of the selected set
-      candidate_stats   : per-candidate OOS Sharpe / return / trades used for filtering
+    require_pardo: bool = False,
+    min_wfe: float | None = None,
+    method: str = "greedy",
+    weighting: str = "equal",
+    initial_equity: float = 100_000.0,
+) -> dict:
+    """Static (full-history) portfolio selection. Returns dict with:
+      selected, weights, corr_matrix, portfolio_returns, portfolio_equity,
+      candidate_stats (DataFrame, one row per template), qualifying (list)
     """
-    rets = _returns_frame(wfa_results)
+    rets = returns_frame(wfa_results)
+    table = candidate_table(wfa_results, rets)
+    qualifying = _qualifying(table, min_sharpe, min_windows, require_pardo, min_wfe, min_trades)
+    selected = select_subset(rets, qualifying, method, max_strategies, corr_ceiling)
 
-    candidate_stats = {}
-    qualifying = []
-    for name, res in wfa_results.items():
-        if name not in rets.columns:
-            continue
-        s = _sharpe(rets[name])
-        n_windows = len(res["windows"])
-        candidate_stats[name] = {"sharpe": s, "n_windows": n_windows}
-        if s >= min_sharpe and n_windows >= min_windows:
-            qualifying.append(name)
+    if not selected:
+        return dict(selected=[], weights=pd.Series(dtype=float), corr_matrix=pd.DataFrame(),
+                    portfolio_returns=pd.Series(dtype=float), portfolio_equity=pd.Series(dtype=float),
+                    candidate_stats=table, qualifying=qualifying)
 
-    if not qualifying:
-        return dict(
-            selected=[],
-            corr_matrix=pd.DataFrame(),
-            portfolio_returns=pd.Series(dtype=float),
-            portfolio_equity=pd.Series(dtype=float),
-            candidate_stats=candidate_stats,
-        )
-
-    corr_matrix = rets[qualifying].corr()
-
-    # greedy build: start with the highest-Sharpe qualifying candidate
-    ranked = sorted(qualifying, key=lambda nm: candidate_stats[nm]["sharpe"], reverse=True)
-    selected = [ranked[0]]
-
-    for _ in range(max_strategies - 1):
-        best_candidate, best_sharpe = None, -np.inf
-        for name in ranked:
-            if name in selected:
-                continue
-            # correlation ceiling vs everything already selected
-            if any(abs(corr_matrix.loc[name, s]) > corr_ceiling for s in selected):
-                continue
-            trial = selected + [name]
-            combo_rets = rets[trial].mean(axis=1)
-            sh = _sharpe(combo_rets)
-            if sh > best_sharpe:
-                best_sharpe, best_candidate = sh, name
-        if best_candidate is None:
-            break
-        # only keep adding if it actually improves the portfolio Sharpe
-        current_sharpe = _sharpe(rets[selected].mean(axis=1))
-        if best_sharpe > current_sharpe:
-            selected.append(best_candidate)
-        else:
-            break
-
-    portfolio_returns = rets[selected].mean(axis=1)
-    
-    portfolio_equity = 100_000.0 * (1 + portfolio_returns).cumprod()
-    if not portfolio_returns.empty:
-        start_date = rets.index[0] - pd.Timedelta(days=1)
-        portfolio_equity = pd.concat([pd.Series([100_000.0], index=[start_date]), portfolio_equity])
-
-
+    weights = portfolio_weights(rets[selected], weighting)
+    port_rets = (rets[selected] * weights).sum(axis=1)
     return dict(
         selected=selected,
-        corr_matrix=corr_matrix,
-        portfolio_returns=portfolio_returns,
-        portfolio_equity=portfolio_equity,
-        candidate_stats=candidate_stats,
+        weights=weights,
+        corr_matrix=rets[qualifying].corr(),
+        portfolio_returns=port_rets,
+        portfolio_equity=initial_equity * (1 + port_rets).cumprod(),
+        candidate_stats=table,
+        qualifying=qualifying,
+    )
+
+
+def walk_forward_portfolio(
+    rets: pd.DataFrame,
+    boundaries: list,
+    min_history_windows: int = 4,
+    min_sharpe: float = 0.2,
+    min_trades_proxy: int = 0,
+    max_strategies: int = 8,
+    corr_ceiling: float = 0.6,
+    method: str = "greedy",
+    weighting: str = "equal",
+    initial_equity: float = 100_000.0,
+) -> dict:
+    """Nested walk-forward of the PORTFOLIO SELECTION itself.
+
+    At each test-window boundary (after `min_history_windows` windows of
+    OOS history exist) the candidate filter, subset selection and weights
+    are recomputed from the OOS returns realised SO FAR, then held over
+    the next window. Nothing about the future enters the choice, so the
+    resulting curve is out-of-sample with respect to both the parameter
+    optimization and the template selection.
+    """
+    boundaries = sorted(set(boundaries))
+    parts, log = [], []
+    for j in range(min_history_windows, len(boundaries)):
+        start = boundaries[j]
+        end = boundaries[j + 1] if j + 1 < len(boundaries) else None
+        hist = rets.loc[: start - pd.Timedelta(nanoseconds=1)]
+        if len(hist) < 60:
+            continue
+        sharpes = hist.apply(annualized_sharpe)
+        cands = list(sharpes.index[sharpes >= min_sharpe])
+        sel = select_subset(hist, cands, method, max_strategies, corr_ceiling)
+        block = rets.loc[start:end] if end is None else rets.loc[start: end - pd.Timedelta(nanoseconds=1)]
+        if not sel or block.empty:
+            parts.append(pd.Series(0.0, index=block.index))
+            log.append(dict(period_start=start, selected=[], weights={}))
+            continue
+        w = portfolio_weights(hist[sel], weighting)
+        parts.append((block[sel] * w).sum(axis=1))
+        log.append(dict(period_start=start, selected=sel, weights=w.round(3).to_dict()))
+
+    port = pd.concat(parts) if parts else pd.Series(dtype=float)
+    return dict(
+        portfolio_returns=port,
+        portfolio_equity=initial_equity * (1 + port).cumprod() if len(port) else pd.Series(dtype=float),
+        selections=log,
+        sharpe=annualized_sharpe(port) if len(port) > 2 else 0.0,
     )
