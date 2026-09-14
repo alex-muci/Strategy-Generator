@@ -163,10 +163,39 @@ def cpcv(
 # Probability of Backtest Overfitting  (CSCV; AFML 11.6, Bailey et al. 2015)
 # --------------------------------------------------------------------------
 
-def cscv_pbo(R: np.ndarray, n_partitions: int = 16, max_combinations: int = 20000, seed: int = 0) -> dict:
+def cscv_partitions(T: int, n_partitions: int = 16) -> int:
+    """Number of CSCV blocks actually used (always even)."""
+    return n_partitions if n_partitions % 2 == 0 else n_partitions + 1
+
+
+def cscv_block_stats(R: np.ndarray, n_partitions: int = 16) -> dict:
+    """Per-block sufficient statistics of a trials matrix: with these the
+    Sharpe of ANY union of blocks is O(N), and a family of thousands of
+    templates can be pooled without ever holding all their returns."""
+    T, N = R.shape
+    S = cscv_partitions(T, n_partitions)
+    bounds = np.linspace(0, T, S + 1).astype(int)
+    sums = np.stack([R[bounds[b]:bounds[b + 1]].sum(axis=0) for b in range(S)])
+    sumsq = np.stack([(R[bounds[b]:bounds[b + 1]] ** 2).sum(axis=0) for b in range(S)])
+    counts = np.array([bounds[b + 1] - bounds[b] for b in range(S)], dtype=float)
+    return dict(sums=sums, sumsq=sumsq, counts=counts)
+
+
+def merge_block_stats(parts: list) -> dict:
+    """Pool block stats of several templates (same T and n_partitions)."""
+    return dict(
+        sums=np.concatenate([p["sums"] for p in parts], axis=1),
+        sumsq=np.concatenate([p["sumsq"] for p in parts], axis=1),
+        counts=parts[0]["counts"],
+    )
+
+
+def cscv_pbo(R: np.ndarray | None = None, n_partitions: int = 16, max_combinations: int = 20000,
+             seed: int = 0, blocks: dict | None = None) -> dict:
     """Combinatorially Symmetric Cross-Validation.
 
-    R : T x N per-bar returns of N trials (strategy variants).
+    R : T x N per-bar returns of N trials (strategy variants), or pass
+    `blocks` from cscv_block_stats / merge_block_stats instead.
     The rows are split into n_partitions contiguous blocks; for every
     way of choosing half the blocks as in-sample (IS) the best IS trial
     is located and its RANK among all trials out-of-sample (OOS) is
@@ -176,18 +205,15 @@ def cscv_pbo(R: np.ndarray, n_partitions: int = 16, max_combinations: int = 2000
     Also returns the OOS-vs-IS Sharpe degradation regression and the
     probability that the IS winner loses money OOS.
     """
-    T, N = R.shape
-    S = n_partitions if n_partitions % 2 == 0 else n_partitions + 1
-    bounds = np.linspace(0, T, S + 1).astype(int)
-    # per-block sufficient statistics -> Sharpe of any block union in O(N)
-    sums = np.stack([R[bounds[b]:bounds[b + 1]].sum(axis=0) for b in range(S)])
-    sumsq = np.stack([(R[bounds[b]:bounds[b + 1]] ** 2).sum(axis=0) for b in range(S)])
-    counts = np.array([bounds[b + 1] - bounds[b] for b in range(S)], dtype=float)
+    if blocks is None:
+        blocks = cscv_block_stats(R, n_partitions)
+    sums, sumsq, counts = blocks["sums"], blocks["sumsq"], blocks["counts"]
+    S, N = sums.shape
 
-    def sharpe_of(blocks):
-        n = counts[list(blocks)].sum()
-        s = sums[list(blocks)].sum(axis=0)
-        q = sumsq[list(blocks)].sum(axis=0)
+    def sharpe_of(blk):
+        n = counts[list(blk)].sum()
+        s = sums[list(blk)].sum(axis=0)
+        q = sumsq[list(blk)].sum(axis=0)
         mean = s / n
         var = np.maximum(q / n - mean ** 2, 0) * n / max(n - 1, 1)
         sd = np.sqrt(var)

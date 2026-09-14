@@ -96,6 +96,24 @@ class EngineTests(unittest.TestCase):
         if not opened_next:
             self.assertAlmostEqual(eq.iloc[i], eq.iloc[i + 1])
 
+    def test_jit_kernel_matches_pure_python(self):
+        """The Numba-compiled loop and the plain-Python loop must agree exactly."""
+        import strategy as S
+        if not S.HAVE_NUMBA:
+            self.skipTest("numba not installed")
+        fast = S._bar_loop_fast
+        try:
+            S._bar_loop_fast = S._bar_loop      # plain Python
+            for tpl in generate_templates("full")[::211]:
+                slow = backtest(self.df, tpl)
+                S._bar_loop_fast = fast
+                quick = backtest(self.df, tpl)
+                S._bar_loop_fast = S._bar_loop
+                np.testing.assert_allclose(slow["equity"].values, quick["equity"].values, rtol=0, atol=1e-9, err_msg=tpl.name)
+                self.assertEqual(len(slow["trades"]), len(quick["trades"]), tpl.name)
+        finally:
+            S._bar_loop_fast = fast
+
     def test_indicators_ranges(self):
         c = self.df["Close"]
         self.assertTrue(((cti(c, 20).dropna().abs()) <= 1).all())

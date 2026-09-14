@@ -293,52 +293,357 @@ class StrategyTemplate:
 
 
 # --------------------------------------------------------------------------
-# Backtest engine (single asset, bar-by-bar for correct stateful exits)
+# Indicator cache
 # --------------------------------------------------------------------------
+# Walk-forward re-runs the same template on the same slice for every grid
+# point, so most indicator arrays are recomputed dozens of times. Keyed on
+# the slice's shape, date range, a few sampled closes and the indicator
+# spec, this cache removes that redundancy (each worker process has its own).
 
-def _compute_indicators(df: pd.DataFrame, tpl: StrategyTemplate) -> dict:
+_IND_CACHE: dict = {}
+_IND_CACHE_MAX = 4096
+
+
+def _df_key(df: pd.DataFrame, close=None) -> tuple:
+    c = df["Close"].to_numpy() if close is None else close
+    n = len(c)
+    return (n, df.index[0], df.index[-1], float(c[0]), float(c[n // 3]), float(c[(2 * n) // 3]), float(c[-1]))
+
+
+def _cached(df: pd.DataFrame, spec: tuple, fn, dfkey=None):
+    key = (_df_key(df) if dfkey is None else dfkey, spec)
+    arr = _IND_CACHE.get(key)
+    if arr is None:
+        if len(_IND_CACHE) >= _IND_CACHE_MAX:
+            _IND_CACHE.clear()
+        arr = fn()
+        _IND_CACHE[key] = arr
+    return arr
+
+
+def _to_arr(x) -> np.ndarray:
+    return np.ascontiguousarray(np.asarray(x, dtype=np.float64))
+
+
+def _channel_arrays(df, kind, n, k, atr_n, dfkey=None):
+    def build():
+        up, lo, mid = channel(df, kind, n, k, atr_n)
+        return (_to_arr(up), _to_arr(lo), _to_arr(mid))
+    return _cached(df, ("channel", kind, n, k if kind != "donchian" else 0.0, atr_n if kind == "keltner" else 0), build, dfkey)
+
+
+def _compute_indicators(df: pd.DataFrame, tpl: StrategyTemplate, dfkey=None) -> dict:
     """All indicator arrays needed by `tpl`, plus a boolean `ready` array:
     ready[i] is True when every indicator used by this template is fully
     formed on bar i. Only indicators the template actually uses count
     toward the warm-up, so a template without a vol filter does not waste
     100 bars of every training window waiting for one."""
+    n = len(df)
     ind = {}
-    ready = np.ones(len(df), dtype=bool)
+    ready = np.ones(n, dtype=np.bool_)
+    dfkey = _df_key(df) if dfkey is None else dfkey
 
-    def use(name, series):
-        arr = np.asarray(series, dtype=float)
+    def use(name, arr):
         ind[name] = arr
         nonlocal ready
         ready = ready & ~np.isnan(arr)
 
-    up, lo, mid = channel(df, tpl.channel_type, tpl.n_entry, tpl.channel_k, tpl.atr_n)
+    up, lo, _ = _channel_arrays(df, tpl.channel_type, tpl.n_entry, tpl.channel_k, tpl.atr_n, dfkey)
     use("upper", up)
     use("lower", lo)
-    use("atr", atr(df, tpl.atr_n))
+    use("atr", _cached(df, ("atr", tpl.atr_n), lambda: _to_arr(atr(df, tpl.atr_n)), dfkey))
 
     if tpl.exit_style == "channel":
-        upx, lox, midx = channel(df, tpl.channel_type, tpl.n_exit, tpl.channel_k, tpl.atr_n)
+        upx, lox, midx = _channel_arrays(df, tpl.channel_type, tpl.n_exit, tpl.channel_k, tpl.atr_n, dfkey)
         use("upper_x", upx)
         use("lower_x", lox)
         use("mid_x", midx)
 
     if tpl.regime_filter != "none":
         spec = REGIME_INDICATORS[tpl.regime_indicator]
-        n = tpl.regime_n if tpl.regime_n > 0 else spec["n"]
-        use("regime", spec["fn"](df, n))
+        rn = tpl.regime_n if tpl.regime_n > 0 else spec["n"]
+        use("regime", _cached(df, ("regime", tpl.regime_indicator, rn), lambda: _to_arr(spec["fn"](df, rn)), dfkey))
         ind["regime_threshold"] = (
             tpl.regime_threshold if not np.isnan(tpl.regime_threshold) else spec["threshold"]
         )
 
     if tpl.vol_filter:
-        a = atr(df, tpl.atr_n)
-        use("vol_rank", a.rolling(tpl.vol_lookback).rank(pct=True))
+        use("vol_rank", _cached(df, ("vol_rank", tpl.atr_n, tpl.vol_lookback),
+                                lambda: _to_arr(atr(df, tpl.atr_n).rolling(tpl.vol_lookback).rank(pct=True)), dfkey))
 
     if tpl.bias_filter == "sma":
-        use("bias", sma(df["Close"], tpl.bias_n))
+        use("bias", _cached(df, ("sma", tpl.bias_n), lambda: _to_arr(sma(df["Close"], tpl.bias_n)), dfkey))
 
     ind["ready"] = ready
     return ind
+
+
+# --------------------------------------------------------------------------
+# Backtest engine (single asset, bar-by-bar for correct stateful exits)
+# --------------------------------------------------------------------------
+
+ENTRY_CODES = {"stop": 0, "close_confirm": 1, "pullback": 2}
+EXIT_CODES = {"channel": 0, "atr_trail": 1, "target_stop": 2, "time_stop": 3}
+REGIME_CODES = {"none": 0, "trend_only": 1, "range_only": 2}
+REASONS = ["stop", "channel", "midline", "target", "time", "stop_same_bar"]
+
+
+def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
+              upper_x, lower_x, mid_x, regime, vol_rank, bias,
+              is_trend, entry_style, exit_style, regime_mode, regime_thr,
+              has_vol, vol_low, vol_high, has_bias,
+              atr_mult_stop, atr_mult_target, atr_mult_trail, pullback_atr_mult,
+              pullback_valid_bars, max_hold_bars, risk_pct, max_leverage, cost_rate,
+              initial_equity):
+    """The bar loop. Plain numpy code so numba can compile it unchanged;
+    the pure-Python version is used when numba is not installed.
+
+    Returns equity, entries and the closed-trade columns
+    (entry_bar, exit_bar, side, entry_px, exit_px, shares, pnl, cost, reason, count)."""
+    n = len(close)
+    equity = np.empty(n)
+    entries = np.zeros(n, dtype=np.int8)
+    t_entry = np.empty(n, dtype=np.int64)
+    t_exit = np.empty(n, dtype=np.int64)
+    t_side = np.empty(n, dtype=np.int64)
+    t_reason = np.empty(n, dtype=np.int64)
+    t_entry_px = np.empty(n)
+    t_exit_px = np.empty(n)
+    t_shares = np.empty(n)
+    t_pnl = np.empty(n)
+    t_cost = np.empty(n)
+    n_trades = 0
+
+    cash = initial_equity
+    position = 0
+    shares = 0.0
+    entry_price = 0.0
+    stop_price = 0.0
+    target_price = 0.0
+    trail_extreme = 0.0
+    entry_bar = -1
+    entry_cost = 0.0
+    pend_active = False
+    pend_side = 0
+    pend_level = 0.0
+    pend_expires = 0
+
+    equity[0] = initial_equity
+    for i in range(1, n):
+        if not ready[i - 1]:
+            equity[i] = cash + (position * shares * (close[i] - entry_price) if position != 0 else 0.0)
+            continue
+
+        a = atr_v[i - 1]
+        if not (a > 0):
+            equity[i] = cash + (position * shares * (close[i] - entry_price) if position != 0 else 0.0)
+            continue
+
+        # ---- manage open position: exits (checked intrabar on bar i) ----
+        if position != 0:
+            exit_price = 0.0
+            reason = -1
+            side = position
+            stop_level = stop_price  # hard stop is always active
+
+            if exit_style == 1:
+                # trailing level from the extreme up to bar i-1 (no intrabar look-ahead)
+                trail_stop = trail_extreme - side * atr_mult_trail * a
+                if side == 1:
+                    stop_level = max(stop_level, trail_stop)
+                else:
+                    stop_level = min(stop_level, trail_stop)
+
+            if side == 1 and low[i] <= stop_level:
+                exit_price = min(open_[i], stop_level)
+                reason = 0
+            elif side == -1 and high[i] >= stop_level:
+                exit_price = max(open_[i], stop_level)
+                reason = 0
+
+            if reason < 0:
+                if exit_style == 0:
+                    if is_trend:
+                        if side == 1 and low[i] <= lower_x[i - 1]:
+                            exit_price = min(open_[i], lower_x[i - 1])
+                            reason = 1
+                        elif side == -1 and high[i] >= upper_x[i - 1]:
+                            exit_price = max(open_[i], upper_x[i - 1])
+                            reason = 1
+                    else:
+                        if side == 1 and high[i] >= mid_x[i - 1]:
+                            exit_price = max(open_[i], mid_x[i - 1])
+                            reason = 2
+                        elif side == -1 and low[i] <= mid_x[i - 1]:
+                            exit_price = min(open_[i], mid_x[i - 1])
+                            reason = 2
+                elif exit_style == 2:
+                    if side == 1 and high[i] >= target_price:
+                        exit_price = max(open_[i], target_price)
+                        reason = 3
+                    elif side == -1 and low[i] <= target_price:
+                        exit_price = min(open_[i], target_price)
+                        reason = 3
+                elif exit_style == 3:
+                    if i - entry_bar >= max_hold_bars:
+                        exit_price = open_[i]
+                        reason = 4
+
+            if reason >= 0:
+                gross = position * shares * (exit_price - entry_price)
+                xcost = cost_rate * shares * exit_price
+                cash += gross - xcost
+                t_entry[n_trades] = entry_bar
+                t_exit[n_trades] = i
+                t_side[n_trades] = position
+                t_entry_px[n_trades] = entry_price
+                t_exit_px[n_trades] = exit_price
+                t_shares[n_trades] = shares
+                t_pnl[n_trades] = gross - xcost - entry_cost
+                t_cost[n_trades] = entry_cost + xcost
+                t_reason[n_trades] = reason
+                n_trades += 1
+                position = 0
+                shares = 0.0
+                equity[i] = cash
+                continue  # no re-entry on the exit bar
+
+            if exit_style == 1:
+                if side == 1:
+                    trail_extreme = max(trail_extreme, high[i])
+                else:
+                    trail_extreme = min(trail_extreme, low[i])
+
+        # ---- filters (previous bar's fully-formed values) ----
+        can_enter = True
+        if regime_mode == 1:
+            can_enter = regime[i - 1] >= regime_thr
+        elif regime_mode == 2:
+            can_enter = regime[i - 1] < regime_thr
+        if can_enter and has_vol:
+            can_enter = vol_low <= vol_rank[i - 1] <= vol_high
+
+        long_ok = True
+        short_ok = True
+        if has_bias:
+            long_ok = close[i - 1] > bias[i - 1]
+            short_ok = close[i - 1] < bias[i - 1]
+
+        fill_side = 0
+        fill_px = 0.0
+
+        # ---- pending pullback order ----
+        if position == 0 and pend_active:
+            if pend_side == 1 and low[i] <= pend_level:
+                fill_side = 1
+                fill_px = min(open_[i], pend_level)
+                pend_active = False
+            elif pend_side == -1 and high[i] >= pend_level:
+                fill_side = -1
+                fill_px = max(open_[i], pend_level)
+                pend_active = False
+            elif i >= pend_expires:
+                pend_active = False
+
+        # ---- new entry signals (based on previous bar's channel) ----
+        if position == 0 and fill_side == 0 and not pend_active and can_enter:
+            if entry_style == 1:
+                ok = i >= 2 and ready[i - 2]
+                broke_up = ok and close[i - 1] > upper[i - 2]
+                broke_down = ok and close[i - 1] < lower[i - 2]
+                level_up = open_[i]
+                level_down = open_[i]
+            else:
+                broke_up = high[i] >= upper[i - 1]
+                broke_down = low[i] <= lower[i - 1]
+                level_up = upper[i - 1]
+                level_down = lower[i - 1]
+
+            side = 0
+            level = 0.0
+            if is_trend:
+                if broke_up and long_ok:
+                    side = 1
+                    level = level_up
+                elif broke_down and short_ok:
+                    side = -1
+                    level = level_down
+            else:
+                if broke_down and long_ok:
+                    side = 1
+                    level = level_down
+                elif broke_up and short_ok:
+                    side = -1
+                    level = level_up
+
+            if side != 0:
+                if entry_style == 1:
+                    fill_side = side
+                    fill_px = open_[i]
+                elif entry_style == 0:
+                    if is_trend:
+                        fill_px = max(open_[i], level) if side == 1 else min(open_[i], level)
+                    else:
+                        fill_px = min(open_[i], level) if side == 1 else max(open_[i], level)
+                    fill_side = side
+                else:
+                    pend_active = True
+                    pend_side = side
+                    pend_level = level - side * pullback_atr_mult * a
+                    pend_expires = i + pullback_valid_bars
+
+        # ---- open the position ----
+        entered = False
+        if fill_side != 0:
+            stop_dist = atr_mult_stop * a
+            qty = cash * risk_pct / stop_dist
+            qty = min(qty, max_leverage * cash / fill_px)
+            if qty > 0:
+                entry_cost = cost_rate * qty * fill_px
+                cash -= entry_cost
+                position = fill_side
+                shares = qty
+                entry_price = fill_px
+                stop_price = fill_px - fill_side * stop_dist
+                target_price = fill_px + fill_side * atr_mult_target * a
+                trail_extreme = fill_px
+                entry_bar = i
+                entries[i] = 1
+                entered = True
+
+        # ---- conservative same-bar stop check on the entry bar ----
+        if entered:
+            hit = (position == 1 and low[i] <= stop_price) or (position == -1 and high[i] >= stop_price)
+            if hit:
+                gross = position * shares * (stop_price - entry_price)
+                xcost = cost_rate * shares * stop_price
+                cash += gross - xcost
+                t_entry[n_trades] = entry_bar
+                t_exit[n_trades] = i
+                t_side[n_trades] = position
+                t_entry_px[n_trades] = entry_price
+                t_exit_px[n_trades] = stop_price
+                t_shares[n_trades] = shares
+                t_pnl[n_trades] = gross - xcost - entry_cost
+                t_cost[n_trades] = entry_cost + xcost
+                t_reason[n_trades] = 5
+                n_trades += 1
+                position = 0
+                shares = 0.0
+
+        # ---- mark to market at the close of bar i ----
+        equity[i] = cash + (position * shares * (close[i] - entry_price) if position != 0 else 0.0)
+
+    return (equity, entries, t_entry, t_exit, t_side, t_entry_px, t_exit_px, t_shares, t_pnl, t_cost, t_reason, n_trades)
+
+
+try:  # compile the loop once per process; falls back to plain Python without numba
+    from numba import njit as _njit
+    _bar_loop_fast = _njit(cache=True, nogil=True)(_bar_loop)
+    HAVE_NUMBA = True
+except Exception:  # pragma: no cover
+    _bar_loop_fast = _bar_loop
+    HAVE_NUMBA = False
 
 
 def backtest(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: float = 100_000.0) -> dict:
@@ -350,222 +655,41 @@ def backtest(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: float = 10
         stats    : summary performance stats
     """
     n = len(df)
-    close = df["Close"].to_numpy(dtype=float)
-    open_ = df["Open"].to_numpy(dtype=float)
-    high = df["High"].to_numpy(dtype=float)
-    low = df["Low"].to_numpy(dtype=float)
+    close = _to_arr(df["Close"])
+    open_ = _to_arr(df["Open"])
+    high = _to_arr(df["High"])
+    low = _to_arr(df["Low"])
 
-    ind = _compute_indicators(df, tpl)
-    ready = ind["ready"]
-    upper_v, lower_v, atr_v = ind["upper"], ind["lower"], ind["atr"]
-    upper_xv = ind.get("upper_x")
-    lower_xv = ind.get("lower_x")
-    mid_xv = ind.get("mid_x")
-    regime_v = ind.get("regime")
-    regime_thr = ind.get("regime_threshold")
-    vol_v = ind.get("vol_rank")
-    bias_v = ind.get("bias")
+    ind = _compute_indicators(df, tpl, _df_key(df, close))
+    zeros = np.zeros(n)
+    out = _bar_loop_fast(
+        open_, high, low, close, ind["ready"], ind["upper"], ind["lower"], ind["atr"],
+        ind.get("upper_x", zeros), ind.get("lower_x", zeros), ind.get("mid_x", zeros),
+        ind.get("regime", zeros), ind.get("vol_rank", zeros), ind.get("bias", zeros),
+        tpl.direction_logic == "trend", ENTRY_CODES[tpl.entry_style], EXIT_CODES[tpl.exit_style],
+        REGIME_CODES[tpl.regime_filter], float(ind.get("regime_threshold", 0.0)),
+        bool(tpl.vol_filter), float(tpl.vol_low_pct), float(tpl.vol_high_pct), tpl.bias_filter == "sma",
+        float(tpl.atr_mult_stop), float(tpl.atr_mult_target), float(tpl.atr_mult_trail), float(tpl.pullback_atr_mult),
+        int(tpl.pullback_valid_bars), int(tpl.max_hold_bars), float(tpl.risk_pct), float(tpl.max_leverage),
+        tpl.cost_bps / 1e4, float(initial_equity),
+    )
+    (equity, entries, t_entry, t_exit, t_side, t_entry_px, t_exit_px, t_shares, t_pnl, t_cost, t_reason, n_trades) = out
 
-    cost_rate = tpl.cost_bps / 1e4
-    is_trend = tpl.direction_logic == "trend"
-
-    equity = np.full(n, np.nan)
-    entries = np.zeros(n, dtype=np.int8)
-    cash = initial_equity
-
-    position = 0        # -1, 0, +1
-    shares = 0.0
-    entry_price = np.nan
-    stop_price = np.nan
-    target_price = np.nan
-    trail_extreme = np.nan
-    entry_bar = -1
-    pending_order = None  # {'side', 'level', 'expires'} for pullback entries
-
-    trades = []
-    open_trade = None
-
-    def open_position(i, side, fill):
-        nonlocal position, shares, entry_price, stop_price, target_price, trail_extreme, entry_bar, open_trade, cash
-        a = atr_v[i - 1]
-        stop_dist = tpl.atr_mult_stop * a
-        risk_amt = cash * tpl.risk_pct
-        qty = risk_amt / stop_dist
-        qty = min(qty, tpl.max_leverage * cash / fill)   # notional cap
-        if qty <= 0:
-            return False
-        cost = cost_rate * qty * fill
-        cash -= cost
-        position = side
-        shares = qty
-        entry_price = fill
-        stop_price = fill - side * stop_dist
-        target_price = fill + side * tpl.atr_mult_target * a
-        trail_extreme = fill
-        entry_bar = i
-        entries[i] = 1
-        open_trade = dict(entry_date=df.index[i], side=side, entry_price=fill, shares=qty, cost=cost)
-        return True
-
-    def close_position(i, exit_price, reason):
-        nonlocal position, shares, entry_price, stop_price, target_price, trail_extreme, open_trade, cash
-        gross = position * shares * (exit_price - entry_price)
-        cost = cost_rate * shares * exit_price
-        cash += gross - cost
-        open_trade.update(
-            exit_date=df.index[i], exit_price=exit_price, reason=reason,
-            pnl=gross - cost - open_trade["cost"], bars_held=i - entry_bar,
-        )
-        open_trade["cost"] += cost
-        trades.append(open_trade)
-        open_trade = None
-        position = 0
-        shares = 0.0
-        entry_price = stop_price = target_price = trail_extreme = np.nan
-
-    equity[0] = initial_equity
-    for i in range(1, n):
-        if not ready[i - 1]:
-            equity[i] = cash + (position * shares * (close[i] - entry_price) if position else 0.0)
-            continue
-
-        a = atr_v[i - 1]
-        if not (a > 0):
-            equity[i] = cash + (position * shares * (close[i] - entry_price) if position else 0.0)
-            continue
-
-        # ---- manage open position: exits (checked intrabar on bar i) ----
-        if position != 0:
-            exit_price, reason = None, None
-            side = position
-            # hard stop is always active (risk control)
-            stop_level = stop_price
-
-            if tpl.exit_style == "atr_trail":
-                # trailing level is based on the extreme up to bar i-1 (no intrabar look-ahead)
-                trail_stop = trail_extreme - side * tpl.atr_mult_trail * a
-                stop_level = max(stop_level, trail_stop) if side == 1 else min(stop_level, trail_stop)
-
-            if side == 1 and low[i] <= stop_level:
-                exit_price, reason = min(open_[i], stop_level), "stop"
-            elif side == -1 and high[i] >= stop_level:
-                exit_price, reason = max(open_[i], stop_level), "stop"
-
-            if exit_price is None:
-                if tpl.exit_style == "channel":
-                    if is_trend:   # exit on the opposite side of the exit channel
-                        if side == 1 and low[i] <= lower_xv[i - 1]:
-                            exit_price, reason = min(open_[i], lower_xv[i - 1]), "channel"
-                        elif side == -1 and high[i] >= upper_xv[i - 1]:
-                            exit_price, reason = max(open_[i], upper_xv[i - 1]), "channel"
-                    else:          # countertrend: take profit at the channel midline
-                        if side == 1 and high[i] >= mid_xv[i - 1]:
-                            exit_price, reason = max(open_[i], mid_xv[i - 1]), "midline"
-                        elif side == -1 and low[i] <= mid_xv[i - 1]:
-                            exit_price, reason = min(open_[i], mid_xv[i - 1]), "midline"
-                elif tpl.exit_style == "target_stop":
-                    if side == 1 and high[i] >= target_price:
-                        exit_price, reason = max(open_[i], target_price), "target"
-                    elif side == -1 and low[i] <= target_price:
-                        exit_price, reason = min(open_[i], target_price), "target"
-                elif tpl.exit_style == "time_stop":
-                    if i - entry_bar >= tpl.max_hold_bars:
-                        exit_price, reason = open_[i], "time"
-
-            if exit_price is not None:
-                close_position(i, exit_price, reason)
-                equity[i] = cash
-                continue  # no re-entry on the exit bar
-
-            # update trailing extreme AFTER the exit check, with this bar's data
-            if tpl.exit_style == "atr_trail":
-                trail_extreme = max(trail_extreme, high[i]) if side == 1 else min(trail_extreme, low[i])
-
-        # ---- filters (previous bar's fully-formed values) ----
-        can_enter = True
-        if regime_v is not None:
-            if tpl.regime_filter == "trend_only":
-                can_enter = regime_v[i - 1] >= regime_thr
-            else:
-                can_enter = regime_v[i - 1] < regime_thr
-        if can_enter and vol_v is not None:
-            can_enter = tpl.vol_low_pct <= vol_v[i - 1] <= tpl.vol_high_pct
-
-        long_ok = short_ok = True
-        if bias_v is not None:
-            long_ok = close[i - 1] > bias_v[i - 1]
-            short_ok = close[i - 1] < bias_v[i - 1]
-
-        entered = False
-
-        # ---- pending pullback order ----
-        if position == 0 and pending_order is not None:
-            side, level = pending_order["side"], pending_order["level"]
-            filled = None
-            if side == 1 and low[i] <= level:
-                filled = min(open_[i], level)
-            elif side == -1 and high[i] >= level:
-                filled = max(open_[i], level)
-            if filled is not None:
-                entered = open_position(i, side, filled)
-                pending_order = None
-            elif i >= pending_order["expires"]:
-                pending_order = None
-
-        # ---- new entry signals (based on previous bar's channel) ----
-        if position == 0 and pending_order is None and can_enter:
-            if tpl.entry_style == "close_confirm":
-                # a CLOSE beyond the channel that existed before that close
-                ok = i >= 2 and ready[i - 2]
-                broke_up = ok and close[i - 1] > upper_v[i - 2]
-                broke_down = ok and close[i - 1] < lower_v[i - 2]
-                level_up, level_down = open_[i], open_[i]
-            else:
-                broke_up = high[i] >= upper_v[i - 1]
-                broke_down = low[i] <= lower_v[i - 1]
-                level_up, level_down = upper_v[i - 1], lower_v[i - 1]
-
-            # The channel that was actually broken determines the fill level.
-            side, level = 0, None
-            if is_trend:
-                if broke_up and long_ok:
-                    side, level = 1, level_up
-                elif broke_down and short_ok:
-                    side, level = -1, level_down
-            else:
-                if broke_down and long_ok:
-                    side, level = 1, level_down
-                elif broke_up and short_ok:
-                    side, level = -1, level_up
-
-            if side != 0:
-                if tpl.entry_style == "close_confirm":
-                    entered = open_position(i, side, open_[i])
-                elif tpl.entry_style == "stop":
-                    # trend: stop orders (fill at open if gapped through);
-                    # countertrend: limit orders (fill at open if better)
-                    if is_trend:
-                        fill = max(open_[i], level) if side == 1 else min(open_[i], level)
-                    else:
-                        fill = min(open_[i], level) if side == 1 else max(open_[i], level)
-                    entered = open_position(i, side, fill)
-                else:  # pullback: arm a limit order for the following bars
-                    pb_level = level - side * tpl.pullback_atr_mult * a
-                    pending_order = {"side": side, "level": pb_level, "expires": i + tpl.pullback_valid_bars}
-
-        # ---- conservative same-bar stop check on the entry bar ----
-        if entered and position != 0:
-            if position == 1 and low[i] <= stop_price:
-                close_position(i, stop_price, "stop_same_bar")
-            elif position == -1 and high[i] >= stop_price:
-                close_position(i, stop_price, "stop_same_bar")
-
-        # ---- mark to market at the close of bar i ----
-        equity[i] = cash + (position * shares * (close[i] - entry_price) if position else 0.0)
-
-    equity_s = pd.Series(equity, index=df.index).ffill()
-    returns = equity_s.pct_change().fillna(0.0)
-    stats = _performance_stats(equity_s, trades, initial_equity, entries)
+    idx = df.index
+    idx_arr = idx.to_numpy()
+    trades = [
+        dict(entry_date=pd.Timestamp(idx_arr[t_entry[k]]), side=int(t_side[k]), entry_price=float(t_entry_px[k]),
+             shares=float(t_shares[k]), cost=float(t_cost[k]), exit_date=pd.Timestamp(idx_arr[t_exit[k]]),
+             exit_price=float(t_exit_px[k]), reason=REASONS[t_reason[k]], pnl=float(t_pnl[k]),
+             bars_held=int(t_exit[k] - t_entry[k]))
+        for k in range(n_trades)
+    ]
+    rets = np.zeros(n)
+    rets[1:] = equity[1:] / equity[:-1] - 1.0
+    equity_s = pd.Series(equity, index=idx)
+    returns = pd.Series(rets, index=idx)
+    stats = _performance_stats(equity, trades, initial_equity, rets, t_pnl[:n_trades],
+                               (t_exit[:n_trades] - t_entry[:n_trades]).astype(float))
     return {"equity": equity_s, "returns": returns, "entries": entries, "trades": trades, "stats": stats}
 
 
@@ -578,30 +702,38 @@ def annualized_sharpe(rets: pd.Series | np.ndarray, periods_per_year: int = PERI
     return float(r.mean() / sd * np.sqrt(periods_per_year)) if sd > 0 else 0.0
 
 
-def _performance_stats(equity: pd.Series, trades: list, initial_equity: float, entries=None) -> dict:
-    rets = equity.pct_change().dropna()
-    n_bars = len(equity)
+def _performance_stats(equity, trades: list, initial_equity: float, rets=None, pnls=None, bars_held=None) -> dict:
+    """Summary stats from an equity path. Accepts a numpy array or a Series;
+    `rets`, `pnls` and `bars_held` may be passed to skip recomputation."""
+    eq = np.asarray(equity, dtype=float)
+    n_bars = len(eq)
+    if rets is None:
+        rets = np.zeros(n_bars)
+        rets[1:] = eq[1:] / eq[:-1] - 1.0
+    if pnls is None:
+        pnls = np.array([t.get("pnl", 0.0) for t in trades], dtype=float)
+    if bars_held is None:
+        bars_held = np.array([t.get("bars_held", 0) for t in trades], dtype=float)
     n_years = max(n_bars / PERIODS_PER_YEAR, 1e-6)
-    final = float(equity.iloc[-1])
+    final = float(eq[-1])
     total_return = final / initial_equity - 1
     cagr = (final / initial_equity) ** (1 / n_years) - 1 if final > 0 else -1.0
-    sharpe = annualized_sharpe(rets)
-    running_max = equity.cummax()
-    max_dd = float((equity / running_max - 1).min())
-    pnls = np.array([t.get("pnl", 0.0) for t in trades], dtype=float)
+    sharpe = annualized_sharpe(rets[1:])
+    running_max = np.maximum.accumulate(eq)
+    max_dd = float((eq / running_max - 1).min())
     wins = pnls[pnls > 0].sum()
     losses = -pnls[pnls < 0].sum()
     profit_factor = wins / losses if losses > 0 else (np.inf if wins > 0 else 0.0)
-    bars_held = [t.get("bars_held", 0) for t in trades]
+    n_tr = len(pnls)
     return dict(
         total_return=float(total_return),
         cagr=float(cagr),
         sharpe=float(sharpe),
         max_drawdown=max_dd,
-        n_trades=len(trades),
-        win_rate=float((pnls > 0).mean()) if len(pnls) else 0.0,
+        n_trades=n_tr,
+        win_rate=float((pnls > 0).mean()) if n_tr else 0.0,
         profit_factor=float(profit_factor),
-        avg_bars_held=float(np.mean(bars_held)) if bars_held else 0.0,
-        exposure=float(sum(bars_held) / n_bars) if n_bars else 0.0,
+        avg_bars_held=float(bars_held.mean()) if n_tr else 0.0,
+        exposure=float(bars_held.sum() / n_bars) if n_bars else 0.0,
         n_bars=n_bars,
     )

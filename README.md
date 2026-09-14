@@ -17,10 +17,10 @@ portfolio construction) plus the modern overfitting diagnostics.
 ## Setup
 
 ```bash
-conda create -p ./env python=3.12 pandas scikit-learn scipy matplotlib yfinance
+conda create -p ./env python=3.12 pandas scikit-learn scipy matplotlib yfinance numba
 conda activate ./env
-python -m unittest discover -s tests -v      # 21 sanity tests
-python main.py                                # synthetic data, 72 templates, ~2 min on 8 cores
+python -m unittest discover -s tests -v      # 22 sanity tests (incl. jit-vs-python kernel equivalence)
+python main.py                                # synthetic data, 72 templates, ~1 min on 8 cores
 ```
 
 ## Running it
@@ -58,7 +58,9 @@ strategy.py     Indicators (ATR, Donchian, Keltner, Bollinger, Kaufman ER,
                 ADX, Ehlers CTI, Choppiness, variance ratio), the
                 StrategyTemplate switches, and a bar-by-bar backtest
                 engine (ATR position sizing, leverage cap, costs, next-bar
-                fills, same-bar stop, close-of-bar mark-to-market).
+                fills, same-bar stop, close-of-bar mark-to-market). The
+                bar loop is Numba-compiled (pure-Python fallback if numba
+                is missing) and indicator arrays are cached per slice.
 
 generator.py    Builds families of templates (quick / default / full)
                 and the lattice parameter grid for each one.
@@ -214,5 +216,10 @@ a decade of daily bars for a family of hundreds of trials.
 - **Meta-labelling** (AFML ch. 3): use the template signals as primary
   models and train a classifier on the triple-barrier outcome to size
   or veto trades.
-- **Speed**: the bar loop is pure Python (~8 us/bar). Numba-jitting it
-  would make the `full` family (3168 templates) a coffee break.
+- **Speed**: the bar loop is already Numba-compiled (a 3000-bar backtest
+  takes ~1.5 ms, of which the loop itself is a fraction; the rest is
+  indicator lookup and result packaging). The remaining cost centres
+  for very large families are the family-level Reality Check and the
+  silhouette search in `effective_n_trials`, both O(templates^2) or
+  O(templates x bootstraps); reduce `--n-boot` or cluster on a subsample
+  if you go beyond a few thousand templates.

@@ -26,7 +26,6 @@ Usage:
 
 from __future__ import annotations
 import argparse
-import json
 import os
 import time
 from multiprocessing import Pool
@@ -42,8 +41,12 @@ from generator import generate_templates, param_grid_for
 from walkforward import walk_forward, grid_combos
 from robustness import (
     trial_returns, cpcv, cscv_pbo, deflated_sharpe_ratio, min_backtest_length,
-    bootstrap_sharpe_pvalue, reality_check, effective_n_trials,
+    bootstrap_sharpe_pvalue, reality_check, effective_n_trials, cscv_block_stats, merge_block_stats,
 )
+
+
+def _cscv_partitions(T: int) -> int:
+    return 16 if T >= 1600 else 8
 from portfolio import select_portfolio, walk_forward_portfolio, returns_frame
 from strategy import annualized_sharpe, PERIODS_PER_YEAR
 
@@ -113,8 +116,9 @@ def _evaluate_template(tpl):
     R, E = trial_returns(df, tpl, combos)
     cp = cpcv(R, E, idx, n_groups=a.cpcv_groups, k_test=a.cpcv_k, embargo_bars=2 * tpl.n_entry,
               selection=a.selection)
-    wfa["trial_returns"] = R
-    wfa["trial_names"] = [f"{tpl.name}|{json.dumps(c, sort_keys=True)}" for c in combos]
+    # only the CSCV block statistics travel back to the parent (not T x N returns)
+    wfa["trial_blocks"] = cscv_block_stats(R, _cscv_partitions(len(df)))
+    wfa["n_trials"] = R.shape[1]
     wfa["cpcv"] = {k: v for k, v in cp.items() if k in ("path_sharpes", "path_max_dd", "n_paths", "sharpe_mean",
                                                         "sharpe_std", "sharpe_min", "prob_sharpe_negative")}
     return tpl.name, wfa
@@ -193,11 +197,10 @@ def family_diagnostics(results: dict, rets: pd.DataFrame, args) -> dict:
     """Overfitting diagnostics for the WHOLE family of trials."""
     print("\nFamily-level diagnostics...")
     # PBO over every (template, param combo) trial the generator tried
-    R = np.concatenate([r["trial_returns"] for r in results.values()], axis=1)
-    n_trials = R.shape[1]
-    pbo = cscv_pbo(R, n_partitions=16 if R.shape[0] >= 1600 else 8)
+    n_trials = sum(r["n_trials"] for r in results.values())
+    pbo = cscv_pbo(blocks=merge_block_stats([r["trial_blocks"] for r in results.values()]))
     # PBO over the template-level OOS curves (the selection step's trials)
-    pbo_tpl = cscv_pbo(rets.to_numpy(), n_partitions=16 if len(rets) >= 1600 else 8) if rets.shape[1] > 1 else None
+    pbo_tpl = cscv_pbo(rets.to_numpy(), n_partitions=_cscv_partitions(len(rets))) if rets.shape[1] > 1 else None
     rc = reality_check(rets, n_boot=args.n_boot)
     oos_sharpes = rets.apply(annualized_sharpe)
     best = oos_sharpes.idxmax()
