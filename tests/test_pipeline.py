@@ -17,13 +17,16 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from data import synthetic_ohlc  # noqa: E402
 from strategy import (  # noqa: E402
     StrategyTemplate, backtest, cti, adx, choppiness, variance_ratio, efficiency_ratio,
-    _compute_indicators,
+    _compute_indicators, annualized_sharpe,
 )
 from generator import generate_templates, param_grid_for  # noqa: E402
-from walkforward import walk_forward, grid_combos, smooth_scores, warmup_bars  # noqa: E402
+from walkforward import (  # noqa: E402
+    walk_forward, grid_combos, smooth_scores, warmup_bars, summarize_walk_forward,
+)
 from robustness import (  # noqa: E402
     trial_returns, cpcv, cpcv_paths, cscv_pbo, deflated_sharpe_ratio, probabilistic_sharpe_ratio,
     bootstrap_sharpe_pvalue, reality_check, hrp_weights, stationary_bootstrap_indices,
+    min_backtest_length,
 )
 from portfolio import (  # noqa: E402
     select_portfolio, walk_forward_portfolio, returns_frame, portfolio_weights,
@@ -395,6 +398,76 @@ class BugRegressionTests(unittest.TestCase):
                 del sys.modules["yfinance"]
             else:
                 sys.modules["yfinance"] = real
+
+
+class AnnualizationTests(unittest.TestCase):
+    """PERIODS_PER_YEAR used to be imported by value into four modules (and
+    baked into default arguments), so a non-daily bar frequency could not be
+    set at all. Everything must now read it through strategy.periods_per_year()."""
+
+    def setUp(self):
+        import strategy as S
+        self._saved = S.periods_per_year()
+
+    def tearDown(self):
+        import strategy as S
+        S.set_periods_per_year(self._saved)
+
+    def test_sharpe_scales_with_the_bar_frequency(self):
+        import strategy as S
+        rng = np.random.default_rng(0)
+        r = pd.Series(rng.normal(0.0004, 0.01, 3000))
+        daily = annualized_sharpe(r)
+        S.set_periods_per_year(S.periods_per_year_for_interval("1h"))
+        hourly = annualized_sharpe(r)
+        self.assertAlmostEqual(hourly / daily, np.sqrt(7.0), places=6)
+
+    def test_every_module_honours_the_setting(self):
+        """walkforward, robustness and portfolio must all see the change."""
+        import strategy as S
+        import robustness as R
+        from robustness import _sharpe_cols
+
+        rng = np.random.default_rng(1)
+        X = rng.normal(0.0004, 0.01, (2000, 3))
+        mask = np.ones(2000, dtype=bool)
+        sr_daily = _sharpe_cols(X, mask).copy()
+        win_daily = summarize_walk_forward(
+            [dict(skipped=False, is_stats=dict(total_return=0.1, sharpe=1.0, n_bars=500),
+                  oos_stats=dict(total_return=0.05, sharpe=0.8, n_trades=10, n_bars=125),
+                  params_changed=False)] * 4,
+            pd.Series(X[:, 0]),
+        )
+        boot_daily = R.bootstrap_sharpe_pvalue(X[:, 0], n_boot=50)["sharpe"]
+        dsr_daily = R.deflated_sharpe_ratio(X[:, 0], n_trials=10, var_sr_trials=1e-4)["sharpe_annual"]
+        mbtl_daily = min_backtest_length(100, 1.0)
+
+        S.set_periods_per_year(S.periods_per_year_for_interval("1h"))
+        k = np.sqrt(7.0)
+        np.testing.assert_allclose(_sharpe_cols(X, mask), sr_daily * k, rtol=1e-9)
+        np.testing.assert_allclose(R.bootstrap_sharpe_pvalue(X[:, 0], n_boot=50)["sharpe"],
+                                   boot_daily * k, rtol=1e-9)
+        np.testing.assert_allclose(
+            R.deflated_sharpe_ratio(X[:, 0], n_trials=10, var_sr_trials=1e-4)["sharpe_annual"],
+            dsr_daily * k, rtol=1e-9)
+        # MinBTL is in years: the same Sharpe needs the same wall-clock time,
+        # but 7x as many bars, so the YEARS figure is unchanged
+        self.assertAlmostEqual(min_backtest_length(100, 1.0), mbtl_daily, places=9)
+        win_hourly = summarize_walk_forward(
+            [dict(skipped=False, is_stats=dict(total_return=0.1, sharpe=1.0, n_bars=500),
+                  oos_stats=dict(total_return=0.05, sharpe=0.8, n_trades=10, n_bars=125),
+                  params_changed=False)] * 4,
+            pd.Series(X[:, 0]),
+        )
+        self.assertAlmostEqual(win_hourly["oos_sharpe"] / win_daily["oos_sharpe"], k, places=9)
+        self.assertGreater(win_hourly["oos_cagr"], win_daily["oos_cagr"])
+
+    def test_unknown_interval_is_rejected(self):
+        import strategy as S
+        with self.assertRaises(ValueError):
+            S.periods_per_year_for_interval("3d")
+        with self.assertRaises(ValueError):
+            S.set_periods_per_year(0)
 
 
 if __name__ == "__main__":

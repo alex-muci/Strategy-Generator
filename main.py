@@ -45,10 +45,16 @@ from robustness import (
 )
 
 
-def _cscv_partitions(T: int) -> int:
-    return 16 if T >= 1600 else 8
 from portfolio import select_portfolio, walk_forward_portfolio, returns_frame
-from strategy import annualized_sharpe, PERIODS_PER_YEAR
+from strategy import (
+    annualized_sharpe, periods_per_year, set_periods_per_year,
+    periods_per_year_for_interval, BARS_PER_YEAR,
+)
+
+
+def _cscv_partitions(T: int) -> int:
+    """CSCV blocks: 16 needs >= 100 bars per block to be meaningful."""
+    return 16 if T >= 1600 else 8
 
 
 def parse_args():
@@ -57,6 +63,8 @@ def parse_args():
     p.add_argument("--max-templates", type=int, default=None)
     p.add_argument("--real", metavar="TICKER", default=None, help="use yfinance data for TICKER instead of synthetic")
     p.add_argument("--start", default="2005-01-01")
+    p.add_argument("--interval", default="1d", choices=sorted(BARS_PER_YEAR),
+                   help="bar interval for --real; also sets the annualization factor")
     p.add_argument("--bars", type=int, default=3000, help="synthetic bars")
     p.add_argument("--seed", type=int, default=7)
     p.add_argument("--trend-prob", type=float, default=0.45, help="synthetic: probability a regime is trending")
@@ -93,6 +101,9 @@ _ARGS = None
 def _init_worker(df, args):
     global _DF, _ARGS
     _DF, _ARGS = df, args
+    # a fresh process re-imports strategy at the daily default; without this every
+    # annualized number computed in the pool would be wrong for intraday bars
+    set_periods_per_year(periods_per_year_for_interval(args.interval))
 
 
 def _wfa_cell(job):
@@ -129,13 +140,16 @@ def main():
     t0 = time.time()
     os.makedirs(args.out, exist_ok=True)
 
+    set_periods_per_year(periods_per_year_for_interval(args.interval))
+
     if args.real:
-        print(f"Loading {args.real} from yfinance...")
-        df = load_yfinance(args.real, start=args.start)
+        print(f"Loading {args.real} ({args.interval} bars) from yfinance...")
+        df = load_yfinance(args.real, start=args.start, interval=args.interval)
     else:
         print(f"Loading synthetic regime-switching data (trend_prob={args.trend_prob}, trend_drift={args.trend_drift})...")
         df = synthetic_ohlc(n_bars=args.bars, seed=args.seed, trend_prob=args.trend_prob, trend_drift=args.trend_drift)
-    print(f"Data: {len(df)} bars, {df.index[0].date()} to {df.index[-1].date()}")
+    print(f"Data: {len(df)} bars, {df.index[0].date()} to {df.index[-1].date()}, "
+          f"annualizing at {periods_per_year()} bars/year")
 
     templates = generate_templates(args.family, max_templates=args.max_templates)
     print(f"Generated {len(templates)} structurally distinct strategy templates (family={args.family})")
@@ -164,6 +178,12 @@ def _run(df, templates, pool, args, t0):
 
     # ---- 3. family-level overfitting diagnostics ----
     rets = returns_frame(results)
+    if rets.empty:
+        raise SystemExit(
+            "No template produced a usable out-of-sample series. The history is probably "
+            f"too short for train={args.train} + test={args.test} bars ({len(df)} bars available) "
+            "-- lower --train/--test or load more data."
+        )
     fam = family_diagnostics(results, rets, args)
 
     # ---- 4. portfolio: static selection, then nested walk-forward selection ----
@@ -205,7 +225,7 @@ def family_diagnostics(results: dict, rets: pd.DataFrame, args) -> dict:
     oos_sharpes = rets.apply(annualized_sharpe)
     best = oos_sharpes.idxmax()
     # raw DSR: every template is an independent trial (very conservative)
-    var_sr_raw = float(oos_sharpes.var()) / PERIODS_PER_YEAR
+    var_sr_raw = float(oos_sharpes.var()) / periods_per_year()
     dsr_raw = deflated_sharpe_ratio(rets[best], n_trials=rets.shape[1], var_sr_trials=var_sr_raw)
     # effective DSR: correlated templates collapsed into clusters
     eff = effective_n_trials(rets)
@@ -215,7 +235,7 @@ def family_diagnostics(results: dict, rets: pd.DataFrame, args) -> dict:
         reality_check=rc, oos_sharpes=oos_sharpes, n_eff=eff["n_eff"], var_sr_period=eff["var_sr_period"],
         best_template=best, dsr_best=dsr_best, dsr_raw=dsr_raw,
         min_btl_years=min_backtest_length(eff["n_eff"], max(float(oos_sharpes.max()), 1e-6)),
-        years_available=len(rets) / PERIODS_PER_YEAR,
+        years_available=len(rets) / periods_per_year(),
     )
     print(f"  trials: {n_trials}  templates: {rets.shape[1]}")
     print(f"  PBO (all param trials, CSCV S={pbo['n_combinations']} splits): {pbo['pbo']:.2f}   "
@@ -400,7 +420,8 @@ def _report(df, results, port, nested, fam, finalists, args):
     L = []
     L.append("# Ranger-style strategy generator -- run report\n\n")
     L.append(f"Data: {len(df)} bars, {df.index[0].date()} to {df.index[-1].date()}"
-             f" ({'yfinance ' + args.real if args.real else 'synthetic'})\n\n")
+             f" ({'yfinance ' + args.real + ' ' + args.interval if args.real else 'synthetic'}),"
+             f" annualized at {periods_per_year()} bars/year\n\n")
     L.append(f"Walk-forward: train={args.train} test={args.test} bars, {'anchored' if args.anchored else 'rolling'}, "
              f"parameter selection = {args.selection}, objective = {args.metric}, costs = {args.cost_bps} bps/side\n\n")
     L.append(f"Templates generated: {len(results)} (family '{args.family}'); parameter trials: {fam['n_trials']}\n\n")

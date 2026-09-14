@@ -33,7 +33,7 @@ from itertools import product as iproduct
 import numpy as np
 import pandas as pd
 
-from strategy import backtest, annualized_sharpe, PERIODS_PER_YEAR, REGIME_INDICATORS
+from strategy import backtest, annualized_sharpe, periods_per_year, REGIME_INDICATORS
 
 
 # --------------------------------------------------------------------------
@@ -108,7 +108,7 @@ def select_params(scores: np.ndarray, idx: np.ndarray, method: str = "plateau") 
 
 def _annualized_return(stats: dict) -> float:
     n = max(stats.get("n_bars", 1), 1)
-    return stats["total_return"] * PERIODS_PER_YEAR / n
+    return stats["total_return"] * periods_per_year() / n
 
 
 # --------------------------------------------------------------------------
@@ -240,13 +240,13 @@ def summarize_walk_forward(windows: list, oos_returns: pd.Series) -> dict:
     eq = (1 + oos_returns).cumprod()
     total = float(eq.iloc[-1] - 1)
     n_bars = len(oos_returns)
-    cagr = float(eq.iloc[-1] ** (PERIODS_PER_YEAR / n_bars) - 1) if eq.iloc[-1] > 0 else -1.0
+    cagr = float(eq.iloc[-1] ** (periods_per_year() / n_bars) - 1) if eq.iloc[-1] > 0 else -1.0
     max_dd = float((eq / eq.cummax() - 1).min())
     oos_sharpe = annualized_sharpe(oos_returns)
 
     is_sharpes = np.array([w["is_stats"]["sharpe"] for w in live])
     is_ann = np.array([_annualized_return(w["is_stats"]) for w in live])
-    oos_ann_total = total * PERIODS_PER_YEAR / n_bars
+    oos_ann_total = total * periods_per_year() / n_bars
     is_ann_mean = float(is_ann.mean())
     # Pardo: annualized OOS return / annualized IS return. Undefined when the
     # optimizer could not even find a profitable IS fit; clipped because a

@@ -77,7 +77,49 @@ from dataclasses import dataclass, asdict
 import numpy as np
 import pandas as pd
 
+# Bars per year, used for every annualization (Sharpe, CAGR, WFE, DSR...).
+# Do NOT import this by value: `from strategy import PERIODS_PER_YEAR` freezes it
+# at import time and set_periods_per_year() can then no longer be honoured.
+# Read it through periods_per_year() instead.
 PERIODS_PER_YEAR = 252
+
+# Regular-session bars per year for the intervals yfinance serves. US equity
+# ETFs trade 6.5h a day, which Yahoo cuts into seven '1h' bars (the last one is
+# a 30-minute stub), thirteen '30m' bars, and so on.
+BARS_PER_YEAR = {
+    "1mo": 12, "1wk": 52, "1d": 252,
+    "1h": 252 * 7, "60m": 252 * 7, "90m": 252 * 5,
+    "30m": 252 * 13, "15m": 252 * 26, "5m": 252 * 78, "1m": 252 * 390,
+}
+
+
+def periods_per_year() -> int:
+    """Bars per year currently used for annualization."""
+    return PERIODS_PER_YEAR
+
+
+def set_periods_per_year(n: int) -> None:
+    """Set the bar frequency for every annualized statistic in the project.
+
+    Call this ONCE, before running anything, and in every worker process (the
+    pool initializer in main.py does it). Annualizing hourly bars at 252 would
+    understate every Sharpe ratio by about sqrt(7).
+    """
+    global PERIODS_PER_YEAR
+    n = int(n)
+    if n < 1:
+        raise ValueError(f"periods_per_year must be >= 1, got {n}")
+    PERIODS_PER_YEAR = n
+
+
+def periods_per_year_for_interval(interval: str) -> int:
+    """Bars per year for a yfinance interval string ('1d', '1h', '30m', ...)."""
+    try:
+        return BARS_PER_YEAR[interval]
+    except KeyError:
+        raise ValueError(
+            f"unknown interval {interval!r}; known: {', '.join(BARS_PER_YEAR)}"
+        ) from None
 
 
 # --------------------------------------------------------------------------
@@ -713,13 +755,14 @@ def backtest(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: float = 10
     return {"equity": equity_s, "returns": returns, "entries": entries, "trades": trades, "stats": stats}
 
 
-def annualized_sharpe(rets: pd.Series | np.ndarray, periods_per_year: int = PERIODS_PER_YEAR) -> float:
+def annualized_sharpe(rets: pd.Series | np.ndarray, ppy: int | None = None) -> float:
     r = np.asarray(rets, dtype=float)
     r = r[~np.isnan(r)]
     if len(r) < 2:
         return 0.0
     sd = r.std(ddof=1)
-    return float(r.mean() / sd * np.sqrt(periods_per_year)) if sd > 0 else 0.0
+    ppy = periods_per_year() if ppy is None else ppy
+    return float(r.mean() / sd * np.sqrt(ppy)) if sd > 0 else 0.0
 
 
 def _performance_stats(equity, trades: list, initial_equity: float, rets=None, pnls=None, bars_held=None) -> dict:
@@ -734,7 +777,7 @@ def _performance_stats(equity, trades: list, initial_equity: float, rets=None, p
         pnls = np.array([t.get("pnl", 0.0) for t in trades], dtype=float)
     if bars_held is None:
         bars_held = np.array([t.get("bars_held", 0) for t in trades], dtype=float)
-    n_years = max(n_bars / PERIODS_PER_YEAR, 1e-6)
+    n_years = max(n_bars / periods_per_year(), 1e-6)
     final = float(eq[-1])
     total_return = final / initial_equity - 1
     cagr = (final / initial_equity) ** (1 / n_years) - 1 if final > 0 else -1.0

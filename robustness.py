@@ -34,7 +34,7 @@ from scipy.stats import norm, skew as _skew, kurtosis as _kurtosis
 from scipy.cluster.hierarchy import linkage, leaves_list
 from scipy.spatial.distance import squareform
 
-from strategy import backtest, PERIODS_PER_YEAR
+from strategy import backtest, periods_per_year
 from walkforward import smooth_scores
 
 EULER_GAMMA = 0.5772156649015329
@@ -65,7 +65,7 @@ def _sharpe_cols(R: np.ndarray, mask: np.ndarray) -> np.ndarray:
         return np.zeros(R.shape[1])
     sd = X.std(axis=0, ddof=1)
     with np.errstate(invalid="ignore", divide="ignore"):
-        sr = np.where(sd > 0, X.mean(axis=0) / sd * np.sqrt(PERIODS_PER_YEAR), 0.0)
+        sr = np.where(sd > 0, X.mean(axis=0) / sd * np.sqrt(periods_per_year()), 0.0)
     return sr
 
 
@@ -218,7 +218,7 @@ def cscv_pbo(R: np.ndarray | None = None, n_partitions: int = 16, max_combinatio
         var = np.maximum(q / n - mean ** 2, 0) * n / max(n - 1, 1)
         sd = np.sqrt(var)
         with np.errstate(invalid="ignore", divide="ignore"):
-            return np.where(sd > 0, mean / sd * np.sqrt(PERIODS_PER_YEAR), 0.0)
+            return np.where(sd > 0, mean / sd * np.sqrt(periods_per_year()), 0.0)
 
     all_combos = list(combinations(range(S), S // 2))
     if len(all_combos) > max_combinations:
@@ -286,16 +286,17 @@ def expected_max_sharpe(n_trials: int, var_sr: float) -> float:
     ))
 
 
-def deflated_sharpe_ratio(returns, n_trials: int, var_sr_trials: float, periods_per_year: int = PERIODS_PER_YEAR) -> dict:
+def deflated_sharpe_ratio(returns, n_trials: int, var_sr_trials: float, ppy: int | None = None) -> dict:
     """Deflated Sharpe Ratio of a strategy that was the best of `n_trials`
     attempts whose per-period Sharpes had variance `var_sr_trials`.
     Returns the DSR probability, the deflating benchmark SR* (annualized
     for readability) and the PSR against zero."""
     sr, g3, g4, T = _moments(returns)
     sr_star = expected_max_sharpe(n_trials, var_sr_trials)
+    ppy = periods_per_year() if ppy is None else ppy
     return dict(
-        sharpe_annual=sr * np.sqrt(periods_per_year),
-        sr_star_annual=sr_star * np.sqrt(periods_per_year),
+        sharpe_annual=sr * np.sqrt(ppy),
+        sr_star_annual=sr_star * np.sqrt(ppy),
         psr0=probabilistic_sharpe_ratio(sr, 0.0, T, g3, g4),
         dsr=probabilistic_sharpe_ratio(sr, sr_star, T, g3, g4),
         n_trials=n_trials,
@@ -343,16 +344,17 @@ def effective_n_trials(returns_frame: pd.DataFrame, max_clusters: int = 30) -> d
                 silhouette=float(best_s))
 
 
-def min_backtest_length(n_trials: int, target_sharpe_annual: float, periods_per_year: int = PERIODS_PER_YEAR) -> float:
+def min_backtest_length(n_trials: int, target_sharpe_annual: float, ppy: int | None = None) -> float:
     """Minimum Backtest Length (Bailey et al. 2014, AFML 11.5): number of
     YEARS of track record needed so that a Sharpe of `target_sharpe_annual`
     could not be expected from the best of `n_trials` pure-noise trials.
     Uses the closed-form upper bound MinBTL ~ 2 ln N / SR^2 (per period)."""
     if target_sharpe_annual <= 0 or n_trials < 2:
         return np.inf
-    sr = target_sharpe_annual / np.sqrt(periods_per_year)
+    ppy = periods_per_year() if ppy is None else ppy
+    sr = target_sharpe_annual / np.sqrt(ppy)
     periods = 2 * np.log(n_trials) / sr ** 2
-    return float(periods / periods_per_year)
+    return float(periods / ppy)
 
 
 # --------------------------------------------------------------------------
@@ -393,7 +395,7 @@ def bootstrap_sharpe_pvalue(returns, n_boot: int = 2000, mean_block: float = 20.
     with np.errstate(invalid="ignore", divide="ignore"):
         boot = np.where(sd > 0, samples.mean(axis=1) / sd, 0.0)
     p = float((boot >= obs).mean())
-    return dict(sharpe=float(obs * np.sqrt(PERIODS_PER_YEAR)), p_value=p, n_boot=n_boot)
+    return dict(sharpe=float(obs * np.sqrt(periods_per_year())), p_value=p, n_boot=n_boot)
 
 
 def reality_check(returns_frame: pd.DataFrame, n_boot: int = 2000, mean_block: float = 20.0, seed: int = 0) -> dict:
