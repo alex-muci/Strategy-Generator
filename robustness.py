@@ -429,6 +429,20 @@ def hrp_weights(returns_frame: pd.DataFrame) -> pd.Series:
     cols = list(returns_frame.columns)
     if len(cols) == 1:
         return pd.Series([1.0], index=cols)
+
+    # A column with zero (or non-finite) variance is a strategy that never
+    # traded. Inverse-variance weighting would divide by zero for it, and the
+    # resulting NaN cluster variance silently degrades the bisection to a 50/50
+    # split -- handing a dead strategy a large share of the book. Give those
+    # columns no weight and run HRP on the rest.
+    var = returns_frame.var()
+    live = [c for c in cols if np.isfinite(var[c]) and var[c] > 0]
+    if len(live) < len(cols):
+        if not live:
+            return pd.Series(1.0 / len(cols), index=cols)
+        w = hrp_weights(returns_frame[live]) if len(live) > 1 else pd.Series([1.0], index=live)
+        return w.reindex(cols).fillna(0.0)
+
     cov = returns_frame.cov()
     corr = returns_frame.corr().fillna(0.0)
     dist = np.sqrt(0.5 * (1 - corr.clip(-1, 1))).to_numpy().copy()

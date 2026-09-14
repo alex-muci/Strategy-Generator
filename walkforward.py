@@ -58,7 +58,10 @@ def warmup_bars(tpl) -> int:
         need.append(tpl.n_exit)
     if tpl.regime_filter != "none":
         spec = REGIME_INDICATORS[tpl.regime_indicator]
-        need.append((tpl.regime_n or spec["n"]) + 10)
+        rn = tpl.regime_n or spec["n"]
+        # ADX is smoothed twice (DI over n bars, then DX over n again), so it is
+        # only fully formed after ~2n bars, unlike the single-pass indicators.
+        need.append(2 * rn + 10 if tpl.regime_indicator == "adx" else rn + 10)
     if tpl.vol_filter:
         need.append(tpl.vol_lookback + tpl.atr_n)
     if tpl.bias_filter == "sma":

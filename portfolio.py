@@ -58,12 +58,18 @@ def candidate_table(wfa_results: dict, rets: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows).set_index("template")
 
 
-def _qualifying(table: pd.DataFrame, min_sharpe, min_windows, require_pardo, min_wfe, min_trades):
+def _qualifying(table: pd.DataFrame, min_sharpe, min_windows, require_pardo, min_wfe, min_trades,
+                available=None):
     q = (table["oos_sharpe"] >= min_sharpe) & (table["n_windows"] >= min_windows) & (table["n_trades_oos"] >= min_trades)
     if require_pardo:
         q &= table["pardo_pass"]
     if min_wfe is not None:
         q &= table["wfe"].fillna(-np.inf) >= min_wfe
+    if available is not None:
+        # a template whose walk-forward produced no usable OOS series has no
+        # column in the aligned returns frame; it is scored 0.0 in `table`, so
+        # with min_sharpe <= 0 it would otherwise qualify and then KeyError.
+        q &= table.index.isin(available)
     return list(table.index[q])
 
 
@@ -98,7 +104,9 @@ def select_subset(rets: pd.DataFrame, candidates: list, method: str = "greedy",
         for name in ranked:
             if name in selected:
                 continue
-            if any(abs(corr.loc[name, s]) > corr_ceiling for s in selected):
+            # a flat (zero-variance) stream has undefined correlation: treat it as
+            # failing the ceiling rather than as conveniently uncorrelated
+            if any(not (abs(corr.loc[name, s]) <= corr_ceiling) for s in selected):
                 continue
             sh = annualized_sharpe(rets[selected + [name]].mean(axis=1))
             if sh > best_s:
@@ -137,7 +145,8 @@ def select_portfolio(
     """
     rets = returns_frame(wfa_results)
     table = candidate_table(wfa_results, rets)
-    qualifying = _qualifying(table, min_sharpe, min_windows, require_pardo, min_wfe, min_trades)
+    qualifying = _qualifying(table, min_sharpe, min_windows, require_pardo, min_wfe, min_trades,
+                             available=set(rets.columns))
     selected = select_subset(rets, qualifying, method, max_strategies, corr_ceiling)
 
     if not selected:

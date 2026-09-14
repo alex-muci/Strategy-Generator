@@ -21,18 +21,50 @@ import numpy as np
 import pandas as pd
 
 
-def load_yfinance(ticker: str, start: str, end: str | None = None) -> pd.DataFrame:
-    """Fetch daily OHLC data for `ticker` between `start` and `end` (YYYY-MM-DD).
+def load_yfinance(
+    ticker: str,
+    start: str,
+    end: str | None = None,
+    interval: str = "1d",
+    min_bars: int = 200,
+) -> pd.DataFrame:
+    """Fetch OHLC data for `ticker` between `start` and `end` (YYYY-MM-DD).
 
-    Returns a DataFrame indexed by date with columns:
-    Open, High, Low, Close, Volume
+    `interval` is any yfinance interval ('1d', '1h', '30m', ...). Note that
+    Yahoo only serves intraday history for a limited window (about 2 years for
+    '1h', 60 days for finer bars).
+
+    Returns a DataFrame indexed by timestamp with columns
+    Open, High, Low, Close, Volume.
+
+    Raises ValueError rather than returning an empty frame: a wrong ticker, a
+    rate limit or no network all make yfinance return an empty DataFrame, and a
+    silent empty frame turns into a confusing IndexError deep in the pipeline.
     """
     import yfinance as yf
 
-    df = yf.download(ticker, start=start, end=end, auto_adjust=True, progress=False)
+    df = yf.download(ticker, start=start, end=end, interval=interval,
+                     auto_adjust=True, progress=False)
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
-    df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
+    if df is None or df.empty:
+        raise ValueError(
+            f"yfinance returned no data for {ticker!r} (interval={interval}, start={start}, "
+            f"end={end}). Check the symbol, the date range (intraday history is short), "
+            f"your network, and whether you are being rate-limited."
+        )
+    missing = [c for c in ("Open", "High", "Low", "Close") if c not in df.columns]
+    if missing:
+        raise ValueError(f"{ticker!r}: yfinance response is missing columns {missing}")
+    if "Volume" not in df.columns:
+        df = df.assign(Volume=np.nan)
+    df = df[["Open", "High", "Low", "Close", "Volume"]]
+    df = df[df[["Open", "High", "Low", "Close"]].notna().all(axis=1)]
+    if len(df) < min_bars:
+        raise ValueError(
+            f"{ticker!r}: only {len(df)} usable bars (interval={interval}), need at least "
+            f"{min_bars}. Widen the date range or use a coarser interval."
+        )
     df.index.name = "Date"
     return df
 

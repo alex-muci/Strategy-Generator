@@ -427,17 +427,22 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
     pend_side = 0
     pend_level = 0.0
     pend_expires = 0
+    last_a = 0.0
 
     equity[0] = initial_equity
     for i in range(1, n):
-        if not ready[i - 1]:
-            equity[i] = cash + (position * shares * (close[i] - entry_price) if position != 0 else 0.0)
-            continue
-
-        a = atr_v[i - 1]
-        if not (a > 0):
-            equity[i] = cash + (position * shares * (close[i] - entry_price) if position != 0 else 0.0)
-            continue
+        # `a_ok`: every indicator this template uses is fully formed on bar i-1
+        # and the ATR is usable. New business (filters, orders, entries) needs
+        # that; an OPEN POSITION is managed on every bar regardless, otherwise a
+        # flat patch that drives the ATR to zero would suspend its stop just when
+        # the gap through it arrives. `last_a` is the most recent usable ATR and
+        # is always > 0 while a position is open (entering required a_ok).
+        a_ok = ready[i - 1] and atr_v[i - 1] > 0.0
+        if a_ok:
+            a = atr_v[i - 1]
+            last_a = a
+        else:
+            a = last_a
 
         # ---- manage open position: exits (checked intrabar on bar i) ----
         if position != 0:
@@ -513,6 +518,12 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
                     trail_extreme = max(trail_extreme, high[i])
                 else:
                     trail_extreme = min(trail_extreme, low[i])
+
+        # ---- no usable indicators: manage what is open, start nothing new ----
+        if not a_ok:
+            pend_active = False  # don't leave a stale resting order behind
+            equity[i] = cash + (position * shares * (close[i] - entry_price) if position != 0 else 0.0)
+            continue
 
         # ---- filters (previous bar's fully-formed values) ----
         can_enter = True
@@ -630,6 +641,15 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
                 n_trades += 1
                 position = 0
                 shares = 0.0
+
+        # ---- the entry bar counts toward the chandelier's anchor ----
+        # (bar i is complete when bar i+1 is traded, so this is not look-ahead;
+        # done after the same-bar stop so the stop still wins on the entry bar)
+        if entered and position != 0 and exit_style == 1:
+            if position == 1:
+                trail_extreme = max(trail_extreme, high[i])
+            else:
+                trail_extreme = min(trail_extreme, low[i])
 
         # ---- mark to market at the close of bar i ----
         equity[i] = cash + (position * shares * (close[i] - entry_price) if position != 0 else 0.0)

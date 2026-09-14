@@ -15,14 +15,19 @@ import pandas as pd
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from data import synthetic_ohlc  # noqa: E402
-from strategy import StrategyTemplate, backtest, cti, adx, choppiness, variance_ratio, efficiency_ratio  # noqa: E402
+from strategy import (  # noqa: E402
+    StrategyTemplate, backtest, cti, adx, choppiness, variance_ratio, efficiency_ratio,
+    _compute_indicators,
+)
 from generator import generate_templates, param_grid_for  # noqa: E402
 from walkforward import walk_forward, grid_combos, smooth_scores, warmup_bars  # noqa: E402
 from robustness import (  # noqa: E402
     trial_returns, cpcv, cpcv_paths, cscv_pbo, deflated_sharpe_ratio, probabilistic_sharpe_ratio,
     bootstrap_sharpe_pvalue, reality_check, hrp_weights, stationary_bootstrap_indices,
 )
-from portfolio import select_portfolio, walk_forward_portfolio, returns_frame  # noqa: E402
+from portfolio import (  # noqa: E402
+    select_portfolio, walk_forward_portfolio, returns_frame, portfolio_weights,
+)
 
 
 def trending_series(n=1500, drift=0.002, vol=0.008, seed=1):
@@ -272,6 +277,124 @@ class PortfolioTests(unittest.TestCase):
         res = self._fake_results(n_tpl=8)
         port = select_portfolio(res, min_sharpe=-1.0, max_strategies=3, method="cluster")
         self.assertLessEqual(len(port["selected"]), 3)
+
+
+class BugRegressionTests(unittest.TestCase):
+    """One test per bug fixed after the first review pass."""
+
+    @staticmethod
+    def _halted_series(n=400, halt=(150, 190), gap=0.70, seed=0):
+        """A steady uptrend, then a completely flat (halted) stretch that drives
+        the ATR to zero, then a hard gap down through any sane stop."""
+        rng = np.random.default_rng(seed)
+        close = 100 * np.cumprod(1 + rng.normal(0.004, 0.01, n))
+        lo, hi = halt
+        close[lo:hi] = close[lo]
+        close[hi:] = close[lo] * gap * np.cumprod(1 + rng.normal(0, 0.01, n - hi))
+        open_ = np.roll(close, 1); open_[0] = close[0]
+        intr = np.abs(rng.normal(0, 0.003, n)) + 0.001
+        high = np.maximum.reduce([close * (1 + intr), open_, close])
+        low = np.minimum.reduce([close * (1 - intr), open_, close])
+        high[lo:hi] = close[lo]; low[lo:hi] = close[lo]; open_[lo:hi] = close[lo]
+        idx = pd.bdate_range("2015-01-01", periods=n)
+        return pd.DataFrame({"Open": open_, "High": high, "Low": low,
+                             "Close": close, "Volume": 1}, index=idx)
+
+    def test_open_position_is_managed_when_the_atr_collapses(self):
+        """A flat patch makes ATR(n) == 0. The entry gate must close, but the
+        stop on an OPEN position must not: otherwise the position rides
+        unprotected straight through the gap that follows."""
+        df = self._halted_series()
+        tpl = StrategyTemplate("t", direction_logic="trend", entry_style="stop",
+                               exit_style="target_stop", n_entry=20, atr_n=20,
+                               atr_mult_stop=2.0, risk_pct=0.01, cost_bps=0.0)
+        ind = _compute_indicators(df, tpl)
+        self.assertTrue((ind["atr"][20:] <= 0).any(), "fixture should zero the ATR")
+        res = backtest(df, tpl)
+        worst = min(t["pnl"] for t in res["trades"])
+        # 1 % of 100k is the intended risk; a gap through the stop can add to it,
+        # but not by an order of magnitude
+        self.assertGreater(worst, -3_000, f"stop was not honoured: worst trade {worst:.0f}")
+
+    def test_trailing_stop_includes_the_entry_bar_extreme(self):
+        """The chandelier anchor must include the entry bar's own high/low --
+        a big favourable move on the entry bar should not be given back."""
+        n = 60
+        close = np.empty(n); high = np.empty(n); low = np.empty(n); open_ = np.empty(n)
+        for i in range(30):                        # narrowing range: no break fires here
+            close[i] = 100.0; open_[i] = 100.0
+            high[i] = 101.0 - 0.02 * i; low[i] = 99.0 + 0.02 * i
+        open_[30], high[30], low[30], close[30] = 100.0, 120.0, 99.5, 101.5
+        for i in range(31, n):                     # then bleed back down
+            close[i] = 101.5 - 0.6 * (i - 30)
+            open_[i] = close[i] + 0.1; high[i] = close[i] + 0.3; low[i] = close[i] - 0.3
+        df = pd.DataFrame({"Open": open_, "High": high, "Low": low, "Close": close,
+                           "Volume": 1}, index=pd.bdate_range("2015-01-01", periods=n))
+        tpl = StrategyTemplate("t", direction_logic="trend", entry_style="stop",
+                               exit_style="atr_trail", n_entry=20, atr_n=10,
+                               atr_mult_trail=2.0, atr_mult_stop=20.0, cost_bps=0.0)
+        trades = backtest(df, tpl)["trades"]
+        self.assertEqual(df.index.get_loc(trades[0]["entry_date"]), 30)
+        self.assertGreater(trades[0]["pnl"], 0.0)
+
+    def test_qualifying_never_names_a_template_absent_from_the_returns_frame(self):
+        """min_sharpe <= 0 used to let a template with an empty OOS series
+        qualify, then KeyError in select_subset."""
+        idx = pd.bdate_range("2015-01-01", periods=600)
+        r = pd.Series(np.random.default_rng(0).normal(0.0005, 0.01, 600), index=idx)
+        summary = dict(oos_cagr=0.0, oos_max_drawdown=0.0, wfe=1.0, pct_profitable_windows=0.6,
+                       n_windows=5, n_trades_oos=50, param_change_rate=0.0, pardo_pass=True)
+        res = {
+            "ok": dict(oos_returns=r, oos_equity=1e5 * (1 + r).cumprod(),
+                       boundaries=list(idx[::100]), windows=[{}] * 5, summary=dict(summary)),
+            "empty": dict(oos_returns=pd.Series(dtype=float), oos_equity=pd.Series(dtype=float),
+                          boundaries=list(idx[::100]), windows=[{}] * 5, summary=dict(summary)),
+        }
+        port = select_portfolio(res, min_sharpe=-10.0, min_windows=0, min_trades=0)
+        self.assertEqual(port["selected"], ["ok"])
+        self.assertNotIn("empty", port["qualifying"])
+
+    def test_hrp_gives_a_dead_strategy_no_weight(self):
+        """A never-traded (zero-variance) column used to divide by zero and then
+        collect an equal share of the book through the NaN bisection."""
+        rng = np.random.default_rng(0)
+        X = pd.DataFrame(rng.normal(0, 0.01, (500, 4)), columns=list("abcd"))
+        X["c"] = 0.0
+        w = hrp_weights(X)
+        self.assertFalse(bool(w.isna().any()))
+        self.assertAlmostEqual(w.sum(), 1.0)
+        self.assertEqual(w["c"], 0.0)
+        self.assertAlmostEqual(portfolio_weights(X, "hrp").sum(), 1.0)
+
+    def test_warmup_covers_adx_double_smoothing(self):
+        """ADX smooths twice, so it needs ~2n bars, not n."""
+        tpl = StrategyTemplate("t", regime_indicator="adx", regime_filter="trend_only",
+                               regime_n=40, n_entry=10, atr_n=10)
+        df = synthetic_ohlc(600, seed=2)
+        ready = _compute_indicators(df, tpl)["ready"]
+        first_ready = int(np.argmax(ready))
+        self.assertTrue(ready.any())
+        self.assertLessEqual(first_ready, warmup_bars(tpl) - 1)
+
+    def test_loader_raises_instead_of_returning_an_empty_frame(self):
+        """A failed download must not look like 'this ticker has no history'."""
+        import data as D
+
+        class _FakeYF:
+            @staticmethod
+            def download(*a, **k):
+                return pd.DataFrame()
+
+        real = sys.modules.get("yfinance")
+        sys.modules["yfinance"] = _FakeYF
+        try:
+            with self.assertRaises(ValueError):
+                D.load_yfinance("NOPE", start="2020-01-01")
+        finally:
+            if real is None:
+                del sys.modules["yfinance"]
+            else:
+                sys.modules["yfinance"] = real
 
 
 if __name__ == "__main__":
