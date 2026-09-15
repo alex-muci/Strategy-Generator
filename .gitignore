@@ -162,3 +162,8 @@ cython_debug/
 *.swo
 *~
 
+# others
+/outputs
+/outputs_*
+# dashboard state (your portfolio spec, positions and generated pages)
+state/
