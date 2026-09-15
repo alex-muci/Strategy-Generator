@@ -19,7 +19,7 @@ portfolio construction) plus the modern overfitting diagnostics.
 ```bash
 conda create -p ./env python=3.12 pandas scikit-learn scipy matplotlib yfinance numba
 conda activate ./env
-python -m unittest discover -s tests -v      # 22 sanity tests (incl. jit-vs-python kernel equivalence)
+python -m unittest discover -s tests -v      # 65 tests (engine, robustness, live signals, dashboard)
 python main.py                                # synthetic data, 72 templates, ~1 min on 8 cores
 ```
 
@@ -47,6 +47,69 @@ Outputs land in `./outputs/` (or `--out DIR`):
 | `correlation_heatmap.png` | correlation of qualifying templates' OOS returns |
 | `selected_windows.csv` | per-window chosen parameters and IS/OOS stats of the finalists |
 | `report.md` | written summary with all the numbers |
+
+## Trading it: the ETF dashboard
+
+`main.py` answers "would this have worked?". `etf_dashboard.py` answers "what do
+I place at my broker this morning?" for a handful of ETFs, in two phases.
+
+```bash
+# once (minutes to an hour) -- decides WHAT to trade
+python etf_dashboard.py research --assets SPY TLT GLD QQQ --family default \
+    --start 2010-01-01 --jobs 8
+
+# every morning, or a few times a day on hourly bars (seconds)
+python etf_dashboard.py signals --account-equity 100000
+open state/dashboard.html
+```
+
+The split is the point. Research runs the whole pipeline per **(asset, template)
+pair** -- so the candidate pool is structurally *and* market diversified -- and
+writes `state/portfolio.json`: the slots to trade, their weights, the
+diagnostics and a plain-language verdict. Re-running that every morning would be
+a fresh data-mining exercise every morning, which is the failure mode the
+robustness toolkit exists to measure. The signals phase only *applies* the spec,
+so it is fast enough for cron:
+
+```
+daily bars:   10 17 * * 1-5   cd <repo> && python etf_dashboard.py signals
+hourly bars:  35 10-16 * * 1-5  ...  (a few minutes after each bar closes)
+```
+
+Add `--interval 1h` to both phases for hourly bars; every annualized statistic
+follows the bar frequency (`strategy.BARS_PER_YEAR`).
+
+What the dashboard shows, in the order you need it:
+
+| | |
+|---|---|
+| **verdict** | the research conclusion, restated every run, so a weak result cannot quietly become habit |
+| **exposure** | gross, net, and the money at risk if every stop fills at once; `--max-gross` scales the whole book down proportionally |
+| **trades to send** | target minus held, per ETF. Put your real broker positions in `state/holdings.json` (`{"SPY": 120, "TLT": -50}`) or it assumes the last run's orders were filled |
+| **orders to work** | the level AND the order type for the next bar -- a breakout entry is a stop order, fading one is a limit order -- with share counts from the engine's own sizing rule |
+| **positions** | entry, current stop, and how much of the original stop distance is left |
+| **track record** | the nested walk-forward curve against simply holding the same ETFs |
+| **slots** | current parameters and when they are next re-optimized |
+| **diagnostics** | PBO, Reality Check, DSR, and the whole search you picked from |
+
+Two rules keep the live path honest, both in `live.py`:
+
+- **Parameters only change at window boundaries.** Re-optimizing every run would
+  be a different strategy from the one the walk-forward measured with
+  `test_bars`-long parameter holds. `due_for_refit` enforces the same cadence.
+- **The forming bar is dropped.** A feed queried at 11:15 returns an 11:00 bar
+  built from 15 minutes of trading; its high, low and close all still move, so
+  acting on it is a decision you could not have taken.
+
+Everything the dashboard reports about the *current* position (side, size, stop,
+target, trailing anchor, resting order) is read out of the same
+`strategy.backtest` loop the research validated, not reimplemented next to it.
+The one thing `live.py` must restate is the *next* bar's order levels, since that
+bar does not exist yet -- so `tests/test_live.py` rolls one real bar forward
+across the template family and asserts the engine filled exactly what the
+dashboard published, at the price that order type implies.
+
+Nothing in this repository places an order. It tells you what to place.
 
 ## Architecture
 
@@ -80,9 +143,22 @@ portfolio.py    Candidate filter (Sharpe / windows / Pardo), greedy or
                 cluster-based subset selection, equal or HRP weights,
                 and the NESTED walk-forward of the selection step.
 
-main.py         Runs everything in a process pool and writes the report.
+main.py         Single-asset research run: everything in a process pool,
+                then the report.
+
+live.py         The live layer: current position and stop levels read out of
+                the engine, the next bar's orders and their order types,
+                re-optimization on the walk-forward's cadence, dropping the
+                forming bar, and per-asset target positions / trade list.
+etf_dashboard.py  `research` (multi-asset pipeline -> portfolio.json + verdict)
+                and `signals` (apply it -> dashboard.html + CSVs).
+dashboard_html.py  Renders that into one self-contained HTML page: no CDN,
+                no font file, inline SVG charts, light and dark.
+
 tests/          unittest suite: no look-ahead, costs, stops, CPCV path
-                coverage, PBO on noise vs. signal, DSR, bootstrap, HRP...
+                coverage, PBO on noise vs. signal, DSR, bootstrap, HRP,
+                the annualization contract, the live order predictions
+                against the engine, and the dashboard round trip.
 ```
 
 ## The strategy templates
@@ -172,6 +248,31 @@ walked forward. With `--trend-prob 0.8 --trend-drift 0.002` (a real
 edge) the finalist passes all 12 walk-forward matrix cells, its
 bootstrap p-value is 0, and the nested portfolio keeps a Sharpe near 1.
 
+## Bugs fixed in the second review pass
+
+- An open position was left completely unmanaged whenever the previous bar's
+  indicators were not fully formed or ATR(n) was zero: the bar loop skipped
+  the whole exit block, so the hard stop, the target and the trailing stop all
+  went quiet. Real data has flat stretches that drive ATR(n) to exactly zero,
+  and in the regression fixture a trade sized to risk 1% of equity rode one of
+  them straight into a gap and lost 13.5%. Exits are now honoured on every bar;
+  only NEW business waits for formed indicators.
+- The ATR chandelier ignored the entry bar's own extreme, so a large favourable
+  move on the entry bar was never locked in (the fixture gave the whole spike
+  back and turned a winner into a loser).
+- `portfolio._qualifying` could name a template with no column in the aligned
+  returns frame, raising KeyError for any `--min-sharpe <= 0`.
+- `hrp_weights` divided by zero on a never-traded (zero-variance) strategy, and
+  the resulting NaN cluster variance silently degraded the bisection to a 50/50
+  split -- handing a dead strategy a quarter of the book.
+- `load_yfinance` returned an empty frame on a wrong symbol, a rate limit or no
+  network, which surfaced much later as an obscure IndexError.
+- `warmup_bars` budgeted n bars for ADX, which is smoothed twice and needs ~2n.
+- `PERIODS_PER_YEAR` was imported by value into four modules and baked into two
+  default arguments, so the project could not be run on anything but daily bars.
+  `strategy.set_periods_per_year()` is now the single source of truth, read at
+  call time and set in the worker processes too.
+
 ## Bugs fixed relative to the first version
 
 - Trailing stop was updated with the current bar's high *before* being
@@ -207,9 +308,10 @@ a decade of daily bars for a family of hundreds of trials.
 
 ## Extending this
 
-- **Multi-asset portfolios**: run the pipeline per asset and merge all
-  `(template, asset)` pairs into one candidate pool -- structural and
-  market diversification at once, closer to RangerZ's basic portfolio.
+- **Multi-asset portfolios**: done, in `etf_dashboard.py research` -- every
+  `(asset, template)` pair is one slot in a single candidate pool, so the
+  portfolio step diversifies structurally and across markets at once, closer
+  to RangerZ's basic portfolio.
 - **More switches**: add an indicator to `REGIME_INDICATORS` or a new
   entry/exit branch in `strategy.backtest`, then list it in
   `generator.FAMILIES`.

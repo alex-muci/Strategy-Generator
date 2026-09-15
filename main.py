@@ -40,8 +40,8 @@ from data import synthetic_ohlc, load_yfinance
 from generator import generate_templates, param_grid_for
 from walkforward import walk_forward, grid_combos
 from robustness import (
-    trial_returns, cpcv, cscv_pbo, deflated_sharpe_ratio, min_backtest_length,
-    bootstrap_sharpe_pvalue, reality_check, effective_n_trials, cscv_block_stats, merge_block_stats,
+    cscv_pbo, deflated_sharpe_ratio, min_backtest_length, bootstrap_sharpe_pvalue,
+    reality_check, effective_n_trials, merge_block_stats, evaluate_template,
 )
 
 
@@ -118,20 +118,16 @@ def _wfa_cell(job):
 
 
 def _evaluate_template(tpl):
+    """Walk-forward + CPCV for one template. Only the CSCV block statistics
+    travel back to the parent process, never the T x N trials matrix."""
     df, a = _DF, _ARGS
     tpl = tpl.with_params(cost_bps=a.cost_bps)
     grid = param_grid_for(tpl, wide=a.wide_grid)
-    wfa = walk_forward(df, tpl, grid, train_bars=a.train, test_bars=a.test, anchored=a.anchored,
-                       metric=a.metric, selection=a.selection)
-    combos, idx = grid_combos(grid)
-    R, E = trial_returns(df, tpl, combos)
-    cp = cpcv(R, E, idx, n_groups=a.cpcv_groups, k_test=a.cpcv_k, embargo_bars=2 * tpl.n_entry,
-              selection=a.selection)
-    # only the CSCV block statistics travel back to the parent (not T x N returns)
-    wfa["trial_blocks"] = cscv_block_stats(R, _cscv_partitions(len(df)))
-    wfa["n_trials"] = R.shape[1]
-    wfa["cpcv"] = {k: v for k, v in cp.items() if k in ("path_sharpes", "path_max_dd", "n_paths", "sharpe_mean",
-                                                        "sharpe_std", "sharpe_min", "prob_sharpe_negative")}
+    wfa = evaluate_template(
+        df, tpl, grid, train_bars=a.train, test_bars=a.test, anchored=a.anchored,
+        metric=a.metric, selection=a.selection, cpcv_groups=a.cpcv_groups,
+        cpcv_k=a.cpcv_k, cscv_partitions_n=_cscv_partitions(len(df)),
+    )
     return tpl.name, wfa
 
 

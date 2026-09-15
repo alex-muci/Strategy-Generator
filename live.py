@@ -44,6 +44,11 @@ from walkforward import grid_combos, score_stats, select_params, warmup_bars
 # data hygiene
 # --------------------------------------------------------------------------
 
+def utcnow() -> pd.Timestamp:
+    """Naive UTC now. One helper so the whole project agrees on the clock."""
+    return pd.Timestamp.now("UTC").tz_convert(None)
+
+
 def drop_forming_bar(df: pd.DataFrame, interval: str, now: pd.Timestamp | None = None) -> pd.DataFrame:
     """Drop the last bar if it has not closed yet.
 
@@ -54,7 +59,7 @@ def drop_forming_bar(df: pd.DataFrame, interval: str, now: pd.Timestamp | None =
     """
     if df.empty:
         return df
-    now = pd.Timestamp.utcnow().tz_localize(None) if now is None else pd.Timestamp(now)
+    now = utcnow() if now is None else pd.Timestamp(now)
     last = df.index[-1]
     if getattr(last, "tz", None) is not None:
         last = last.tz_convert("UTC").tz_localize(None)
@@ -173,6 +178,10 @@ def strategy_state(
         as_of=tail.index[-1],
         last_close=float(tail["Close"].iloc[-1]),
         atr=float(ind["atr"][n - 1]),
+        # the multiple the hard stop sits at, so a reader can express "how close
+        # is this to its stop" as a fraction of the distance it started with
+        atr_mult_stop=float(tpl.atr_mult_stop),
+        exit_style=tpl.exit_style,
         equity_slot=float(equity),
         position=None if pos is None else pos["side"],
         shares=0.0 if pos is None else pos["shares"],
@@ -412,6 +421,12 @@ def trade_list(by_asset: pd.DataFrame, holdings: dict, lot: float = 1.0) -> pd.D
     so a 3-share drift does not generate a trade every morning.
     """
     assets = sorted(set(by_asset.index) | set(holdings))
+    if not assets:
+        # a flat book with nothing held: an empty frame still has to carry the
+        # columns, or every consumer of it blows up on a quiet day
+        return pd.DataFrame(columns=["held", "target", "delta", "action", "order_shares",
+                                     "price", "order_notional"],
+                            index=pd.Index([], name="asset"))
     rows = []
     for a in assets:
         target = float(by_asset["shares"].get(a, 0.0))

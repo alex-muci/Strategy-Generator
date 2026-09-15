@@ -35,7 +35,7 @@ from scipy.cluster.hierarchy import linkage, leaves_list
 from scipy.spatial.distance import squareform
 
 from strategy import backtest, periods_per_year
-from walkforward import smooth_scores
+from walkforward import smooth_scores, walk_forward, grid_combos
 
 EULER_GAMMA = 0.5772156649015329
 
@@ -56,6 +56,42 @@ def trial_returns(df: pd.DataFrame, tpl, combos: list, initial_equity: float = 1
         R[:, j] = res["returns"].to_numpy()
         E[:, j] = res["entries"]
     return R, E
+
+
+def evaluate_template(
+    df: pd.DataFrame,
+    tpl,
+    param_grid: dict,
+    *,
+    cpcv_groups: int = 8,
+    cpcv_k: int = 2,
+    cscv_partitions_n: int = 16,
+    selection: str = "plateau",
+    **wfa_kwargs,
+) -> dict:
+    """Walk-forward a template AND stress it, in one call.
+
+    Returns the `walk_forward` dict plus:
+      cpcv         : the CPCV Sharpe distribution (summary fields only)
+      trial_blocks : CSCV block statistics of the trials matrix, so the caller
+                     can pool PBO across a whole family without shipping every
+                     T x N return matrix back from a worker process
+      n_trials     : how many parameter combos were tried
+
+    Shared by main.py (one asset) and etf_dashboard.py (several), so the two
+    cannot drift apart on what "evaluated" means.
+    """
+    wfa = walk_forward(df, tpl, param_grid, selection=selection, **wfa_kwargs)
+    combos, idx = grid_combos(param_grid)
+    R, E = trial_returns(df, tpl, combos)
+    cp = cpcv(R, E, idx, n_groups=cpcv_groups, k_test=cpcv_k,
+              embargo_bars=2 * tpl.n_entry, selection=selection)
+    wfa["cpcv"] = {k: v for k, v in cp.items()
+                   if k in ("path_sharpes", "path_max_dd", "n_paths", "sharpe_mean",
+                            "sharpe_std", "sharpe_min", "prob_sharpe_negative")}
+    wfa["trial_blocks"] = cscv_block_stats(R, cscv_partitions_n)
+    wfa["n_trials"] = R.shape[1]
+    return wfa
 
 
 def _sharpe_cols(R: np.ndarray, mask: np.ndarray) -> np.ndarray:
