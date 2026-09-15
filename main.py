@@ -57,7 +57,7 @@ def _cscv_partitions(T: int) -> int:
     return 16 if T >= 1600 else 8
 
 
-def parse_args():
+def parse_args(argv=None):
     p = argparse.ArgumentParser(description="Ranger-style strategy generator with robust walk-forward evaluation")
     p.add_argument("--family", default="quick", choices=["quick", "default", "full"])
     p.add_argument("--max-templates", type=int, default=None)
@@ -88,7 +88,7 @@ def parse_args():
     p.add_argument("--no-matrix", action="store_true", help="skip Pardo's walk-forward matrix (slow-ish)")
     p.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) - 1))
     p.add_argument("--out", default="outputs")
-    return p.parse_args()
+    return p.parse_args(argv)
 
 
 # --------------------------------------------------------------------------

@@ -48,6 +48,7 @@ Outputs land in `./outputs/` (or `--out DIR`):
 | `selected_windows.csv` | per-window chosen parameters and IS/OOS stats of the finalists |
 | `report.md` | written summary with all the numbers |
 
+
 ## Trading it: the ETF dashboard
 
 `main.py` answers "would this have worked?". `etf_dashboard.py` answers "what do
