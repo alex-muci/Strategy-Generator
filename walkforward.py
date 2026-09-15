@@ -33,7 +33,9 @@ from itertools import product as iproduct
 import numpy as np
 import pandas as pd
 
-from strategy import backtest, annualized_sharpe, periods_per_year, REGIME_INDICATORS
+from strategy import (
+    backtest, annualized_sharpe, periods_per_year, performance_stats, REGIME_INDICATORS,
+)
 
 
 # --------------------------------------------------------------------------
@@ -51,17 +53,37 @@ def grid_combos(grid: dict):
     return combos, np.array(idx, dtype=int).reshape(len(combos), len(keys))
 
 
+def _ema_settle_bars(alpha: float, tol: float = 1e-4) -> int:
+    """Bars until an EMA started cold has forgotten its seed to within `tol`.
+
+    A rolling window is exact once it is full; an exponential average never
+    is -- it carries (1 - alpha)^t of its (arbitrary) first value forever. A
+    walk-forward window backtested from a cold start therefore sees a Keltner
+    channel or an ADX that differs from the one a trader with full history
+    sees, unless the warm-up runs long enough for that residual to vanish.
+    """
+    return int(np.ceil(np.log(tol) / np.log1p(-alpha)))
+
+
 def warmup_bars(tpl) -> int:
-    """Bars needed before the first bar on which `tpl` can trade."""
+    """Bars needed before the first bar on which `tpl` can trade AND on which
+    every indicator it uses matches what a full-history run would show."""
     need = [tpl.n_entry, tpl.atr_n]
+    if tpl.channel_type == "keltner":
+        need.append(_ema_settle_bars(2.0 / (tpl.n_entry + 1)))
     if tpl.exit_style == "channel":
         need.append(tpl.n_exit)
+        if tpl.channel_type == "keltner":
+            need.append(_ema_settle_bars(2.0 / (tpl.n_exit + 1)))
     if tpl.regime_filter != "none":
         spec = REGIME_INDICATORS[tpl.regime_indicator]
         rn = tpl.regime_n or spec["n"]
-        # ADX is smoothed twice (DI over n bars, then DX over n again), so it is
-        # only fully formed after ~2n bars, unlike the single-pass indicators.
-        need.append(2 * rn + 10 if tpl.regime_indicator == "adx" else rn + 10)
+        if tpl.regime_indicator == "adx":
+            # Wilder smoothing (alpha = 1/n) applied twice: the DX smoothing
+            # only starts once the DI smoothing has settled
+            need.append(rn + 2 * _ema_settle_bars(1.0 / rn))
+        else:
+            need.append(rn + 10)
     if tpl.vol_filter:
         need.append(tpl.vol_lookback + tpl.atr_n)
     if tpl.bias_filter == "sma":
@@ -112,6 +134,66 @@ def _annualized_return(stats: dict) -> float:
 
 
 # --------------------------------------------------------------------------
+# one window, warmed up but traded only inside itself
+# --------------------------------------------------------------------------
+
+def window_backtest(df: pd.DataFrame, tpl, start: int, end: int, *,
+                    warmup: int | None = None, initial_equity: float = 100_000.0) -> dict:
+    """Backtest `tpl` on the bars df.iloc[start:end], with the indicators
+    warmed up on the bars before `start` but NO trade opened before it.
+
+    This is the one way both halves of the walk-forward run a window:
+
+    * a cold start inside the window throws away its first `warmup_bars`
+      bars (and a different number of them for every parameter set, which
+      makes the in-sample scores of a grid non-comparable);
+    * a warm start that is allowed to trade on the buffer opens positions
+      BEFORE the window, chosen by parameters that were fitted on exactly
+      those bars, and their P&L then lands in the window's "out-of-sample"
+      return.
+
+    Returns the `backtest` dict with `returns`, `equity` and `stats` cut to
+    the window (the equity starts the window at `initial_equity`; all trades
+    lie inside it) plus `window_start`, the window's first timestamp.
+    """
+    n = len(df)
+    start, end = int(start), int(min(end, n))
+    warmup = warmup_bars(tpl) if warmup is None else int(warmup)
+    buf = max(0, start - warmup)
+    res = backtest(df.iloc[buf:end], tpl, initial_equity=initial_equity, first_trade_bar=start - buf)
+    off = start - buf
+    eq = res["equity"].to_numpy()[off:]
+    out = dict(res)
+    out["equity"] = res["equity"].iloc[off:]
+    out["returns"] = res["returns"].iloc[off:]
+    out["entries"] = res["entries"][off:]
+    out["stats"] = performance_stats(eq, res["trades"], initial_equity)
+    out["window_start"] = df.index[start]
+    return out
+
+
+def optimize_window(df: pd.DataFrame, tpl, combos: list, idx: np.ndarray, start: int, end: int, *,
+                    metric: str = "sharpe", selection: str = "plateau", min_trades: int = 5,
+                    initial_equity: float = 100_000.0) -> dict:
+    """The in-sample step: score every parameter set of `combos` on the
+    window df.iloc[start:end] (each warmed up on the bars before it) and pick
+    one with `selection`. Shared by the walk-forward loop and the live refit
+    so the two cannot choose parameters differently.
+
+    Returns dict(best=index into combos or None, scores, stats)."""
+    warm = max(warmup_bars(tpl.with_params(**p)) for p in combos)
+    scores = np.empty(len(combos))
+    stats_list = []
+    for j, params in enumerate(combos):
+        res = window_backtest(df, tpl.with_params(**params), start, end, warmup=warm,
+                              initial_equity=initial_equity)
+        stats_list.append(res["stats"])
+        scores[j] = score_stats(res["stats"], metric, min_trades)
+    best = select_params(scores, idx, selection)
+    return dict(best=best, scores=scores, stats=stats_list, warmup=warm)
+
+
+# --------------------------------------------------------------------------
 # the walk-forward loop
 # --------------------------------------------------------------------------
 
@@ -155,16 +237,11 @@ def walk_forward(
             break
         train_end = test_start - embargo_bars
         train_start = 0 if anchored else max(0, train_end - train_bars)
-        train_slice = df.iloc[train_start:train_end]
 
         # ---- optimize on the training window ----
-        scores = np.empty(len(combos))
-        stats_list = []
-        for j, params in enumerate(combos):
-            res = backtest(train_slice, tpl.with_params(**params), initial_equity=initial_equity)
-            stats_list.append(res["stats"])
-            scores[j] = score_stats(res["stats"], metric, min_trades)
-        best = select_params(scores, idx, selection)
+        opt = optimize_window(df, tpl, combos, idx, train_start, train_end, metric=metric,
+                              selection=selection, min_trades=min_trades, initial_equity=initial_equity)
+        best, scores, stats_list = opt["best"], opt["scores"], opt["stats"]
 
         boundaries.append(df.index[test_start])
         oos_slice_index = df.index[test_start:test_end]
@@ -183,17 +260,16 @@ def walk_forward(
         chosen_params = combos[best]
         chosen = tpl.with_params(**chosen_params)
 
-        # ---- apply OOS, with a warm-up buffer so indicators are formed on day 1 ----
-        buf_start = max(0, test_start - warmup_bars(chosen))
-        oos_res = backtest(df.iloc[buf_start:test_end], chosen, initial_equity=initial_equity)
-        oos_rets = oos_res["returns"].loc[oos_slice_index]
+        # ---- apply OOS: indicators warmed up before the window, first trade
+        # no earlier than its first bar (see window_backtest) ----
+        oos_res = window_backtest(df, chosen, test_start, test_end, initial_equity=initial_equity)
+        oos_rets = oos_res["returns"]
         oos_ret_parts.append(oos_rets)
 
-        oos_trades = [t for t in oos_res["trades"] if t["entry_date"] >= oos_slice_index[0]]
         oos_stats = dict(
             total_return=float((1 + oos_rets).prod() - 1),
             sharpe=annualized_sharpe(oos_rets),
-            n_trades=len(oos_trades),
+            n_trades=len(oos_res["trades"]),
             n_bars=len(oos_rets),
         )
         is_stats = stats_list[best]
@@ -246,12 +322,17 @@ def summarize_walk_forward(windows: list, oos_returns: pd.Series) -> dict:
 
     is_sharpes = np.array([w["is_stats"]["sharpe"] for w in live])
     is_ann = np.array([_annualized_return(w["is_stats"]) for w in live])
-    oos_ann_total = total * periods_per_year() / n_bars
+    oos_ann = np.array([_annualized_return(w["oos_stats"]) for w in live])
     is_ann_mean = float(is_ann.mean())
-    # Pardo: annualized OOS return / annualized IS return. Undefined when the
-    # optimizer could not even find a profitable IS fit; clipped because a
-    # tiny IS denominator makes the ratio meaningless either way.
-    wfe = float(np.clip(oos_ann_total / is_ann_mean, -10, 10)) if is_ann_mean > 0 else np.nan
+    oos_ann_mean = float(oos_ann.mean())
+    # Pardo: annualized OOS return / annualized IS return, both as the mean of
+    # the per-window simple-annualized returns. Annualizing the COMPOUNDED
+    # total of the whole OOS history against per-window IS figures would grow
+    # with the length of the history alone (a flat 10 %/y over 30 years
+    # compounds to a "WFE" of 6). Undefined when the optimizer could not even
+    # find a profitable IS fit; clipped because a tiny IS denominator makes
+    # the ratio meaningless either way.
+    wfe = float(np.clip(oos_ann_mean / is_ann_mean, -10, 10)) if is_ann_mean > 0 else np.nan
 
     profitable = np.array([w["oos_stats"]["total_return"] > 0 for w in live])
     pct_profitable = float(profitable.mean())

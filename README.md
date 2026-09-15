@@ -19,7 +19,7 @@ portfolio construction) plus the modern overfitting diagnostics.
 ```bash
 conda create -p ./env python=3.12 pandas scikit-learn scipy matplotlib yfinance numba
 conda activate ./env
-python -m unittest discover -s tests -v      # 65 tests (engine, robustness, live signals, dashboard)
+python -m unittest discover -s tests -v      # 89 tests (engine, templates, walk-forward, robustness, live signals, dashboard)
 python main.py                                # synthetic data, 72 templates, ~1 min on 8 cores
 ```
 
@@ -247,6 +247,37 @@ static portfolio's Sharpe of 0.6 turns into -0.5 once the selection is
 walked forward. With `--trend-prob 0.8 --trend-drift 0.002` (a real
 edge) the finalist passes all 12 walk-forward matrix cells, its
 bootstrap p-value is 0, and the nested portfolio keeps a Sharpe near 1.
+
+## Bugs fixed in the third review pass (walk-forward and the bar loop)
+
+- The out-of-sample window was backtested from a cold start `warmup_bars`
+  before it, and that buffer was allowed to TRADE. A position opened on the
+  buffer was chosen by parameters fitted on exactly those bars, and its P&L
+  inside the window was counted as out-of-sample (5 % of OOS bars and 8 % of
+  OOS trades on the synthetic default). `backtest()` now takes
+  `first_trade_bar`: the buffer only forms indicators, the first trade is on
+  the window's first bar, and `walkforward.window_backtest` is the one way
+  both the training and the test window are run. Training windows get the
+  same warm-up, so a grid point with a 60-bar channel is no longer scored on
+  fewer bars than one with a 20-bar channel, and `live.refit_params` calls
+  the same optimizer as the walk-forward loop.
+- The warm-up was far too short for exponentially smoothed indicators: an
+  EMA carries `(1-alpha)^t` of its arbitrary seed forever, and after the old
+  buffer a Keltner channel or a Wilder ADX still differed from the value a
+  trader with full history sees (the ADX by 27 % at the first bar of a test
+  window). `warmup_bars` now budgets the settle time of the EMA.
+- Pardo's WFE annualized the COMPOUNDED total return of the whole OOS
+  history and divided it by the mean per-window IS return, so it grew with
+  the length of the history alone: a flat 10 %/y in-sample and out-of-sample
+  reported a WFE of 1.6 over ten years and 6 over thirty. It is now the mean
+  of the per-window annualized OOS returns over the mean of the IS ones.
+- With a trend template's channel exit, a bar that traded through both the
+  channel and the hard stop always filled at the stop, although the channel
+  (the nearer level) is hit first on the way through; 4.6 % of channel-exit
+  trades on the synthetic default were filled at the wrong, further level.
+- The indicator cache was keyed on sampled closes only, so two frames with
+  the same closes and different highs and lows shared one (wrong) ATR and
+  channel. High and Low are now part of the key.
 
 ## Bugs fixed in the second review pass
 

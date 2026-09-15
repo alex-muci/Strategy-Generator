@@ -37,7 +37,7 @@ from strategy import (
     StrategyTemplate, backtest, periods_per_year, _compute_indicators,
     ENTRY_CODES, EXIT_CODES,
 )
-from walkforward import grid_combos, score_stats, select_params, warmup_bars
+from walkforward import grid_combos, optimize_window, warmup_bars
 
 
 # --------------------------------------------------------------------------
@@ -107,17 +107,16 @@ def refit_params(
     chosen the same way the walk-forward chose them.
     """
     combos, idx = grid_combos(param_grid)
-    train = df if anchored else df.iloc[-train_bars:]
-    if len(train) < train_bars and not anchored:
-        raise ValueError(f"need {train_bars} bars to refit, have {len(train)}")
+    start = 0 if anchored else len(df) - train_bars
+    if start < 0:
+        raise ValueError(f"need {train_bars} bars to refit, have {len(df)}")
+    train = df.iloc[start:]
 
-    scores = np.empty(len(combos))
-    stats_list = []
-    for j, params in enumerate(combos):
-        res = backtest(train, tpl.with_params(**params), initial_equity=initial_equity)
-        stats_list.append(res["stats"])
-        scores[j] = score_stats(res["stats"], metric, min_trades)
-    best = select_params(scores, idx, selection)
+    # the window's indicators warm up on the bars before it (when there are
+    # any), exactly as the walk-forward's training windows do
+    opt = optimize_window(df, tpl, combos, idx, start, len(df), metric=metric, selection=selection,
+                          min_trades=min_trades, initial_equity=initial_equity)
+    best, scores, stats_list = opt["best"], opt["scores"], opt["stats"]
     return dict(
         params=None if best is None else combos[best],
         is_stats=None if best is None else stats_list[best],

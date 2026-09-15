@@ -349,7 +349,12 @@ _IND_CACHE_MAX = 4096
 def _df_key(df: pd.DataFrame, close=None) -> tuple:
     c = df["Close"].to_numpy() if close is None else close
     n = len(c)
-    return (n, df.index[0], df.index[-1], float(c[0]), float(c[n // 3]), float(c[(2 * n) // 3]), float(c[-1]))
+    # High/Low feed the ATR and every channel, so they are part of the key too:
+    # two frames with identical closes but different wicks must not share arrays
+    h = df["High"].to_numpy()
+    lo = df["Low"].to_numpy()
+    return (n, df.index[0], df.index[-1], float(c[0]), float(c[n // 3]), float(c[(2 * n) // 3]), float(c[-1]),
+            float(h.sum()), float(lo.sum()), float(h[n // 2]), float(lo[n // 2]))
 
 
 def _cached(df: pd.DataFrame, spec: tuple, fn, dfkey=None):
@@ -436,9 +441,14 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
               has_vol, vol_low, vol_high, has_bias,
               atr_mult_stop, atr_mult_target, atr_mult_trail, pullback_atr_mult,
               pullback_valid_bars, max_hold_bars, risk_pct, max_leverage, cost_rate,
-              initial_equity):
+              initial_equity, first_trade_bar):
     """The bar loop. Plain numpy code so numba can compile it unchanged;
     the pure-Python version is used when numba is not installed.
+
+    Bars before `first_trade_bar` are indicator warm-up only: nothing is
+    entered on them (and no order rests on them), so the walk-forward can
+    hand the loop a slice that starts before its window without any trade
+    decided on the earlier bars leaking into the window's result.
 
     Returns equity, entries, the closed-trade columns
     (entry_bar, exit_bar, side, entry_px, exit_px, shares, pnl, cost, reason, count)
@@ -493,6 +503,7 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
             reason = -1
             side = position
             stop_level = stop_price  # hard stop is always active
+            stop_reason = 0
 
             if exit_style == 1:
                 # trailing level from the extreme up to bar i-1 (no intrabar look-ahead)
@@ -501,24 +512,28 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
                     stop_level = max(stop_level, trail_stop)
                 else:
                     stop_level = min(stop_level, trail_stop)
+            elif exit_style == 0 and is_trend:
+                # the opposite channel is a stop on the SAME side as the hard
+                # stop; on the way through, whichever sits nearer to the price
+                # is hit first, so it must fill at that level, not at the
+                # further one
+                if side == 1 and lower_x[i - 1] > stop_level:
+                    stop_level = lower_x[i - 1]
+                    stop_reason = 1
+                elif side == -1 and upper_x[i - 1] < stop_level:
+                    stop_level = upper_x[i - 1]
+                    stop_reason = 1
 
             if side == 1 and low[i] <= stop_level:
                 exit_price = min(open_[i], stop_level)
-                reason = 0
+                reason = stop_reason
             elif side == -1 and high[i] >= stop_level:
                 exit_price = max(open_[i], stop_level)
-                reason = 0
+                reason = stop_reason
 
             if reason < 0:
                 if exit_style == 0:
-                    if is_trend:
-                        if side == 1 and low[i] <= lower_x[i - 1]:
-                            exit_price = min(open_[i], lower_x[i - 1])
-                            reason = 1
-                        elif side == -1 and high[i] >= upper_x[i - 1]:
-                            exit_price = max(open_[i], upper_x[i - 1])
-                            reason = 1
-                    else:
+                    if not is_trend:
                         if side == 1 and high[i] >= mid_x[i - 1]:
                             exit_price = max(open_[i], mid_x[i - 1])
                             reason = 2
@@ -562,8 +577,9 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
                 else:
                     trail_extreme = min(trail_extreme, low[i])
 
-        # ---- no usable indicators: manage what is open, start nothing new ----
-        if not a_ok:
+        # ---- no usable indicators (or still warming up): manage what is open,
+        # start nothing new ----
+        if not a_ok or i < first_trade_bar:
             pend_active = False  # don't leave a stale resting order behind
             equity[i] = cash + (position * shares * (close[i] - entry_price) if position != 0 else 0.0)
             continue
@@ -714,15 +730,20 @@ except Exception:  # pragma: no cover
     HAVE_NUMBA = False
 
 
-def backtest(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: float = 100_000.0) -> dict:
+def backtest(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: float = 100_000.0,
+             first_trade_bar: int = 0) -> dict:
     """Run `tpl` over `df` (must have Open/High/Low/Close). Returns a dict:
         equity   : pd.Series of end-of-bar equity, indexed like df
         returns  : pd.Series of per-bar simple returns of equity
         entries  : np.ndarray (1 on bars where a new trade was opened)
         trades   : list of trade dicts
         stats    : summary performance stats
+
+    `first_trade_bar` > 0 uses the first bars as indicator warm-up only: the
+    equity stays at `initial_equity` and no trade can open before that bar.
     """
     n = len(df)
+    first_trade_bar = int(max(first_trade_bar, 0))
     close = _to_arr(df["Close"])
     open_ = _to_arr(df["Open"])
     high = _to_arr(df["High"])
@@ -739,7 +760,7 @@ def backtest(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: float = 10
         bool(tpl.vol_filter), float(tpl.vol_low_pct), float(tpl.vol_high_pct), tpl.bias_filter == "sma",
         float(tpl.atr_mult_stop), float(tpl.atr_mult_target), float(tpl.atr_mult_trail), float(tpl.pullback_atr_mult),
         int(tpl.pullback_valid_bars), int(tpl.max_hold_bars), float(tpl.risk_pct), float(tpl.max_leverage),
-        tpl.cost_bps / 1e4, float(initial_equity),
+        tpl.cost_bps / 1e4, float(initial_equity), first_trade_bar,
     )
     (equity, entries, t_entry, t_exit, t_side, t_entry_px, t_exit_px, t_shares, t_pnl, t_cost,
      t_reason, n_trades, f_position, f_shares, f_entry_price, f_stop, f_target, f_trail,
@@ -758,7 +779,7 @@ def backtest(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: float = 10
     rets[1:] = equity[1:] / equity[:-1] - 1.0
     equity_s = pd.Series(equity, index=idx)
     returns = pd.Series(rets, index=idx)
-    stats = _performance_stats(equity, trades, initial_equity, rets, t_pnl[:n_trades],
+    stats = performance_stats(equity, trades, initial_equity, rets, t_pnl[:n_trades],
                                (t_exit[:n_trades] - t_entry[:n_trades]).astype(float))
 
     open_position = None
@@ -790,7 +811,7 @@ def annualized_sharpe(rets: pd.Series | np.ndarray, ppy: int | None = None) -> f
     return float(r.mean() / sd * np.sqrt(ppy)) if sd > 0 else 0.0
 
 
-def _performance_stats(equity, trades: list, initial_equity: float, rets=None, pnls=None, bars_held=None) -> dict:
+def performance_stats(equity, trades: list, initial_equity: float, rets=None, pnls=None, bars_held=None) -> dict:
     """Summary stats from an equity path. Accepts a numpy array or a Series;
     `rets`, `pnls` and `bars_held` may be passed to skip recomputation."""
     eq = np.asarray(equity, dtype=float)
@@ -825,3 +846,6 @@ def _performance_stats(equity, trades: list, initial_equity: float, rets=None, p
         exposure=float(bars_held.sum() / n_bars) if n_bars else 0.0,
         n_bars=n_bars,
     )
+
+
+_performance_stats = performance_stats  # backwards-compatible name
