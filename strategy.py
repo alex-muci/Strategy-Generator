@@ -440,8 +440,9 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
     """The bar loop. Plain numpy code so numba can compile it unchanged;
     the pure-Python version is used when numba is not installed.
 
-    Returns equity, entries and the closed-trade columns
-    (entry_bar, exit_bar, side, entry_px, exit_px, shares, pnl, cost, reason, count)."""
+    Returns equity, entries, the closed-trade columns
+    (entry_bar, exit_bar, side, entry_px, exit_px, shares, pnl, cost, reason, count)
+    and the loop's final state (open position, resting order, last usable ATR)."""
     n = len(close)
     equity = np.empty(n)
     entries = np.zeros(n, dtype=np.int8)
@@ -696,7 +697,12 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
         # ---- mark to market at the close of bar i ----
         equity[i] = cash + (position * shares * (close[i] - entry_price) if position != 0 else 0.0)
 
-    return (equity, entries, t_entry, t_exit, t_side, t_entry_px, t_exit_px, t_shares, t_pnl, t_cost, t_reason, n_trades)
+    # the trailing state is returned too, so the live signal layer in live.py can
+    # read the CURRENT position and resting order out of the same loop the
+    # backtest runs, instead of reimplementing the rules and drifting from them
+    return (equity, entries, t_entry, t_exit, t_side, t_entry_px, t_exit_px, t_shares, t_pnl, t_cost,
+            t_reason, n_trades, position, shares, entry_price, stop_price, target_price, trail_extreme,
+            entry_bar, entry_cost, pend_active, pend_side, pend_level, pend_expires, last_a)
 
 
 try:  # compile the loop once per process; falls back to plain Python without numba
@@ -735,7 +741,9 @@ def backtest(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: float = 10
         int(tpl.pullback_valid_bars), int(tpl.max_hold_bars), float(tpl.risk_pct), float(tpl.max_leverage),
         tpl.cost_bps / 1e4, float(initial_equity),
     )
-    (equity, entries, t_entry, t_exit, t_side, t_entry_px, t_exit_px, t_shares, t_pnl, t_cost, t_reason, n_trades) = out
+    (equity, entries, t_entry, t_exit, t_side, t_entry_px, t_exit_px, t_shares, t_pnl, t_cost,
+     t_reason, n_trades, f_position, f_shares, f_entry_price, f_stop, f_target, f_trail,
+     f_entry_bar, f_entry_cost, f_pend_active, f_pend_side, f_pend_level, f_pend_expires, f_last_atr) = out
 
     idx = df.index
     idx_arr = idx.to_numpy()
@@ -752,7 +760,24 @@ def backtest(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: float = 10
     returns = pd.Series(rets, index=idx)
     stats = _performance_stats(equity, trades, initial_equity, rets, t_pnl[:n_trades],
                                (t_exit[:n_trades] - t_entry[:n_trades]).astype(float))
-    return {"equity": equity_s, "returns": returns, "entries": entries, "trades": trades, "stats": stats}
+
+    open_position = None
+    if f_position != 0:
+        open_position = dict(
+            side=int(f_position), shares=float(f_shares), entry_price=float(f_entry_price),
+            entry_bar=int(f_entry_bar), entry_date=pd.Timestamp(idx_arr[int(f_entry_bar)]),
+            entry_cost=float(f_entry_cost), hard_stop=float(f_stop), target=float(f_target),
+            trail_extreme=float(f_trail), bars_held=int(n - 1 - int(f_entry_bar)),
+            unrealized=float(f_position * f_shares * (close[-1] - f_entry_price)),
+        )
+    pending_order = None
+    if f_pend_active:
+        pending_order = dict(side=int(f_pend_side), level=float(f_pend_level),
+                             expires_bar=int(f_pend_expires))
+
+    return {"equity": equity_s, "returns": returns, "entries": entries, "trades": trades,
+            "stats": stats, "open_position": open_position, "pending_order": pending_order,
+            "last_atr": float(f_last_atr), "indicators": ind}
 
 
 def annualized_sharpe(rets: pd.Series | np.ndarray, ppy: int | None = None) -> float:
