@@ -30,6 +30,7 @@ python main.py --help
 python main.py --family quick                       # 72 templates (Donchian, ER filter)
 python main.py --family default                     # ~770 templates, all switches sampled
 python main.py --real SPY --start 2005-01-01 --family default --jobs 8
+python main.py --real SPY --start 2005-01-01 --family quick --sides long_only   # one-sided family (an asset with a drift)
 python main.py --real QQQ --start 2010-01-01 --train 500 --test 125   # rolling window (default): each window re-optimizes on the last 500 bars only
 python main.py --real GC=F --train 750 --test 250 --anchored --selection best   # anchored: training (window expands from bar 0)
 python main.py --trend-prob 0.8 --trend-drift 0.002  # synthetic data with a KNOWN trend edge
@@ -39,14 +40,14 @@ Outputs land in `./outputs/` (or `--out DIR`):
 
 | file | what it shows |
 |---|---|
-| `equity_curves.png` | every template's OOS curve (grey), the selected ones, the static portfolio (black) and the **nested walk-forward portfolio** (red dashed) |
-| `template_ranking.png/.csv` | every template ranked by OOS Sharpe, with WFE, % profitable windows, Pardo pass, CPCV mean and P(CPCV<0); red line = expected max Sharpe of that many noise trials |
+| `equity_curves.png` | every template's OOS curve (grey), the selected ones, the static portfolio (black), the **nested walk-forward portfolio** (red dashed) and **buy & hold** of the same asset over the same bars (dotted) |
+| `template_ranking.png/.csv` | every template ranked by OOS Sharpe, with WFE, % profitable windows, Pardo pass, CPCV mean and P(CPCV<0); red line = expected max Sharpe of that many noise trials, dotted line = buy & hold Sharpe |
 | `cpcv_distribution.png` | for each finalist, the distribution of Sharpe over all combinatorial-CV paths vs. the single walk-forward path |
 | `pbo.png` | CSCV logit histogram (Probability of Backtest Overfitting) and OOS-vs-IS degradation for the whole family |
 | `wfa_matrix_*.png` | Pardo's walk-forward matrix (train x test lengths) for the top finalist |
 | `correlation_heatmap.png` | correlation of qualifying templates' OOS returns |
 | `selected_windows.csv` | per-window chosen parameters and IS/OOS stats of the finalists |
-| `report.md` | written summary with all the numbers |
+| `report.md` | written summary with all the numbers, including the **buy & hold benchmark**: Sharpe, CAGR and drawdown of simply holding the asset over the same OOS bars, the nested portfolio's beta and correlation to it and its information ratio (what is left after the asset's own drift is removed), and how many templates beat holding at all |
 
 
 ## Trading it: the ETF dashboard
@@ -176,6 +177,7 @@ A **template** is a fixed combination of categorical switches:
 | `regime_filter` | `none` / `trend_only` / `range_only` (Ranger's "sideways" mode) |
 | `vol_filter` | skip entries when ATR is in an extreme percentile |
 | `bias_filter` | `sma`: longs only above SMA(200), shorts only below (financial-hacker's market-direction filter) |
+| `sides` | `both` / `long_only` / `short_only`. Quick and default families are two-sided; restrict them from the command line (`--sides long_only`) because whether an asset has a drift is a property of the asset, not something to let the selection step data-mine. `full` carries all three. |
 
 Its *numeric* parameters (lookbacks, ATR multiples, thresholds...) are
 re-optimized every walk-forward window from a small lattice grid

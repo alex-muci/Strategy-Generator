@@ -31,7 +31,7 @@ from data import synthetic_ohlc  # noqa: E402
 from strategy import (  # noqa: E402
     StrategyTemplate, backtest, _compute_indicators, REGIME_INDICATORS,
     DIRECTION_LOGICS, CHANNEL_TYPES, ENTRY_STYLES, EXIT_STYLES, REGIME_FILTERS,
-    VOL_FILTERS, BIAS_FILTERS,
+    VOL_FILTERS, BIAS_FILTERS, SIDES,
 )
 from generator import generate_templates, param_grid_for, FAMILIES  # noqa: E402
 from walkforward import grid_combos  # noqa: E402
@@ -67,7 +67,11 @@ PERTURB = {
 def _family_size(spec: dict) -> int:
     regimes = {("er", rf) if rf == "none" else (ri, rf) for ri, rf in spec["regimes"]}
     return (len(spec["direction_logics"]) * len(spec["channel_types"]) * len(spec["entry_styles"])
-            * len(spec["exit_styles"]) * len(regimes) * len(spec["vol_filters"]) * len(spec["bias_filters"]))
+            * len(spec["exit_styles"]) * len(regimes) * len(spec["vol_filters"]) * len(spec["bias_filters"])
+            * len(spec.get("sides", ["both"])))
+
+
+_MIRROR_SIDES = {"both": "both", "long_only": "short_only", "short_only": "long_only"}
 
 
 def _mirror(df: pd.DataFrame) -> pd.DataFrame:
@@ -104,6 +108,7 @@ class TemplateGenerationTests(unittest.TestCase):
             self.assertIn(t.regime_indicator, REGIME_INDICATORS)
             self.assertIn(t.bias_filter, BIAS_FILTERS)
             self.assertIn(t.vol_filter, VOL_FILTERS)
+            self.assertIn(t.sides, SIDES)
         self.assertEqual(set(ENTRY_CODES), set(ENTRY_STYLES))
         self.assertEqual(set(EXIT_CODES), set(EXIT_STYLES))
         self.assertEqual(set(REGIME_CODES), set(REGIME_FILTERS))
@@ -181,7 +186,11 @@ class TemplateBehaviourTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.df = synthetic_ohlc(1200, seed=11)
-        cls.sample = generate_templates("full")[::41]      # 78 templates, every switch value present
+        # 78 two-sided templates, every other switch value present. One-sided
+        # templates are covered by test_each_switch_changes_the_strategy; they
+        # trade too rarely (half the signals gone, filters stacked on top) for
+        # the "used params move the run" ratio below to be meaningful.
+        cls.sample = [t for t in generate_templates("full") if t.sides == "both"][::41]
 
     def _equity(self, df, tpl):
         return backtest(df, tpl)["equity"].to_numpy()
@@ -277,7 +286,8 @@ class TemplateBehaviourTests(unittest.TestCase):
         costs off, the ATR-based size is the same on both sides). Anything the
         short-side code does differently from the long side shows up here.
         The variance-ratio indicator is built on log returns, which do not
-        mirror, so it is the one template family left out."""
+        mirror, so it is the one template family left out. A one-sided
+        template is mirrored into the other side's template."""
         mirror = _mirror(self.df)
         c = 2.0 * (float(self.df["High"].max()) + 1.0)
         checked = 0
@@ -285,7 +295,7 @@ class TemplateBehaviourTests(unittest.TestCase):
             if tpl.regime_filter != "none" and tpl.regime_indicator == "vr":
                 continue
             t = tpl.with_params(cost_bps=0.0, max_leverage=1e9)
-            a, b = backtest(self.df, t), backtest(mirror, t)
+            a, b = backtest(self.df, t), backtest(mirror, t.with_params(sides=_MIRROR_SIDES[t.sides]))
             np.testing.assert_allclose(a["equity"].to_numpy(), b["equity"].to_numpy(), rtol=1e-9,
                                        err_msg=f"{tpl.name}: mirrored run has a different equity curve")
             self.assertEqual(len(a["trades"]), len(b["trades"]), tpl.name)
@@ -306,6 +316,7 @@ class TemplateBehaviourTests(unittest.TestCase):
         variants = [
             ("direction_logic", DIRECTION_LOGICS), ("channel_type", CHANNEL_TYPES),
             ("entry_style", ENTRY_STYLES), ("exit_style", EXIT_STYLES), ("bias_filter", BIAS_FILTERS),
+            ("sides", SIDES),
         ]
         for field, values in variants:
             runs = [self._equity(df, base.with_params(**{field: v})) for v in values]
@@ -319,6 +330,16 @@ class TemplateBehaviourTests(unittest.TestCase):
             self.assertIn(why, {t["reason"] for t in trades}, ex)
         ct = backtest(df, base.with_params(direction_logic="countertrend"))["trades"]
         self.assertIn("midline", {t["reason"] for t in ct})
+        # a one-sided template never takes the other side, and its trades are
+        # exactly the two-sided template's trades on that side, not a re-run
+        for sides, side in (("long_only", 1), ("short_only", -1)):
+            one = backtest(df, base.with_params(sides=sides))["trades"]
+            self.assertTrue(one, sides)
+            self.assertEqual({t["side"] for t in one}, {side}, sides)
+            # with the SMA bias on top the set can only shrink
+            biased = backtest(df, base.with_params(sides=sides, bias_filter="sma"))["trades"]
+            self.assertLessEqual(len(biased), len(one), sides)
+            self.assertEqual({t["side"] for t in biased} - {side}, set(), sides)
 
 
 if __name__ == "__main__":

@@ -30,6 +30,7 @@ from strategy import (
     REGIME_FILTERS,
     VOL_FILTERS,
     BIAS_FILTERS,
+    SIDES,
 )
 
 # (indicator, filter) pairs; the indicator is irrelevant when filter == 'none'
@@ -46,6 +47,7 @@ FAMILIES = {
         regimes=[("er", "none"), ("er", "trend_only"), ("er", "range_only")],
         vol_filters=VOL_FILTERS,
         bias_filters=["none"],
+        sides=["both"],
     ),
     "default": dict(
         direction_logics=DIRECTION_LOGICS,
@@ -57,6 +59,7 @@ FAMILIES = {
                  ("chop", "range_only"), ("vr", "trend_only"), ("vr", "range_only")],
         vol_filters=[False],
         bias_filters=["none", "sma"],
+        sides=["both"],
     ),
     "full": dict(
         direction_logics=DIRECTION_LOGICS,
@@ -66,8 +69,13 @@ FAMILIES = {
         regimes=_ALL_REGIMES,
         vol_filters=VOL_FILTERS,
         bias_filters=BIAS_FILTERS,
+        sides=SIDES,
     ),
 }
+# `sides` is deliberately ["both"] in quick and default: restricting a family to
+# one side is a decision about the ASSET (does it have a drift?), so it is taken
+# on the command line (`--sides long_only`) rather than by tripling the family
+# and letting the selection step data-mine it.
 
 _SHORT = {
     "trend": "TR", "countertrend": "CT",
@@ -76,12 +84,15 @@ _SHORT = {
     "channel": "chan", "atr_trail": "trail", "target_stop": "tgt", "time_stop": "time",
     "none": "none", "trend_only": "trend", "range_only": "range",
     "sma": "sma",
+    "both": "", "long_only": "L", "short_only": "S",
 }
 
 
-def template_name(dl, ch, es, ex, rind, rf, vf, bf) -> str:
+def template_name(dl, ch, es, ex, rind, rf, vf, bf, sd="both") -> str:
     regime = "noreg" if rf == "none" else f"{rind}:{_SHORT[rf]}"
-    return f"{_SHORT[dl]}-{_SHORT[ch]}-{_SHORT[es]}-{_SHORT[ex]}-{regime}-{'V' if vf else 'noV'}-{'B' if bf == 'sma' else 'noB'}"
+    base = f"{_SHORT[dl]}-{_SHORT[ch]}-{_SHORT[es]}-{_SHORT[ex]}-{regime}-{'V' if vf else 'noV'}-{'B' if bf == 'sma' else 'noB'}"
+    # two-sided templates keep their historical names; one-sided ones get a suffix
+    return base if sd == "both" else f"{base}-{_SHORT[sd]}"
 
 
 def generate_templates(
@@ -100,18 +111,19 @@ def generate_templates(
     combos = product(
         spec["direction_logics"], spec["channel_types"], spec["entry_styles"],
         spec["exit_styles"], spec["regimes"], spec["vol_filters"], spec["bias_filters"],
+        spec.get("sides", ["both"]),
     )
-    for dl, ch, es, ex, (rind, rf), vf, bf in combos:
+    for dl, ch, es, ex, (rind, rf), vf, bf, sd in combos:
         if rf == "none":
             rind = "er"  # canonical: indicator is irrelevant without a filter
-        key = (dl, ch, es, ex, rind, rf, vf, bf)
+        key = (dl, ch, es, ex, rind, rf, vf, bf, sd)
         if key in seen:
             continue
         seen.add(key)
         tpl = StrategyTemplate(
             name=template_name(*key),
             direction_logic=dl, channel_type=ch, entry_style=es, exit_style=ex,
-            regime_indicator=rind, regime_filter=rf, vol_filter=vf, bias_filter=bf,
+            regime_indicator=rind, regime_filter=rf, vol_filter=vf, bias_filter=bf, sides=sd,
         )
         tpl.validate()
         templates.append(tpl)

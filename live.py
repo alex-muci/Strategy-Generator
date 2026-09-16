@@ -224,12 +224,14 @@ def _filter_block(df: pd.DataFrame, tpl: StrategyTemplate, ind: dict) -> list:
 
 
 def _bias(df: pd.DataFrame, tpl: StrategyTemplate, ind: dict) -> tuple[bool, bool]:
-    """(long allowed, short allowed) under the SMA bias filter."""
+    """(long allowed, short allowed) under the `sides` switch and the SMA bias
+    filter, in the same order the engine applies them."""
+    long_ok, short_ok = tpl.sides != "short_only", tpl.sides != "long_only"
     if tpl.bias_filter != "sma":
-        return True, True
+        return long_ok, short_ok
     n = len(df)
     c, b = float(df["Close"].iloc[-1]), float(ind["bias"][n - 1])
-    return c > b, c < b
+    return long_ok and c > b, short_ok and c < b
 
 
 def _entry_orders(df, tpl: StrategyTemplate, ind: dict, pending, equity: float) -> list:

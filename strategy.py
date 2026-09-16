@@ -58,6 +58,12 @@ Switches (define a "template" -- a structurally distinct strategy):
                               below it ("market direction" filter from
                               financial-hacker's Market Regime Filter)
 
+  sides           : 'both' / 'long_only' / 'short_only' -> which side of the
+                    market the template may take at all. On an asset with a
+                    persistent drift the two sides are different strategies,
+                    not mirror images: on SPY every short leg of every
+                    symmetric template lost money over 2005-2026.
+
 Numeric params (walk-forward optimized, see generator.param_grid_for):
   n_entry, n_exit, atr_n, channel_k, atr_mult_stop, atr_mult_target,
   atr_mult_trail, pullback_atr_mult, pullback_valid_bars, max_hold_bars,
@@ -268,6 +274,7 @@ REGIME_INDICATOR_NAMES = list(REGIME_INDICATORS)
 REGIME_FILTERS = ["none", "trend_only", "range_only"]
 VOL_FILTERS = [False, True]
 BIAS_FILTERS = ["none", "sma"]
+SIDES = ["both", "long_only", "short_only"]
 
 
 @dataclass
@@ -285,6 +292,7 @@ class StrategyTemplate:
     regime_filter: str = "none"
     vol_filter: bool = False
     bias_filter: str = "none"
+    sides: str = "both"
 
     # numeric params / defaults (subject to WFA tuning)
     n_entry: int = 40
@@ -322,6 +330,7 @@ class StrategyTemplate:
             regime_filter=self.regime_filter,
             vol_filter=self.vol_filter,
             bias_filter=self.bias_filter,
+            sides=self.sides,
         )
 
     def validate(self):
@@ -332,6 +341,7 @@ class StrategyTemplate:
         assert self.regime_indicator in REGIME_INDICATORS
         assert self.regime_filter in REGIME_FILTERS
         assert self.bias_filter in BIAS_FILTERS
+        assert self.sides in SIDES
 
 
 # --------------------------------------------------------------------------
@@ -438,7 +448,7 @@ REASONS = ["stop", "channel", "midline", "target", "time", "stop_same_bar"]
 def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
               upper_x, lower_x, mid_x, regime, vol_rank, bias,
               is_trend, entry_style, exit_style, regime_mode, regime_thr,
-              has_vol, vol_low, vol_high, has_bias,
+              has_vol, vol_low, vol_high, has_bias, allow_long, allow_short,
               atr_mult_stop, atr_mult_target, atr_mult_trail, pullback_atr_mult,
               pullback_valid_bars, max_hold_bars, risk_pct, max_leverage, cost_rate,
               initial_equity, first_trade_bar):
@@ -593,11 +603,12 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
         if can_enter and has_vol:
             can_enter = vol_low <= vol_rank[i - 1] <= vol_high
 
-        long_ok = True
-        short_ok = True
+        # the `sides` switch first, then the SMA bias narrows it further
+        long_ok = allow_long
+        short_ok = allow_short
         if has_bias:
-            long_ok = close[i - 1] > bias[i - 1]
-            short_ok = close[i - 1] < bias[i - 1]
+            long_ok = long_ok and close[i - 1] > bias[i - 1]
+            short_ok = short_ok and close[i - 1] < bias[i - 1]
 
         fill_side = 0
         fill_px = 0.0
@@ -758,6 +769,7 @@ def backtest(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: float = 10
         tpl.direction_logic == "trend", ENTRY_CODES[tpl.entry_style], EXIT_CODES[tpl.exit_style],
         REGIME_CODES[tpl.regime_filter], float(ind.get("regime_threshold", 0.0)),
         bool(tpl.vol_filter), float(tpl.vol_low_pct), float(tpl.vol_high_pct), tpl.bias_filter == "sma",
+        tpl.sides != "short_only", tpl.sides != "long_only",
         float(tpl.atr_mult_stop), float(tpl.atr_mult_target), float(tpl.atr_mult_trail), float(tpl.pullback_atr_mult),
         int(tpl.pullback_valid_bars), int(tpl.max_hold_bars), float(tpl.risk_pct), float(tpl.max_leverage),
         tpl.cost_bps / 1e4, float(initial_equity), first_trade_bar,

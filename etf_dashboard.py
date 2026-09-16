@@ -68,7 +68,7 @@ from robustness import (
 )
 from strategy import (
     StrategyTemplate, annualized_sharpe, periods_per_year, set_periods_per_year,
-    periods_per_year_for_interval, BARS_PER_YEAR,
+    periods_per_year_for_interval, BARS_PER_YEAR, SIDES,
 )
 from dashboard_html import render_dashboard
 
@@ -101,6 +101,8 @@ def parse_args(argv=None):
     r.add_argument("--start", default="2010-01-01")
     r.add_argument("--family", default="quick", choices=["quick", "default", "full"])
     r.add_argument("--max-templates", type=int, default=None)
+    r.add_argument("--sides", nargs="+", default=None, choices=SIDES,
+                   help="restrict every template to these sides (default: the family's own list)")
     r.add_argument("--train", type=int, default=500, help="training window (bars)")
     r.add_argument("--test", type=int, default=125, help="test window (bars)")
     r.add_argument("--anchored", action="store_true", help="expanding training window")
@@ -232,10 +234,11 @@ def research(args) -> dict:
             f"only {n_bars} shared bars: too few for train={args.train} + test={args.test}. "
             f"Use an earlier --start, a coarser --interval, or smaller windows.")
 
-    templates = generate_templates(args.family, max_templates=args.max_templates)
+    overrides = {"sides": args.sides} if args.sides else {}
+    templates = generate_templates(args.family, max_templates=args.max_templates, **overrides)
     cfg = dict(
         interval=args.interval, periods_per_year=ppy, start=args.start,
-        family=args.family, train_bars=args.train, test_bars=args.test,
+        family=args.family, sides=args.sides, train_bars=args.train, test_bars=args.test,
         anchored=args.anchored, metric=args.metric, selection=args.selection,
         wide_grid=args.wide_grid, cost_bps=args.cost_bps, risk_pct=args.risk_pct,
         max_leverage=args.max_leverage, cpcv_groups=args.cpcv_groups, cpcv_k=args.cpcv_k,

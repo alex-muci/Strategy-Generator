@@ -48,7 +48,7 @@ from robustness import (
 from portfolio import select_portfolio, walk_forward_portfolio, returns_frame
 from strategy import (
     annualized_sharpe, periods_per_year, set_periods_per_year,
-    periods_per_year_for_interval, BARS_PER_YEAR,
+    periods_per_year_for_interval, BARS_PER_YEAR, SIDES,
 )
 
 
@@ -61,6 +61,9 @@ def parse_args(argv=None):
     p = argparse.ArgumentParser(description="Ranger-style strategy generator with robust walk-forward evaluation")
     p.add_argument("--family", default="quick", choices=["quick", "default", "full"])
     p.add_argument("--max-templates", type=int, default=None)
+    p.add_argument("--sides", nargs="+", default=None, choices=SIDES,
+                   help="restrict every template to these sides (default: the family's own list, "
+                        "'both' for quick and default). On an asset with a drift, e.g. --sides long_only")
     p.add_argument("--real", metavar="TICKER", default=None, help="use yfinance data for TICKER instead of synthetic")
     p.add_argument("--start", default="2005-01-01")
     p.add_argument("--interval", default="1d", choices=sorted(BARS_PER_YEAR),
@@ -147,8 +150,10 @@ def main():
     print(f"Data: {len(df)} bars, {df.index[0].date()} to {df.index[-1].date()}, "
           f"annualizing at {periods_per_year()} bars/year")
 
-    templates = generate_templates(args.family, max_templates=args.max_templates)
-    print(f"Generated {len(templates)} structurally distinct strategy templates (family={args.family})")
+    overrides = {"sides": args.sides} if args.sides else {}
+    templates = generate_templates(args.family, max_templates=args.max_templates, **overrides)
+    print(f"Generated {len(templates)} structurally distinct strategy templates (family={args.family}"
+          f"{', sides=' + '/'.join(args.sides) if args.sides else ''})")
     print(f"Walk-forward: train={args.train} test={args.test} {'anchored' if args.anchored else 'rolling'}, "
           f"selection={args.selection}, metric={args.metric}, cost={args.cost_bps}bps/side")
 
@@ -197,7 +202,11 @@ def _run(df, templates, pool, args, t0):
     # ---- finalists: bootstrap p-value, DSR, walk-forward matrix ----
     finalists = finalist_diagnostics(results, port, fam, args, pool)
 
-    _report(df, results, port, nested, fam, finalists, args)
+    # ---- the benchmark nobody optimized: holding the asset over the same bars ----
+    bench = benchmark_stats(df, rets, port, nested)
+    _print_benchmark(bench, args)
+
+    _report(df, results, port, nested, fam, finalists, bench, args)
     print(f"\nTotal runtime {time.time() - t0:.1f}s. Outputs in ./{args.out}/")
 
 
@@ -248,6 +257,75 @@ def family_diagnostics(results: dict, rets: pd.DataFrame, args) -> dict:
     return out
 
 
+def _curve_stats(r: pd.Series) -> dict:
+    eq = (1 + r).cumprod()
+    n = len(r)
+    if n < 2:
+        return dict(sharpe=0.0, cagr=0.0, max_dd=0.0, n_bars=n)
+    return dict(
+        sharpe=annualized_sharpe(r),
+        cagr=float(eq.iloc[-1] ** (periods_per_year() / n) - 1) if eq.iloc[-1] > 0 else -1.0,
+        max_dd=float((eq / eq.cummax() - 1).min()),
+        n_bars=n,
+    )
+
+
+def _against(r: pd.Series, bh: pd.Series) -> dict:
+    """Beta, correlation and information ratio of a return stream against
+    buy-and-hold over the stream's own dates. The IR (annualized Sharpe of the
+    residual after removing beta x benchmark) is scale-free, so it compares
+    a strategy risking 1 % per trade with an unlevered holding."""
+    x = bh.reindex(r.index).fillna(0.0).to_numpy()
+    y = r.to_numpy()
+    if len(y) < 3 or x.std(ddof=1) == 0 or y.std(ddof=1) == 0:
+        return dict(beta=np.nan, corr=np.nan, info_ratio=np.nan)
+    beta = float(np.cov(x, y, ddof=1)[0, 1] / x.var(ddof=1))
+    resid = y - beta * x
+    ir = float(resid.mean() / resid.std(ddof=1) * np.sqrt(periods_per_year())) if resid.std(ddof=1) > 0 else 0.0
+    return dict(beta=beta, corr=float(np.corrcoef(x, y)[0, 1]), info_ratio=ir)
+
+
+def benchmark_stats(df: pd.DataFrame, rets: pd.DataFrame, port: dict, nested: dict) -> dict:
+    """Buy-and-hold of the same asset over the same out-of-sample bars, and the
+    two portfolios measured against it.
+
+    Every template here was walked forward, selected and stress-tested; the
+    asset itself was not, so it is the one curve with no selection bias at
+    all. Sharpe is the number to compare (the templates risk 1 % of equity
+    per trade, so their CAGR is on a different scale); beta says how much of a
+    portfolio is just the asset's own drift, and the information ratio how
+    much is left once that is removed."""
+    bh = df["Close"].pct_change().reindex(rets.index).fillna(0.0)
+    tpl_sharpes = rets.apply(annualized_sharpe)
+    out = dict(
+        returns=bh,
+        buy_hold=_curve_stats(bh),
+        n_templates=int(rets.shape[1]),
+        n_templates_beat_bh=int((tpl_sharpes > annualized_sharpe(bh)).sum()),
+        static=None, nested=None, buy_hold_nested_period=None,
+    )
+    pr = port["portfolio_returns"]
+    if len(pr) > 2:
+        out["static"] = _curve_stats(pr) | _against(pr, bh)
+    nr = nested["portfolio_returns"]
+    if len(nr) > 2:
+        out["nested"] = _curve_stats(nr) | _against(nr, bh)
+        out["buy_hold_nested_period"] = _curve_stats(bh.reindex(nr.index).fillna(0.0))
+    return out
+
+
+def _print_benchmark(b: dict, args) -> None:
+    asset = args.real or "synthetic series"
+    print(f"\nBenchmark: buy and hold {asset} over the same OOS bars: Sharpe {b['buy_hold']['sharpe']:.2f}, "
+          f"CAGR {b['buy_hold']['cagr']:.1%}, max DD {b['buy_hold']['max_dd']:.1%}; "
+          f"{b['n_templates_beat_bh']} of {b['n_templates']} templates have a higher OOS Sharpe")
+    if b["nested"]:
+        n, bhn = b["nested"], b["buy_hold_nested_period"]
+        print(f"  nested walk-forward portfolio Sharpe {n['sharpe']:.2f} vs buy-and-hold {bhn['sharpe']:.2f} "
+              f"over the nested period; beta {n['beta']:.2f}, corr {n['corr']:.2f}, "
+              f"information ratio {n['info_ratio']:.2f}")
+
+
 def finalist_diagnostics(results, port, fam, args, pool) -> dict:
     print("\nFinalist diagnostics (selected templates)...")
     out = {}
@@ -281,7 +359,7 @@ def finalist_diagnostics(results, port, fam, args, pool) -> dict:
 # reporting
 # --------------------------------------------------------------------------
 
-def _report(df, results, port, nested, fam, finalists, args):
+def _report(df, results, port, nested, fam, finalists, bench, args):
     out = args.out
     selected = port["selected"]
     table = port["candidate_stats"].copy()
@@ -318,7 +396,12 @@ def _report(df, results, port, nested, fam, finalists, args):
     if len(nested["portfolio_equity"]) > 1:
         neq = nested["portfolio_equity"] / nested["portfolio_equity"].iloc[0]
         ax.plot(neq.index, neq.values, linewidth=3.0, color="red", linestyle="--", label="PORTFOLIO (nested walk-forward selection)")
-    ax.set_title("Out-of-sample walk-forward equity: all templates (grey), selected, and portfolios")
+    bh_eq = (1 + bench["returns"]).cumprod()
+    if len(bh_eq) > 1:
+        ax.plot(bh_eq.index, bh_eq.values, linewidth=1.8, color="#444444", linestyle=":",
+                label=f"BUY & HOLD {args.real or 'the asset'} (Sharpe {bench['buy_hold']['sharpe']:.2f}; "
+                      "unlevered, strategies risk 1%/trade)")
+    ax.set_title("Out-of-sample walk-forward equity: all templates (grey), selected, portfolios, buy & hold")
     ax.set_ylabel("Growth of 1.0")
     ax.legend(fontsize=7, ncol=2, loc="upper left")
     ax.grid(alpha=0.3)
@@ -349,6 +432,8 @@ def _report(df, results, port, nested, fam, finalists, args):
     ax.invert_yaxis()
     ax.axvline(fam["dsr_best"]["sr_star_annual"], color="red", linestyle="--", linewidth=1,
                label=f"E[max Sharpe of {fam['n_eff']} independent noise trials] = {fam['dsr_best']['sr_star_annual']:.2f}")
+    ax.axvline(bench["buy_hold"]["sharpe"], color="#444444", linestyle=":", linewidth=1.5,
+               label=f"buy & hold {args.real or 'the asset'} = {bench['buy_hold']['sharpe']:.2f}")
     ax.set_xlabel("Out-of-sample Sharpe (walk-forward)")
     ax.set_title("Templates ranked (blue = selected, green = passes Pardo WFA criteria)")
     ax.tick_params(axis="y", labelsize=6)
@@ -465,7 +550,40 @@ def _report(df, results, port, nested, fam, finalists, args):
         for s in nested["selections"]:
             L.append(f"- {pd.Timestamp(s['period_start']).date()}: {', '.join(s['selected']) or '(cash)'}\n")
 
+    b = bench
+    asset = args.real or "the synthetic series"
+    L.append(f"\n## Benchmark: buy and hold {asset}\n\n")
+    L.append("The asset was not optimized, selected or stress-tested, so it is the one curve with no "
+             "selection bias. Compare Sharpe: the templates risk 1 % of equity per trade, so their CAGR "
+             "and drawdown are on a smaller scale than an unlevered holding.\n\n")
+    L.append("| curve | period | Sharpe | CAGR | max DD | beta to B&H | corr | info ratio |\n")
+    L.append("|---|---|---|---|---|---|---|---|\n")
+    bh = b["buy_hold"]
+    L.append(f"| buy & hold | all OOS bars ({bh['n_bars']}) | {bh['sharpe']:.2f} | {bh['cagr']:.1%} | {bh['max_dd']:.1%} | 1.00 | 1.00 | - |\n")
+    if b["static"]:
+        s = b["static"]
+        L.append(f"| static portfolio | all OOS bars | {s['sharpe']:.2f} | {s['cagr']:.1%} | {s['max_dd']:.1%} | "
+                 f"{s['beta']:.2f} | {s['corr']:.2f} | {s['info_ratio']:.2f} |\n")
+    if b["nested"]:
+        n, bhn = b["nested"], b["buy_hold_nested_period"]
+        L.append(f"| buy & hold | nested period ({bhn['n_bars']}) | {bhn['sharpe']:.2f} | {bhn['cagr']:.1%} | {bhn['max_dd']:.1%} | 1.00 | 1.00 | - |\n")
+        L.append(f"| **nested portfolio** | nested period | **{n['sharpe']:.2f}** | {n['cagr']:.1%} | {n['max_dd']:.1%} | "
+                 f"{n['beta']:.2f} | {n['corr']:.2f} | **{n['info_ratio']:.2f}** |\n")
+    L.append(f"\n{b['n_templates_beat_bh']} of {b['n_templates']} templates have a higher OOS Sharpe than holding {asset}.\n")
+    if b["nested"]:
+        n, bhn = b["nested"], b["buy_hold_nested_period"]
+        if n["sharpe"] < bhn["sharpe"]:
+            L.append(f"\nThe honest portfolio Sharpe ({n['sharpe']:.2f}) is BELOW buy and hold ({bhn['sharpe']:.2f}) "
+                     "over the same bars: the whole search did not beat doing nothing. ")
+        else:
+            L.append(f"\nThe honest portfolio Sharpe ({n['sharpe']:.2f}) is above buy and hold ({bhn['sharpe']:.2f}) "
+                     "over the same bars. ")
+        L.append(f"Beta {n['beta']:.2f} and correlation {n['corr']:.2f} say how much of it is the asset's own drift; "
+                 f"the information ratio {n['info_ratio']:.2f} is what is left once that is removed.\n")
+
     L.append("\n## How to read this\n\n")
+    L.append("- Buy & hold: if the nested portfolio's Sharpe is not above it, the search added nothing; "
+             "a high beta with a low information ratio means the templates are a costly way to hold the asset.\n")
     L.append("- PBO near 0.5 or above: picking the best parameter set in-sample is no better than a coin toss out-of-sample.\n")
     L.append("- DSR below ~0.95: the best OOS Sharpe is not distinguishable from the best of that many random trials.\n")
     L.append("- Reality Check p above 0.05-0.15: the family's best result is consistent with data snooping.\n")
