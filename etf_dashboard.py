@@ -55,7 +55,7 @@ import numpy as np
 import pandas as pd
 
 from data import load_yfinance, synthetic_ohlc
-from generator import generate_templates, param_grid_for
+from generator import generate_templates, param_grid_for, FAMILIES
 from live import (
     drop_forming_bar, refit_params, due_for_refit, strategy_state,
     portfolio_targets, trade_list, utcnow,
@@ -99,7 +99,7 @@ def parse_args(argv=None):
     r = sub.add_parser("research", parents=[common], help="decide what to trade (slow)")
     r.add_argument("--assets", nargs="+", default=["SPY", "TLT", "GLD", "QQQ"])
     r.add_argument("--start", default="2010-01-01")
-    r.add_argument("--family", default="quick", choices=["quick", "default", "full"])
+    r.add_argument("--family", default="quick", choices=list(FAMILIES))
     r.add_argument("--max-templates", type=int, default=None)
     r.add_argument("--sides", nargs="+", default=None, choices=SIDES,
                    help="restrict every template to these sides (default: the family's own list)")
@@ -325,6 +325,9 @@ def _assemble_spec(data, results, args, cfg, pool) -> dict:
                 pct_profitable_windows=float(s["pct_profitable_windows"]),
                 n_windows=int(s["n_windows"]), n_trades_oos=int(s["n_trades_oos"]),
                 pardo_pass=bool(s["pardo_pass"]),
+                oos_exposure=float(s.get("oos_exposure", 0.0)),
+                oos_notional=float(s.get("oos_notional", 0.0)),
+                oos_avg_net_exposure=float(s.get("oos_avg_net_exposure", 0.0)),
                 cpcv_mean=float(cp["sharpe_mean"]), cpcv_std=float(cp["sharpe_std"]),
                 cpcv_prob_negative=float(cp["prob_sharpe_negative"]),
                 bootstrap_p=float(finalists[name]["bootstrap_p"]),

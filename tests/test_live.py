@@ -149,6 +149,51 @@ class LiveOrderTests(unittest.TestCase):
                     self.assertTrue(any(o["kind"] == "stop" for o in st["exit_orders"]))
                     self.assertEqual(st["entry_orders"], [])
 
+    def test_channel_exit_is_one_stop_at_the_nearer_level(self):
+        """A trend template with a channel exit has TWO exit levels on the same
+        side of the price: the hard ATR stop and the opposite channel. The
+        engine fills whichever is nearer (strategy._bar_loop merges them into
+        one stop level), so the live layer must publish ONE stop at that
+        level. Two same-side resting stops would reverse the position when
+        the second fills after the first has closed it, and a channel stop
+        further away than the hard stop is a level the engine never uses."""
+        checked_chan = checked_hard = 0
+        for tpl in [t for t in generate_templates("full") if t.exit_style == "channel"
+                    and t.direction_logic == "trend" and t.sides == "both"][::9]:
+            for t in range(LOOKBACK + 20, len(self.df), 23):
+                st = strategy_state(self.df.iloc[:t], tpl, equity=100_000.0, lookback_bars=LOOKBACK)
+                if st["position"] is None:
+                    continue
+                side = st["position"]
+                stops = [o for o in st["exit_orders"] if o["kind"] == "stop"]
+                self.assertEqual(len(st["exit_orders"]), 1, f"{tpl.name} bar {t}: {st['exit_orders']}")
+                self.assertEqual(len(stops), 1)
+                self.assertEqual(stops[0]["side"], -side)
+                res = backtest(self.df.iloc[t - LOOKBACK:t], tpl, initial_equity=100_000.0)
+                ind, n = res["indicators"], LOOKBACK
+                hard = res["open_position"]["hard_stop"]
+                chan = float(ind["lower_x"][n - 1] if side == 1 else ind["upper_x"][n - 1])
+                nearer = max(hard, chan) if side == 1 else min(hard, chan)
+                self.assertAlmostEqual(stops[0]["level"], nearer, places=8, msg=f"{tpl.name} bar {t}")
+                if nearer == chan and chan != hard:
+                    checked_chan += 1
+                else:
+                    checked_hard += 1
+        # both cases must occur, or the test is not telling them apart
+        self.assertGreater(checked_chan, 20)
+        self.assertGreater(checked_hard, 20)
+        # a countertrend channel exit keeps its two DIFFERENT orders: hard stop + midline limit
+        ct = [t for t in generate_templates("full") if t.exit_style == "channel"
+              and t.direction_logic == "countertrend" and t.sides == "both"][0]
+        seen = 0
+        for t in range(LOOKBACK + 20, len(self.df), 23):
+            st = strategy_state(self.df.iloc[:t], ct, equity=100_000.0, lookback_bars=LOOKBACK)
+            if st["position"] is None:
+                continue
+            self.assertEqual(sorted(o["kind"] for o in st["exit_orders"]), ["limit", "stop"], ct.name)
+            seen += 1
+        self.assertGreater(seen, 5)
+
     def test_sizing_matches_the_engine(self):
         """The share count on a predicted order must equal what the engine
         would actually buy at that level."""

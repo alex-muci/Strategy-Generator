@@ -18,6 +18,8 @@ from data import synthetic_ohlc  # noqa: E402
 from strategy import (  # noqa: E402
     StrategyTemplate, backtest, cti, adx, choppiness, variance_ratio, efficiency_ratio,
     _compute_indicators, annualized_sharpe,
+    hedge_weights, hedge_channel, hedge_warmup, hedge_direction, hedge_experts, donchian,
+    HEDGE_LADDER, HEDGE_MEMORY, _adahedge_loop,
 )
 from generator import generate_templates, param_grid_for  # noqa: E402
 from walkforward import (  # noqa: E402
@@ -31,6 +33,33 @@ from robustness import (  # noqa: E402
 from portfolio import (  # noqa: E402
     select_portfolio, walk_forward_portfolio, returns_frame, portfolio_weights,
 )
+
+
+def _ohlc_from_close(close, rng):
+    n = len(close)
+    intrabar = np.abs(rng.normal(0, 0.003, n)) + 0.001
+    open_ = np.roll(close, 1); open_[0] = close[0]
+    high = np.maximum.reduce([close * (1 + intrabar), open_, close])
+    low = np.minimum.reduce([close * (1 - intrabar), open_, close])
+    idx = pd.bdate_range("2010-01-01", periods=n)
+    return pd.DataFrame({"Open": open_, "High": high, "Low": low, "Close": close, "Volume": 1}, index=idx)
+
+
+def regime_series(seed=0, kinds=("trend", "mr", "trend"), n_each=1000):
+    """Alternating regimes: steady up-trend / AR(1) mean reversion."""
+    rng = np.random.default_rng(seed)
+    parts, lvl = [], 100.0
+    for kind in kinds:
+        if kind == "trend":
+            c = lvl * np.cumprod(1 + 0.002 + rng.normal(0, 0.008, n_each))
+        else:
+            x = np.zeros(n_each)
+            for i in range(1, n_each):
+                x[i] = 0.85 * x[i - 1] + rng.normal(0, 0.02)
+            c = lvl * np.exp(x)
+        parts.append(c)
+        lvl = c[-1]
+    return _ohlc_from_close(np.concatenate(parts), rng)
 
 
 def trending_series(n=1500, drift=0.002, vol=0.008, seed=1):
@@ -132,6 +161,107 @@ class EngineTests(unittest.TestCase):
         # CTI of a perfect straight line is +1
         line = pd.Series(np.arange(100, dtype=float))
         self.assertAlmostEqual(cti(line, 20).iloc[-1], 1.0, places=9)
+
+
+class HedgeChannelTests(unittest.TestCase):
+    """The online-learned channel: parameter-free, causal, bounded memory,
+    and it learns the period and the side."""
+
+    def setUp(self):
+        self.df = synthetic_ohlc(1200, seed=7)
+
+    def test_adahedge_follows_the_leader(self):
+        loss = np.full((300, 4), 0.6)
+        loss[:, 1] = 0.3                       # expert 1 is always better
+        W, eta = _adahedge_loop(loss, HEDGE_MEMORY)
+        np.testing.assert_allclose(W.sum(axis=1), 1.0)
+        self.assertGreater(W[-1, 1], 0.99)
+        rng = np.random.default_rng(0)
+        noisy = rng.uniform(0, 1, (3000, 4))
+        noisy[:, 2] -= 0.08                    # a small but persistent edge
+        W, eta = _adahedge_loop(np.clip(noisy, 0, 1), HEDGE_MEMORY)
+        self.assertEqual(int(np.argmax(W[-1])), 2)
+        self.assertTrue(np.isfinite(eta[-1]))  # learning rate shrank from FTL to a finite eta
+
+    def test_bounded_memory_tracks_a_change_of_leader(self):
+        loss = np.full((2000, 4), 0.6)
+        loss[:1000, 0] = 0.4                   # expert 0 leads for 1000 rounds...
+        loss[1000:, 3] = 0.4                   # ...then expert 3 does
+        W, _ = _adahedge_loop(loss, HEDGE_MEMORY)
+        self.assertGreater(W[999, 0], 0.9)
+        self.assertGreater(W[1000 + HEDGE_MEMORY, 3], 0.9)   # the old leader has left the memory
+        # row t depends on rows t-memory+1..t only
+        W2, _ = _adahedge_loop(loss[500:], HEDGE_MEMORY)
+        np.testing.assert_allclose(W[500 + HEDGE_MEMORY:], W2[HEDGE_MEMORY:])
+
+    def test_weights_are_causal_and_normalised(self):
+        W = hedge_weights(self.df, 20, "trend")
+        np.testing.assert_allclose(W.sum(axis=1), 1.0)
+        self.assertTrue((W >= 0).all())
+        Wc = hedge_weights(self.df.iloc[:700], 20, "trend")
+        np.testing.assert_allclose(W[:700], Wc)  # the future does not change the past
+
+    def test_channel_is_a_mixture_of_the_experts(self):
+        up, lo, mid = hedge_channel(self.df, 20, "trend")
+        warm = hedge_warmup(20)
+        self.assertEqual(int(up.isna().sum()), warm)
+        ups = np.stack([donchian(self.df, n)[0].to_numpy() for n in HEDGE_LADDER], axis=1)[warm:]
+        los = np.stack([donchian(self.df, n)[1].to_numpy() for n in HEDGE_LADDER], axis=1)[warm:]
+        self.assertTrue((up.to_numpy()[warm:] <= ups.max(axis=1) + 1e-9).all())
+        self.assertTrue((up.to_numpy()[warm:] >= ups.min(axis=1) - 1e-9).all())
+        self.assertTrue((lo.to_numpy()[warm:] <= los.max(axis=1) + 1e-9).all())
+        self.assertTrue((lo.to_numpy()[warm:] >= los.min(axis=1) - 1e-9).all())
+
+    def test_no_lookback_in_the_grid(self):
+        for tpl in generate_templates("online"):
+            grid = param_grid_for(tpl)
+            for key in ("n_entry", "n_exit", "channel_k"):
+                self.assertNotIn(key, grid, tpl.name)
+        tpl = generate_templates("online")[0]
+        self.assertEqual(param_grid_for(tpl), {})
+        res = walk_forward(self.df, tpl, param_grid_for(tpl), train_bars=400, test_bars=100)
+        self.assertEqual(len(res["oos_returns"]), len(self.df) - 400)
+        self.assertGreaterEqual(warmup_bars(tpl), hedge_warmup(tpl.atr_n))
+        self.assertGreaterEqual(warmup_bars(StrategyTemplate("t", direction_logic="learned")), hedge_warmup(20))
+
+    def test_learns_the_trend_lookback_and_the_fade(self):
+        # on a strong trend the trend learner concentrates on the slowest expert...
+        df = trending_series()
+        W = hedge_weights(df, 20, "trend")
+        self.assertGreater(W[-500:, 2:].sum(axis=1).mean(), 0.9)   # the two slowest experts
+        tr = backtest(df, StrategyTemplate("t", channel_type="hedge", cost_bps=0.0))
+        ct = backtest(df, StrategyTemplate("t", channel_type="hedge", direction_logic="countertrend", cost_bps=0.0))
+        self.assertGreater(tr["stats"]["total_return"], 0.2)
+        self.assertLess(ct["stats"]["total_return"], tr["stats"]["total_return"])
+        # ...and on a mean-reverting series the countertrend learner picks a fast
+        # expert and fading it makes money where following it loses
+        mr = regime_series(kinds=("mr",), n_each=2000)
+        Wc = hedge_weights(mr, 20, "countertrend")
+        self.assertGreater(Wc[-1000:, :2].sum(axis=1).mean(), 0.6)  # the two fastest experts
+        fade = backtest(mr, StrategyTemplate("t", channel_type="hedge", direction_logic="countertrend",
+                                             exit_style="time_stop", max_hold_bars=5, cost_bps=0.0))
+        follow = backtest(mr, StrategyTemplate("t", channel_type="hedge", direction_logic="trend",
+                                               exit_style="time_stop", max_hold_bars=5, cost_bps=0.0))
+        self.assertGreater(fade["stats"]["total_return"], 0.0)
+        self.assertLess(follow["stats"]["total_return"], fade["stats"]["total_return"])
+
+    def test_learned_direction_follows_then_fades(self):
+        df = regime_series()
+        d = hedge_direction(df, 20)
+        lookbacks, sides = hedge_experts("learned")
+        self.assertEqual(len(lookbacks), 2 * len(HEDGE_LADDER))
+        self.assertTrue(np.isnan(d[:hedge_warmup(20)]).all())
+        self.assertGreater((d[500:1000] > 0).mean(), 0.9)     # trend regime: follow
+        self.assertGreater((d[1400:2000] < 0).mean(), 0.9)    # mean reversion: fade
+        self.assertGreater((d[2500:3000] > 0).mean(), 0.9)    # trend again: follow
+        learned = backtest(df, StrategyTemplate("t", channel_type="hedge", direction_logic="learned", cost_bps=0.0))
+        follow = backtest(df, StrategyTemplate("t", channel_type="hedge", direction_logic="trend", cost_bps=0.0))
+        fade = backtest(df, StrategyTemplate("t", channel_type="hedge", direction_logic="countertrend", cost_bps=0.0))
+        self.assertGreater(learned["stats"]["total_return"], follow["stats"]["total_return"])
+        self.assertGreater(learned["stats"]["total_return"], fade["stats"]["total_return"])
+        # a trade keeps the exit logic of the side it was opened under
+        reasons = {t["reason"] for t in learned["trades"]}
+        self.assertTrue({"channel", "midline"} & reasons)
 
 
 class WalkForwardTests(unittest.TestCase):

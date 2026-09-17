@@ -19,7 +19,7 @@ portfolio construction) plus the modern overfitting diagnostics.
 ```bash
 conda create -p ./env python=3.12 pandas scikit-learn scipy matplotlib yfinance numba
 conda activate ./env
-python -m unittest discover -s tests -v      # 89 tests (engine, templates, walk-forward, robustness, live signals, dashboard)
+python -m unittest discover -s tests -v      # 99 tests (engine, templates, hedge learner, walk-forward, robustness, live signals, dashboard)
 python main.py                                # synthetic data, 72 templates, ~1 min on 8 cores
 ```
 
@@ -29,6 +29,7 @@ python main.py                                # synthetic data, 72 templates, ~1
 python main.py --help
 python main.py --family quick                       # 72 templates (Donchian, ER filter)
 python main.py --family default                     # ~770 templates, all switches sampled
+python main.py --family online                      # ~290 templates on the online-learned channel (no lookback to fit)
 python main.py --real SPY --start 2005-01-01 --family default --jobs 8
 python main.py --real SPY --start 2005-01-01 --family quick --sides long_only   # one-sided family (an asset with a drift)
 python main.py --real QQQ --start 2010-01-01 --train 500 --test 125   # rolling window (default): each window re-optimizes on the last 500 bars only
@@ -119,7 +120,8 @@ Nothing in this repository places an order. It tells you what to place.
 data.py         Load real data (yfinance) or generate synthetic
                 regime-switching OHLC (trend probability / drift tunable).
 
-strategy.py     Indicators (ATR, Donchian, Keltner, Bollinger, Kaufman ER,
+strategy.py     Indicators (ATR, Donchian, Keltner, Bollinger, the AdaHedge
+                online-learned channel and direction, Kaufman ER,
                 ADX, Ehlers CTI, Choppiness, variance ratio), the
                 StrategyTemplate switches, and a bar-by-bar backtest
                 engine (ATR position sizing, leverage cap, costs, next-bar
@@ -169,8 +171,8 @@ A **template** is a fixed combination of categorical switches:
 
 | switch | values |
 |---|---|
-| `direction_logic` | `trend` (trade with the break) / `countertrend` (fade it) |
-| `channel_type` | `donchian` / `keltner` (EMA +/- k ATR) / `bollinger` (SMA +/- k sd) |
+| `direction_logic` | `trend` (trade with the break) / `countertrend` (fade it) / `learned` (the online learner decides bar by bar, see below) |
+| `channel_type` | `donchian` / `keltner` (EMA +/- k ATR) / `bollinger` (SMA +/- k sd) / `hedge` (online-learned, see below) |
 | `entry_style` | `stop` (at the level) / `close_confirm` (close beyond, next open) / `pullback` (limit k ATR inside the level) |
 | `exit_style` | `channel` (Turtle exit; midline target for countertrend) / `atr_trail` / `target_stop` / `time_stop` -- a hard ATR stop is always on |
 | `regime_indicator` | `er` Kaufman Efficiency Ratio / `adx` / `cti` Ehlers Correlation Trend / `chop` Choppiness / `vr` variance ratio |
@@ -184,6 +186,72 @@ re-optimized every walk-forward window from a small lattice grid
 (`generator.param_grid_for`), so "the strategy" in the final portfolio
 is the template plus a time-varying parameter set chosen only from
 information available up to that point.
+
+### The `hedge` channel: an online-learned alternative to fitted lookbacks
+
+Donchian, Keltner and Bollinger channels all carry a lookback (and a
+width) that the walk-forward has to re-fit every window, and that
+choice is the single biggest source of curve-fitting in a breakout
+system. The `hedge` channel removes it with an **online learning**
+algorithm from the prediction-with-expert-advice literature:
+
+- **Experts**: Donchian channels with a fixed, log-spaced ladder of
+  lookbacks (`HEDGE_LADDER` = 10, 20, 40, 80 bars). The ladder spans the
+  scales; it is not a tuned parameter.
+- **Loss**: every bar each expert is scored on the ATR-normalised next
+  move of the stance it implied (new n-bar high -> long, new n-bar
+  low -> short, hold otherwise). For a `countertrend` template the
+  stance is the *fade*, so the learner rewards the lookback whose
+  breakouts are most **anti-correlated** with the following move.
+- **Learner**: **AdaHedge** (de Rooij, van Erven, Grunwald, Koolen,
+  JMLR 2014), exponential weights whose learning rate is set from the
+  accumulated mixability gap. It starts as plain **follow-the-leader**
+  and only becomes more conservative when the data forces it to. No
+  learning rate, no threshold. It scores the last `HEDGE_MEMORY` (250)
+  bars: plain AdaHedge finds the best expert *in hindsight* over all
+  history, so after a long trend a fade expert would have to pay back
+  the whole history before it could win; the bounded memory is what
+  lets the learner *track* a change of regime, and it is also what
+  makes the learner state reproducible from the walk-forward's warm-up
+  buffer (see `walkforward.window_backtest`).
+- **Channel**: the weight-averaged expert channel, i.e. an adaptive
+  channel whose effective period is learned causally bar by bar. The
+  exit channel uses the same weights over the ladder scaled by
+  `HEDGE_EXIT_SCALE` (Turtle 20/10 style).
+- **Learned direction** (`direction_logic = "learned"`, any channel):
+  the ladder doubles to a *follow* and a *fade* expert per lookback and
+  the net side weight decides, bar by bar, whether the template follows
+  or fades the break. A trade keeps the exit logic of the side it was
+  opened under. On a series that alternates trend and mean-reversion
+  regimes the direction flips to fade within the learner's memory of
+  the range starting and back to follow in the next trend.
+
+`generator.param_grid_for` drops `n_entry` and `n_exit` for hedge
+templates: with a `channel` exit and no regime filter the grid is empty
+and the walk-forward has nothing left to fit. The `online` family is
+288 such templates; `full` includes them alongside the fitted ones.
+
+Why this and not the other online-learning candidates:
+
+- **Cover's universal portfolio, Anticor (Borodin et al. 2004), OLMAR,
+  PAMR** are *multi-asset portfolio* algorithms: they need a cross-
+  section to rebalance between. On a single instrument they degenerate.
+  Anticor's idea (bet on lagged cross-correlation) survives here only as
+  the sign flip that makes the countertrend learner score the fade.
+- **Plain Hedge / exponentiated gradient** needs a learning rate, and
+  **fixed-share** needs a switching rate: parameters again. AdaHedge is
+  the parameter-free variant with the same regret guarantee.
+- **Follow-the-leader** on its own is unstable on noisy losses (it flips
+  between near-tied experts); AdaHedge *is* FTL until the losses show
+  the flipping costs something, then smooths.
+
+What it does and does not buy you. On a synthetic "long bull market
+with occasional sharp reversals" series the hedge family has a higher
+median OOS Sharpe and more profitable templates than the Donchian
+family, and lower drawdowns, but the *best* template and the nested
+walk-forward portfolio are no better (worse on some seeds). The learner
+removes one degree of curve-fitting; it does not add an edge the experts
+do not have.
 
 ## How the evaluation is made robust
 
@@ -349,6 +417,11 @@ a decade of daily bars for a family of hundreds of trials.
 - **More switches**: add an indicator to `REGIME_INDICATORS` or a new
   entry/exit branch in `strategy.backtest`, then list it in
   `generator.FAMILIES`.
+- **More experts for the hedge channel**: `HEDGE_LADDER` can hold any
+  set of Donchian lookbacks; Keltner / Bollinger widths, or a fade expert
+  that only acts inside a range regime, could join the ladder (the
+  mixture stays causal and parameter-free as long as the ladder is fixed
+  in advance).
 - **Meta-labelling** (AFML ch. 3): use the template signals as primary
   models and train a classifier on the triple-barrier outcome to size
   or veto trades.
