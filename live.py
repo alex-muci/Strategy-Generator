@@ -253,7 +253,9 @@ def _entry_orders(df, tpl: StrategyTemplate, ind: dict, pending, equity: float) 
 
     upper, lower = float(ind["upper"][n - 1]), float(ind["lower"][n - 1])
     long_ok, short_ok = _bias(df, tpl, ind)
-    is_trend = tpl.direction_logic == "trend"
+    # the direction in force on the next bar: the engine reads it off the last
+    # closed bar (constant unless the template's direction is learned)
+    is_trend = bool(ind["direction"][n - 1] > 0)
     # which channel edge opens a long, and which opens a short
     long_level, short_level = (upper, lower) if is_trend else (lower, upper)
     out = []
@@ -329,7 +331,7 @@ def _exit_orders(df, tpl: StrategyTemplate, ind: dict, pos: dict) -> list:
                     note=f"chandelier: {tpl.atr_mult_trail:g} ATR from "
                          f"{pos['trail_extreme']:.2f} (hard stop {pos['hard_stop']:.2f})")]
     elif tpl.exit_style == "channel":
-        if tpl.direction_logic == "trend":
+        if pos["is_trend"]:   # the logic the trade was OPENED under, not today's
             lvl = float(ind["lower_x"][n - 1] if side == 1 else ind["upper_x"][n - 1])
             out.append(dict(kind="stop", side=-side, level=lvl,
                             note=f"opposite {tpl.n_exit}-bar channel (Turtle exit)"))

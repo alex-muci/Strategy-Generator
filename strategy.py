@@ -14,10 +14,29 @@ Switches (define a "template" -- a structurally distinct strategy):
                                       sell new lows)
                     'countertrend' -> FADE the break (sell new highs, buy
                                       new lows), i.e. range / reversion
+                    'learned'      -> the online learner (see 'hedge' below)
+                                      scores a FOLLOW and a FADE expert per
+                                      lookback and the side with more weight
+                                      decides, bar by bar, whether the
+                                      template follows or fades the break;
+                                      a trade keeps the logic it was opened
+                                      under. Works with any channel_type.
 
   channel_type    : 'donchian'  -> highest high / lowest low of n bars
                     'keltner'   -> EMA(n) +/- channel_k * ATR(atr_n)
                     'bollinger' -> SMA(n) +/- channel_k * stdev(n)
+                    'hedge'     -> ONLINE-LEARNED channel: no lookback to
+                                   optimize (n_entry / n_exit are unused). A
+                                   fixed ladder of Donchian "experts"
+                                   (HEDGE_LADDER) is weighted bar by bar by
+                                   AdaHedge, a parameter-free exponential-
+                                   weights (Hedge / follow-the-leader)
+                                   learner scoring the last HEDGE_MEMORY
+                                   bars; the channel is the weight-averaged
+                                   expert channel. Rewards are signed by
+                                   direction_logic, so a countertrend
+                                   template learns which lookback pays to
+                                   FADE (anti-correlation).
 
   entry_style     : 'stop'          -> enter the moment the channel trades
                                        (stop order for trend, limit for fade)
@@ -240,14 +259,251 @@ def bollinger(df: pd.DataFrame, n: int, k: float):
     return mid + width, mid - width, mid
 
 
-def channel(df: pd.DataFrame, kind: str, n: int, k: float, atr_n: int):
+def channel(df: pd.DataFrame, kind: str, n: int, k: float, atr_n: int,
+            mode: str = "trend", role: str = "entry"):
     if kind == "donchian":
         return donchian(df, n)
     if kind == "keltner":
         return keltner(df, n, k, atr_n)
     if kind == "bollinger":
         return bollinger(df, n, k)
+    if kind == "hedge":
+        return hedge_channel(df, atr_n, mode=mode, scale=HEDGE_EXIT_SCALE if role == "exit" else 1.0)
     raise ValueError(f"unknown channel_type {kind}")
+
+
+# --------------------------------------------------------------------------
+# Online-learned ("hedge") channel and learned direction
+# --------------------------------------------------------------------------
+# The Donchian / Bollinger / Keltner channels all need a lookback (and a
+# width) that the walk-forward has to re-fit every window. The hedge
+# channel replaces that fit with an ONLINE LEARNER from the prediction-
+# with-expert-advice literature:
+#
+#   * experts  : Donchian channels with the fixed lookbacks HEDGE_LADDER
+#                (a log-spaced ladder, not a tuned parameter). A trend
+#                template scores FOLLOW experts, a countertrend one FADE
+#                experts, a 'learned' direction both.
+#   * loss     : each bar, expert e is scored on the ATR-normalised return
+#                of the stance it implied on the previous bar (new n-bar
+#                high -> long, new n-bar low -> short, else hold; a fade
+#                expert takes the opposite side). Losses are in [0, 1].
+#   * learner  : AdaHedge (de Rooij, van Erven, Grunwald, Koolen, JMLR
+#                2014): exponential weights w_e ~ exp(-eta * cum. loss_e)
+#                whose learning rate eta = ln(N) / (accumulated mixability
+#                gap) starts at infinity, i.e. plain follow-the-leader,
+#                and shrinks only as much as the data forces it to. It is
+#                run over the last HEDGE_MEMORY bars only. Plain AdaHedge
+#                finds the best expert IN HINDSIGHT over all history: after
+#                a long trend a fade expert would need the whole history
+#                back before it could win. The bounded memory is what lets
+#                it track a change of regime, and it also makes the learner
+#                state a function of a fixed number of past bars, which the
+#                walk-forward's warm-up buffer relies on (walkforward.
+#                window_backtest: a window warmed on `warmup_bars` of
+#                history must match a full-history run exactly).
+#   * channel  : upper/lower/mid = the weight-averaged expert channels. The
+#                exit channel reuses the weights over the ladder scaled by
+#                HEDGE_EXIT_SCALE (Turtle 20/10, 55/20 style).
+#   * direction: for direction_logic 'learned', +1 (follow) or -1 (fade)
+#                from the sign of the net side weight.
+
+HEDGE_LADDER = (10, 20, 40, 80)
+HEDGE_EXIT_SCALE = 0.5
+HEDGE_MEMORY = 250            # bars of losses the learner scores (about a year of daily bars)
+HEDGE_MODES = ("trend", "countertrend", "learned")
+
+
+def hedge_warmup(atr_n: int) -> int:
+    """Bars before the learner's first fully formed output: every loss in
+    its memory needs formed experts and a formed ATR on the bar before."""
+    return int(max(HEDGE_LADDER) + atr_n + HEDGE_MEMORY)
+
+
+def hedge_experts(mode: str):
+    """(lookbacks, sides) of the expert ladder for a direction mode:
+    trend -> follow experts only, countertrend -> fade experts only,
+    learned -> both, so the learner can switch between following and
+    fading as well as between periods."""
+    if mode == "trend":
+        return np.array(HEDGE_LADDER, dtype=np.int64), np.ones(len(HEDGE_LADDER))
+    if mode == "countertrend":
+        return np.array(HEDGE_LADDER, dtype=np.int64), -np.ones(len(HEDGE_LADDER))
+    if mode == "learned":
+        n = np.array(HEDGE_LADDER * 2, dtype=np.int64)
+        return n, np.concatenate([np.ones(len(HEDGE_LADDER)), -np.ones(len(HEDGE_LADDER))])
+    raise ValueError(f"unknown hedge mode {mode}")
+
+
+def _adahedge_run(loss, t0, t1, w):
+    """AdaHedge from a cold start over loss[t0:t1] (N experts, losses in
+    [0, 1]); writes the final weights into `w`, returns the final eta."""
+    N = loss.shape[1]
+    L = np.zeros(N)
+    delta = 0.0
+    eta = np.inf
+    log_n = np.log(N)
+    for e in range(N):
+        w[e] = 1.0 / N
+    for t in range(t0, t1):
+        l = loss[t]
+        lm = l.min()
+        # Hedge loss of the current mixture vs. the mix loss
+        h = 0.0
+        for e in range(N):
+            h += w[e] * l[e]
+        if delta > 0.0:
+            s = 0.0
+            for e in range(N):
+                s += w[e] * np.exp(-eta * (l[e] - lm))
+            mix = lm - np.log(s) / eta
+        else:                                  # eta = inf: mix loss is the best supported expert
+            mix = 1.0
+            for e in range(N):
+                if w[e] > 0.0 and l[e] < mix:
+                    mix = l[e]
+        gap = h - mix
+        if gap > 0.0:
+            delta += gap                       # cumulative mixability gap
+        for e in range(N):
+            L[e] += l[e]
+        # new learning rate and weights
+        m = L.min()
+        if delta > 0.0:
+            eta = log_n / delta
+            s = 0.0
+            for e in range(N):
+                w[e] = np.exp(-eta * (L[e] - m))
+                s += w[e]
+            for e in range(N):
+                w[e] /= s
+        else:
+            eta = np.inf                       # follow the leader
+            cnt = 0
+            for e in range(N):
+                if L[e] <= m:
+                    w[e] = 1.0
+                    cnt += 1
+                else:
+                    w[e] = 0.0
+            for e in range(N):
+                w[e] /= cnt
+    return eta
+
+
+def _adahedge_loop(loss, memory):
+    """Windowed AdaHedge over a T x N loss matrix: row t of the returned
+    T x N weights is AdaHedge run from scratch over the last `memory`
+    rounds up to and including t. Also returns the per-round eta. Plain
+    numpy so numba can compile it."""
+    T, N = loss.shape
+    W = np.empty((T, N))
+    etas = np.empty(T)
+    w = np.empty(N)
+    for t in range(T):
+        t0 = t + 1 - memory
+        if t0 < 0:
+            t0 = 0
+        etas[t] = _adahedge_run(loss, t0, t + 1, w)
+        for e in range(N):
+            W[t, e] = w[e]
+    return W, etas
+
+
+def _expert_stances(high, low, close, uppers, lowers, sides):
+    """Stance (+1/-1/0) each Donchian expert holds at the CLOSE of bar t:
+    a new n-bar high (high[t] >= upper[t-1]) puts a follow expert
+    (sides[e] = +1) long, a new n-bar low puts it short; a fade expert
+    (sides[e] = -1) takes the opposite side. Otherwise, and on a bar that
+    breaks both edges, the previous stance is held."""
+    T, N = uppers.shape
+    S = np.zeros((T, N))
+    for e in range(N):
+        sign = sides[e]
+        s = 0.0
+        for t in range(1, T):
+            u = uppers[t - 1, e]
+            lo = lowers[t - 1, e]
+            if not np.isnan(u):
+                up = high[t] >= u
+                dn = low[t] <= lo
+                if up and not dn:
+                    s = sign
+                elif dn and not up:
+                    s = -sign
+            S[t, e] = s
+    return S
+
+
+try:
+    from numba import njit as _njit_h
+    _adahedge_run = _njit_h(cache=True, nogil=True)(_adahedge_run)
+    _adahedge_fast = _njit_h(cache=True, nogil=True)(_adahedge_loop)
+    _stances_fast = _njit_h(cache=True, nogil=True)(_expert_stances)
+except Exception:  # pragma: no cover
+    _adahedge_fast = _adahedge_loop
+    _stances_fast = _expert_stances
+
+
+def hedge_weights(df: pd.DataFrame, atr_n: int, mode: str = "trend") -> np.ndarray:
+    """T x n_experts learner weights, row t computed from bars <= t
+    (the last HEDGE_MEMORY of them)."""
+    lookbacks, sides = hedge_experts(mode)
+    high = _to_arr(df["High"]); low = _to_arr(df["Low"]); close = _to_arr(df["Close"])
+    T = len(close)
+    N = len(lookbacks)
+    uppers = np.empty((T, N)); lowers = np.empty((T, N))
+    cache = {}
+    for e, n in enumerate(lookbacks):
+        if int(n) not in cache:
+            up, lo, _ = donchian(df, int(n))
+            cache[int(n)] = (_to_arr(up), _to_arr(lo))
+        uppers[:, e], lowers[:, e] = cache[int(n)]
+    S = _stances_fast(high, low, close, uppers, lowers, np.ascontiguousarray(sides))
+    a = _to_arr(atr(df, atr_n))
+    # ATR-normalised next-bar move, scored against the stance held at the previous close
+    z = np.zeros(T)
+    z[1:] = (close[1:] - close[:-1]) / np.where(a[:-1] > 0, a[:-1], np.nan)
+    payoff = np.clip(S[:-1] * z[1:, None] / 2.0, -1.0, 1.0)
+    loss = np.full((T, N), 0.5)
+    loss[1:] = 0.5 * (1.0 - np.nan_to_num(payoff, nan=0.0))
+    formed = ~np.isnan(uppers)           # an unformed expert has no stance: neutral loss
+    loss = np.where(formed, loss, 0.5)
+    W, _ = _adahedge_fast(np.ascontiguousarray(loss), int(HEDGE_MEMORY))
+    return W
+
+
+def hedge_direction(df: pd.DataFrame, atr_n: int) -> np.ndarray:
+    """Per-bar direction for direction_logic 'learned': +1 follow the
+    break, -1 fade it, from the net side weight of the learner over
+    follow and fade experts. NaN until the learner is formed."""
+    W = hedge_weights(df, atr_n, "learned")
+    _, sides = hedge_experts("learned")
+    d = np.where(W @ sides >= 0.0, 1.0, -1.0)
+    d[:min(len(d), hedge_warmup(atr_n))] = np.nan
+    return d
+
+
+def hedge_channel(df: pd.DataFrame, atr_n: int, mode: str = "trend", scale: float = 1.0):
+    """Weight-averaged Donchian channel over the expert ladder (lookbacks
+    scaled by `scale`), NaN until the learner is formed."""
+    W = hedge_weights(df, atr_n, mode)
+    lookbacks, _ = hedge_experts(mode)
+    T = len(df)
+    up = np.zeros(T); lo = np.zeros(T)
+    cache = {}
+    for e, n in enumerate(lookbacks):
+        m = max(2, int(round(int(n) * scale)))
+        if m not in cache:
+            u, l, _ = donchian(df, m)
+            cache[m] = (_to_arr(u), _to_arr(l))
+        up += W[:, e] * cache[m][0]
+        lo += W[:, e] * cache[m][1]
+    warm = min(T, hedge_warmup(atr_n))
+    up[:warm] = np.nan; lo[:warm] = np.nan
+    idx = df.index
+    upper = pd.Series(up, index=idx); lower = pd.Series(lo, index=idx)
+    return upper, lower, (upper + lower) / 2
 
 
 # Regime "trendiness" registry. Every entry is oriented so that a HIGHER
@@ -266,8 +522,8 @@ REGIME_INDICATORS = {
 # Template / config
 # --------------------------------------------------------------------------
 
-DIRECTION_LOGICS = ["trend", "countertrend"]
-CHANNEL_TYPES = ["donchian", "keltner", "bollinger"]
+DIRECTION_LOGICS = ["trend", "countertrend", "learned"]
+CHANNEL_TYPES = ["donchian", "keltner", "bollinger", "hedge"]
 ENTRY_STYLES = ["stop", "close_confirm", "pullback"]
 EXIT_STYLES = ["channel", "atr_trail", "target_stop", "time_stop"]
 REGIME_INDICATOR_NAMES = list(REGIME_INDICATORS)
@@ -382,11 +638,16 @@ def _to_arr(x) -> np.ndarray:
     return np.ascontiguousarray(np.asarray(x, dtype=np.float64))
 
 
-def _channel_arrays(df, kind, n, k, atr_n, dfkey=None):
+def _channel_arrays(df, kind, n, k, atr_n, dfkey=None, mode="trend", role="entry"):
     def build():
-        up, lo, mid = channel(df, kind, n, k, atr_n)
+        up, lo, mid = channel(df, kind, n, k, atr_n, mode=mode, role=role)
         return (_to_arr(up), _to_arr(lo), _to_arr(mid))
-    return _cached(df, ("channel", kind, n, k if kind != "donchian" else 0.0, atr_n if kind == "keltner" else 0), build, dfkey)
+    if kind == "hedge":
+        # no lookback / width: keyed on direction mode (signed rewards), ATR length and entry/exit role
+        spec = ("channel", kind, role, mode, atr_n)
+    else:
+        spec = ("channel", kind, n, k if kind != "donchian" else 0.0, atr_n if kind == "keltner" else 0)
+    return _cached(df, spec, build, dfkey)
 
 
 def _compute_indicators(df: pd.DataFrame, tpl: StrategyTemplate, dfkey=None) -> dict:
@@ -405,13 +666,21 @@ def _compute_indicators(df: pd.DataFrame, tpl: StrategyTemplate, dfkey=None) -> 
         nonlocal ready
         ready = ready & ~np.isnan(arr)
 
-    up, lo, _ = _channel_arrays(df, tpl.channel_type, tpl.n_entry, tpl.channel_k, tpl.atr_n, dfkey)
+    mode = tpl.direction_logic
+    up, lo, _ = _channel_arrays(df, tpl.channel_type, tpl.n_entry, tpl.channel_k, tpl.atr_n, dfkey, mode, "entry")
     use("upper", up)
     use("lower", lo)
     use("atr", _cached(df, ("atr", tpl.atr_n), lambda: _to_arr(atr(df, tpl.atr_n)), dfkey))
 
+    # per-bar direction: +1 follow the break, -1 fade it; learned from the
+    # follow/fade expert ladder (NaN while the learner is unformed), else constant
+    if mode == "learned":
+        use("direction", _cached(df, ("hedge_dir", tpl.atr_n), lambda: hedge_direction(df, tpl.atr_n), dfkey))
+    else:
+        ind["direction"] = np.full(n, 1.0 if mode == "trend" else -1.0)
+
     if tpl.exit_style == "channel":
-        upx, lox, midx = _channel_arrays(df, tpl.channel_type, tpl.n_exit, tpl.channel_k, tpl.atr_n, dfkey)
+        upx, lox, midx = _channel_arrays(df, tpl.channel_type, tpl.n_exit, tpl.channel_k, tpl.atr_n, dfkey, mode, "exit")
         use("upper_x", upx)
         use("lower_x", lox)
         use("mid_x", midx)
@@ -447,7 +716,7 @@ REASONS = ["stop", "channel", "midline", "target", "time", "stop_same_bar"]
 
 def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
               upper_x, lower_x, mid_x, regime, vol_rank, bias,
-              is_trend, entry_style, exit_style, regime_mode, regime_thr,
+              direction, entry_style, exit_style, regime_mode, regime_thr,
               has_vol, vol_low, vol_high, has_bias, allow_long, allow_short,
               atr_mult_stop, atr_mult_target, atr_mult_trail, pullback_atr_mult,
               pullback_valid_bars, max_hold_bars, risk_pct, max_leverage, cost_rate,
@@ -491,9 +760,13 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
     pend_level = 0.0
     pend_expires = 0
     last_a = 0.0
+    pos_trend = True      # direction logic the OPEN trade was entered under
+    pend_trend = True     # ... and the resting pullback order
 
     equity[0] = initial_equity
     for i in range(1, n):
+        # direction in force for NEW signals on bar i (constant unless 'learned')
+        is_trend = direction[i - 1] > 0.0
         # `a_ok`: every indicator this template uses is fully formed on bar i-1
         # and the ATR is usable. New business (filters, orders, entries) needs
         # that; an OPEN POSITION is managed on every bar regardless, otherwise a
@@ -522,7 +795,7 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
                     stop_level = max(stop_level, trail_stop)
                 else:
                     stop_level = min(stop_level, trail_stop)
-            elif exit_style == 0 and is_trend:
+            elif exit_style == 0 and pos_trend:
                 # the opposite channel is a stop on the SAME side as the hard
                 # stop; on the way through, whichever sits nearer to the price
                 # is hit first, so it must fill at that level, not at the
@@ -543,7 +816,7 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
 
             if reason < 0:
                 if exit_style == 0:
-                    if not is_trend:
+                    if not pos_trend:
                         if side == 1 and high[i] >= mid_x[i - 1]:
                             exit_price = max(open_[i], mid_x[i - 1])
                             reason = 2
@@ -614,14 +887,17 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
         fill_px = 0.0
 
         # ---- pending pullback order ----
+        fill_trend = is_trend
         if position == 0 and pend_active:
             if pend_side == 1 and low[i] <= pend_level:
                 fill_side = 1
                 fill_px = min(open_[i], pend_level)
+                fill_trend = pend_trend
                 pend_active = False
             elif pend_side == -1 and high[i] >= pend_level:
                 fill_side = -1
                 fill_px = max(open_[i], pend_level)
+                fill_trend = pend_trend
                 pend_active = False
             elif i >= pend_expires:
                 pend_active = False
@@ -670,6 +946,7 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
                 else:
                     pend_active = True
                     pend_side = side
+                    pend_trend = is_trend
                     pend_level = level - side * pullback_atr_mult * a
                     pend_expires = i + pullback_valid_bars
 
@@ -683,6 +960,7 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
                 entry_cost = cost_rate * qty * fill_px
                 cash -= entry_cost
                 position = fill_side
+                pos_trend = fill_trend
                 shares = qty
                 entry_price = fill_px
                 stop_price = fill_px - fill_side * stop_dist
@@ -729,7 +1007,8 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
     # backtest runs, instead of reimplementing the rules and drifting from them
     return (equity, entries, t_entry, t_exit, t_side, t_entry_px, t_exit_px, t_shares, t_pnl, t_cost,
             t_reason, n_trades, position, shares, entry_price, stop_price, target_price, trail_extreme,
-            entry_bar, entry_cost, pend_active, pend_side, pend_level, pend_expires, last_a)
+            entry_bar, entry_cost, pend_active, pend_side, pend_level, pend_expires, last_a,
+            pos_trend, pend_trend)
 
 
 try:  # compile the loop once per process; falls back to plain Python without numba
@@ -766,7 +1045,7 @@ def backtest(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: float = 10
         open_, high, low, close, ind["ready"], ind["upper"], ind["lower"], ind["atr"],
         ind.get("upper_x", zeros), ind.get("lower_x", zeros), ind.get("mid_x", zeros),
         ind.get("regime", zeros), ind.get("vol_rank", zeros), ind.get("bias", zeros),
-        tpl.direction_logic == "trend", ENTRY_CODES[tpl.entry_style], EXIT_CODES[tpl.exit_style],
+        ind["direction"], ENTRY_CODES[tpl.entry_style], EXIT_CODES[tpl.exit_style],
         REGIME_CODES[tpl.regime_filter], float(ind.get("regime_threshold", 0.0)),
         bool(tpl.vol_filter), float(tpl.vol_low_pct), float(tpl.vol_high_pct), tpl.bias_filter == "sma",
         tpl.sides != "short_only", tpl.sides != "long_only",
@@ -776,7 +1055,8 @@ def backtest(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: float = 10
     )
     (equity, entries, t_entry, t_exit, t_side, t_entry_px, t_exit_px, t_shares, t_pnl, t_cost,
      t_reason, n_trades, f_position, f_shares, f_entry_price, f_stop, f_target, f_trail,
-     f_entry_bar, f_entry_cost, f_pend_active, f_pend_side, f_pend_level, f_pend_expires, f_last_atr) = out
+     f_entry_bar, f_entry_cost, f_pend_active, f_pend_side, f_pend_level, f_pend_expires, f_last_atr,
+     f_pos_trend, f_pend_trend) = out
 
     idx = df.index
     idx_arr = idx.to_numpy()
@@ -802,11 +1082,12 @@ def backtest(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: float = 10
             entry_cost=float(f_entry_cost), hard_stop=float(f_stop), target=float(f_target),
             trail_extreme=float(f_trail), bars_held=int(n - 1 - int(f_entry_bar)),
             unrealized=float(f_position * f_shares * (close[-1] - f_entry_price)),
+            is_trend=bool(f_pos_trend),
         )
     pending_order = None
     if f_pend_active:
         pending_order = dict(side=int(f_pend_side), level=float(f_pend_level),
-                             expires_bar=int(f_pend_expires))
+                             expires_bar=int(f_pend_expires), is_trend=bool(f_pend_trend))
 
     return {"equity": equity_s, "returns": returns, "entries": entries, "trades": trades,
             "stats": stats, "open_position": open_position, "pending_order": pending_order,

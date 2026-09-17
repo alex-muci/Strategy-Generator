@@ -37,7 +37,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from data import synthetic_ohlc, load_yfinance
-from generator import generate_templates, param_grid_for
+from generator import generate_templates, param_grid_for, FAMILIES
 from walkforward import walk_forward, grid_combos
 from robustness import (
     cscv_pbo, deflated_sharpe_ratio, min_backtest_length, bootstrap_sharpe_pvalue,
@@ -59,7 +59,7 @@ def _cscv_partitions(T: int) -> int:
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description="Ranger-style strategy generator with robust walk-forward evaluation")
-    p.add_argument("--family", default="quick", choices=["quick", "default", "full"])
+    p.add_argument("--family", default="quick", choices=list(FAMILIES))
     p.add_argument("--max-templates", type=int, default=None)
     p.add_argument("--sides", nargs="+", default=None, choices=SIDES,
                    help="restrict every template to these sides (default: the family's own list, "

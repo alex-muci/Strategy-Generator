@@ -10,6 +10,10 @@ Three families are predefined:
 
   quick    ~72 templates  (Donchian only, ER regime filter) -- smoke test
   default  ~300 templates (two channel types, five regime indicators)
+  online   ~290 templates (the online-learned 'hedge' channel only, incl.
+                           the 'learned' follow-or-fade direction: no
+                           lookback or width in the grid, the walk-forward
+                           only re-fits exits / regime thresholds)
   full     every combination of every switch (thousands; overnight run)
 
 The bigger the family, the more the *selection* step becomes a data
@@ -40,7 +44,7 @@ _ALL_REGIMES = [("er", "none")] + [
 
 FAMILIES = {
     "quick": dict(
-        direction_logics=DIRECTION_LOGICS,
+        direction_logics=["trend", "countertrend"],
         channel_types=["donchian"],
         entry_styles=["stop", "pullback"],
         exit_styles=["channel", "atr_trail", "target_stop"],
@@ -50,13 +54,24 @@ FAMILIES = {
         sides=["both"],
     ),
     "default": dict(
-        direction_logics=DIRECTION_LOGICS,
+        direction_logics=["trend", "countertrend"],
         channel_types=["donchian", "keltner"],
         entry_styles=["stop", "close_confirm", "pullback"],
         exit_styles=["channel", "atr_trail", "target_stop", "time_stop"],
         regimes=[("er", "none"), ("er", "trend_only"), ("er", "range_only"),
                  ("adx", "trend_only"), ("cti", "trend_only"),
                  ("chop", "range_only"), ("vr", "trend_only"), ("vr", "range_only")],
+        vol_filters=[False],
+        bias_filters=["none", "sma"],
+        sides=["both"],
+    ),
+    "online": dict(
+        direction_logics=DIRECTION_LOGICS,
+        channel_types=["hedge"],
+        entry_styles=["stop", "close_confirm"],
+        exit_styles=EXIT_STYLES,
+        regimes=[("er", "none"), ("er", "trend_only"), ("er", "range_only"),
+                 ("vr", "trend_only"), ("vr", "range_only"), ("chop", "range_only")],
         vol_filters=[False],
         bias_filters=["none", "sma"],
         sides=["both"],
@@ -78,8 +93,8 @@ FAMILIES = {
 # and letting the selection step data-mine it.
 
 _SHORT = {
-    "trend": "TR", "countertrend": "CT",
-    "donchian": "don", "keltner": "kel", "bollinger": "bol",
+    "trend": "TR", "countertrend": "CT", "learned": "LN",
+    "donchian": "don", "keltner": "kel", "bollinger": "bol", "hedge": "hdg",
     "stop": "stop", "close_confirm": "cls", "pullback": "pb",
     "channel": "chan", "atr_trail": "trail", "target_stop": "tgt", "time_stop": "time",
     "none": "none", "trend_only": "trend", "range_only": "range",
@@ -142,12 +157,15 @@ def param_grid_for(tpl: StrategyTemplate, wide: bool = False) -> dict:
     Kept deliberately small so a full sweep across hundreds of templates
     finishes in minutes; `wide=True` roughly triples it.
     """
-    grid = {"n_entry": [20, 40, 60] if not wide else [10, 20, 30, 40, 55, 70, 90]}
+    grid = {}
+    online = tpl.channel_type == "hedge"   # lookbacks are learned online, not fitted
+    if not online:
+        grid["n_entry"] = [20, 40, 60] if not wide else [10, 20, 30, 40, 55, 70, 90]
 
     if tpl.channel_type in ("keltner", "bollinger"):
         grid["channel_k"] = [1.5, 2.5] if not wide else [1.0, 1.5, 2.0, 2.5, 3.0]
 
-    if tpl.exit_style == "channel":
+    if tpl.exit_style == "channel" and not online:
         grid["n_exit"] = [10, 20] if not wide else [5, 10, 15, 20, 30]
     elif tpl.exit_style == "atr_trail":
         grid["atr_mult_trail"] = [2.5, 3.5] if not wide else [1.5, 2.0, 2.5, 3.0, 3.5, 4.5]

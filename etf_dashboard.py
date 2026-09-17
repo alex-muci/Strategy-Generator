@@ -55,7 +55,7 @@ import numpy as np
 import pandas as pd
 
 from data import load_yfinance, synthetic_ohlc
-from generator import generate_templates, param_grid_for
+from generator import generate_templates, param_grid_for, FAMILIES
 from live import (
     drop_forming_bar, refit_params, due_for_refit, strategy_state,
     portfolio_targets, trade_list, utcnow,
@@ -99,7 +99,7 @@ def parse_args(argv=None):
     r = sub.add_parser("research", parents=[common], help="decide what to trade (slow)")
     r.add_argument("--assets", nargs="+", default=["SPY", "TLT", "GLD", "QQQ"])
     r.add_argument("--start", default="2010-01-01")
-    r.add_argument("--family", default="quick", choices=["quick", "default", "full"])
+    r.add_argument("--family", default="quick", choices=list(FAMILIES))
     r.add_argument("--max-templates", type=int, default=None)
     r.add_argument("--sides", nargs="+", default=None, choices=SIDES,
                    help="restrict every template to these sides (default: the family's own list)")

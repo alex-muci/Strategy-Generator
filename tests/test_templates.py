@@ -41,7 +41,8 @@ FIELDS = {f.name for f in dataclasses.fields(StrategyTemplate)}
 
 # which numeric parameter is read only under which switch setting
 PARAM_NEEDS = {
-    "n_exit": lambda t: t.exit_style == "channel",
+    "n_entry": lambda t: t.channel_type != "hedge",
+    "n_exit": lambda t: t.exit_style == "channel" and t.channel_type != "hedge",
     "channel_k": lambda t: t.channel_type in ("keltner", "bollinger"),
     "atr_mult_trail": lambda t: t.exit_style == "atr_trail",
     "atr_mult_target": lambda t: t.exit_style == "target_stop",
@@ -57,7 +58,7 @@ PARAM_NEEDS = {
 }
 # a value far enough from the default that using it would visibly change a run
 PERTURB = {
-    "n_exit": 7, "channel_k": 0.7, "atr_mult_trail": 1.2, "atr_mult_target": 1.5,
+    "n_entry": 13, "n_exit": 7, "channel_k": 0.7, "atr_mult_trail": 1.2, "atr_mult_target": 1.5,
     "max_hold_bars": 3, "pullback_atr_mult": 1.5, "pullback_valid_bars": 9,
     "regime_n": 7, "regime_threshold": 0.01, "vol_lookback": 30, "vol_low_pct": 0.45,
     "vol_high_pct": 0.55, "bias_n": 15,
@@ -150,7 +151,8 @@ class TemplateParamTests(unittest.TestCase):
         for wide in (False, True):
             for t in generate_templates("full"):
                 grid = param_grid_for(t, wide=wide)
-                self.assertIn("n_entry", grid, t.name)
+                if t.channel_type != "hedge":
+                    self.assertIn("n_entry", grid, t.name)
                 for k, values in grid.items():
                     self.assertIn(k, FIELDS, f"{t.name}: {k} is not a template field")
                     self.assertEqual(list(values), sorted(values), f"{t.name}: {k} is not a sorted lattice")
