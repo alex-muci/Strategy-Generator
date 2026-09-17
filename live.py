@@ -332,9 +332,18 @@ def _exit_orders(df, tpl: StrategyTemplate, ind: dict, pos: dict) -> list:
                          f"{pos['trail_extreme']:.2f} (hard stop {pos['hard_stop']:.2f})")]
     elif tpl.exit_style == "channel":
         if pos["is_trend"]:   # the logic the trade was OPENED under, not today's
-            lvl = float(ind["lower_x"][n - 1] if side == 1 else ind["upper_x"][n - 1])
-            out.append(dict(kind="stop", side=-side, level=lvl,
-                            note=f"opposite {tpl.n_exit}-bar channel (Turtle exit)"))
+            # the opposite channel is a stop on the SAME side as the hard stop
+            # and the engine fills whichever sits nearer to the price (see
+            # strategy._bar_loop). One resting stop at that level, not two:
+            # two same-side stops would REVERSE the position when the second
+            # one fills after the first has already closed it
+            chan = float(ind["lower_x"][n - 1] if side == 1 else ind["upper_x"][n - 1])
+            hard = float(pos["hard_stop"])
+            level = max(hard, chan) if side == 1 else min(hard, chan)
+            binding = "channel" if level == chan and chan != hard else "hard stop"
+            out = [dict(kind="stop", side=-side, level=level,
+                        note=f"opposite {tpl.n_exit}-bar channel {chan:.2f} (Turtle exit) / "
+                             f"hard ATR stop {hard:.2f}: {binding} is nearer")]
         else:
             out.append(dict(kind="limit", side=-side, level=float(ind["mid_x"][n - 1]),
                             note=f"{tpl.n_exit}-bar channel midline (mean-reversion target)"))

@@ -35,7 +35,7 @@ from strategy import StrategyTemplate, backtest, _compute_indicators, atr  # noq
 from generator import generate_templates, param_grid_for  # noqa: E402
 from walkforward import (  # noqa: E402
     walk_forward, walk_forward_matrix, window_backtest, warmup_bars, summarize_walk_forward,
-    grid_combos, _ema_settle_bars,
+    grid_combos, _ema_settle_bars, position_notional, exposure_totals,
 )
 from live import refit_params  # noqa: E402
 
@@ -179,6 +179,65 @@ class WalkForwardWindowTests(unittest.TestCase):
                                 train_lengths=(200, 400), test_lengths=(100, 700))
         self.assertEqual(sorted(m.index.tolist()), [(200, 100), (400, 100)])
         self.assertTrue(np.isfinite(m["oos_sharpe"]).all())
+
+
+class ExposureTests(unittest.TestCase):
+    """OOS exposure, notional and net exposure: rebuilt from the trades, so
+    they must agree with the engine's own bar counts and with the sizing rule."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.df = synthetic_ohlc(1300, seed=31)
+
+    def test_notional_matches_trades_and_sizing(self):
+        df = self.df
+        close = df["Close"].to_numpy()
+        for tpl in (StrategyTemplate("t"), StrategyTemplate("ct", direction_logic="countertrend", exit_style="time_stop"),
+                    StrategyTemplate("L", sides="long_only", exit_style="target_stop")):
+            res = backtest(df, tpl)
+            notional = position_notional(res, close)
+            self.assertEqual(len(notional), len(df))
+            held = notional != 0
+            # bars with a position = the engine's own bars_held total (+ the open one)
+            expected = sum(t["bars_held"] for t in res["trades"])
+            if res["open_position"] is not None:
+                expected += res["open_position"]["bars_held"] + 1
+            self.assertEqual(int(held.sum()), expected, tpl.name)
+            # on an entry bar the notional is shares x close, signed by the side
+            for t in res["trades"][:20]:
+                i = df.index.get_loc(t["entry_date"])
+                self.assertAlmostEqual(notional[i], t["side"] * t["shares"] * close[i], places=6)
+            if tpl.sides == "long_only":
+                self.assertTrue((notional >= 0).all())
+            tot = exposure_totals(res, close)
+            self.assertEqual(tot["held_bars"], expected)
+            self.assertGreaterEqual(tot["gross"], abs(tot["net"]))
+            # 1% risk on a 3-ATR stop, 2x leverage cap: notional / equity stays under the cap
+            eq = res["equity"].to_numpy()
+            self.assertLessEqual(float(np.max(np.abs(notional) / eq)), tpl.max_leverage + 1e-9)
+
+    def test_walk_forward_pools_the_windows(self):
+        tpl = generate_templates("quick")[0]
+        res = walk_forward(self.df, tpl, param_grid_for(tpl), train_bars=400, test_bars=100)
+        s = res["summary"]
+        n = len(res["oos_returns"])
+        live = [w for w in res["windows"] if not w["skipped"]]
+        self.assertAlmostEqual(s["oos_exposure"], sum(w["oos_stats"]["held_bars"] for w in live) / n)
+        self.assertAlmostEqual(s["oos_notional"], sum(w["oos_stats"]["gross_notional"] for w in live) / n)
+        self.assertAlmostEqual(s["oos_avg_net_exposure"], sum(w["oos_stats"]["net_notional"] for w in live) / n)
+        self.assertTrue(0 < s["oos_exposure"] <= 1)
+        self.assertGreaterEqual(s["oos_notional"], abs(s["oos_avg_net_exposure"]))
+        self.assertLessEqual(s["oos_notional"], tpl.max_leverage)
+        # each window's numbers are the window's own backtest
+        for w in live[:3]:
+            ts, te = self.df.index.get_loc(w["test_start"]), self.df.index.get_loc(w["test_end"]) + 1
+            win = window_backtest(self.df, tpl.with_params(**w["params"]), ts, te)
+            self.assertEqual(win["exposure"]["held_bars"], w["oos_stats"]["held_bars"])
+            self.assertAlmostEqual(win["exposure"]["gross"], w["oos_stats"]["gross_notional"])
+        # a long-only template has a non-negative net exposure
+        lo = walk_forward(self.df, tpl.with_params(sides="long_only"), param_grid_for(tpl), train_bars=400, test_bars=100)
+        self.assertGreaterEqual(lo["summary"]["oos_avg_net_exposure"], 0.0)
+        self.assertAlmostEqual(lo["summary"]["oos_avg_net_exposure"], lo["summary"]["oos_notional"])
 
 
 class WalkForwardEfficiencyTests(unittest.TestCase):

@@ -54,6 +54,9 @@ def candidate_table(wfa_results: dict, rets: pd.DataFrame) -> pd.DataFrame:
             wfe=s["wfe"], pct_profitable_windows=s["pct_profitable_windows"],
             n_windows=s["n_windows"], n_trades_oos=s["n_trades_oos"],
             param_change_rate=s["param_change_rate"], pardo_pass=s["pardo_pass"],
+            oos_exposure=s.get("oos_exposure", np.nan),
+            oos_notional=s.get("oos_notional", np.nan),
+            oos_avg_net_exposure=s.get("oos_avg_net_exposure", np.nan),
         ))
     return pd.DataFrame(rows).set_index("template")
 

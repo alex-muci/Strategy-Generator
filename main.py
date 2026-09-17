@@ -396,15 +396,23 @@ def _report(df, results, port, nested, fam, finalists, bench, args):
     if len(nested["portfolio_equity"]) > 1:
         neq = nested["portfolio_equity"] / nested["portfolio_equity"].iloc[0]
         ax.plot(neq.index, neq.values, linewidth=3.0, color="red", linestyle="--", label="PORTFOLIO (nested walk-forward selection)")
+    ax.set_title("Out-of-sample walk-forward equity: all templates (grey), selected, portfolios, buy & hold")
+    ax.set_ylabel("Strategies: growth of 1.0")
+    ax.grid(alpha=0.3)
+    handles, labels = ax.get_legend_handles_labels()
+    # buy & hold is unlevered while the strategies risk 1%/trade, so its
+    # curve lives on a different scale: secondary axis
     bh_eq = (1 + bench["returns"]).cumprod()
     if len(bh_eq) > 1:
-        ax.plot(bh_eq.index, bh_eq.values, linewidth=1.8, color="#444444", linestyle=":",
-                label=f"BUY & HOLD {args.real or 'the asset'} (Sharpe {bench['buy_hold']['sharpe']:.2f}; "
-                      "unlevered, strategies risk 1%/trade)")
-    ax.set_title("Out-of-sample walk-forward equity: all templates (grey), selected, portfolios, buy & hold")
-    ax.set_ylabel("Growth of 1.0")
-    ax.legend(fontsize=7, ncol=2, loc="upper left")
-    ax.grid(alpha=0.3)
+        ax2 = ax.twinx()
+        ax2.plot(bh_eq.index, bh_eq.values, linewidth=1.8, color="#444444", linestyle=":",
+                 label=f"BUY & HOLD {args.real or 'the asset'} (Sharpe {bench['buy_hold']['sharpe']:.2f}; "
+                       "unlevered, right axis)")
+        ax2.set_ylabel(f"Buy & hold {args.real or 'the asset'}: growth of 1.0 (right axis)", color="#444444")
+        ax2.tick_params(axis="y", colors="#444444")
+        h2, l2 = ax2.get_legend_handles_labels()
+        handles, labels = handles + h2, labels + l2
+    ax.legend(handles, labels, fontsize=7, ncol=2, loc="upper left")
     fig.tight_layout()
     fig.savefig(f"{out}/equity_curves.png", dpi=140)
     plt.close(fig)
@@ -523,13 +531,18 @@ def _report(df, results, port, nested, fam, finalists, bench, args):
              f"(available OOS: {fam['years_available']:.1f} years)\n\n")
 
     L.append("## Selected strategies (static selection on full OOS history)\n\n")
-    L.append("| template | OOS Sharpe | WFE | prof. windows | Pardo | CPCV mean+/-sd | P(CPCV<0) | boot p | DSR | weight |\n")
-    L.append("|---|---|---|---|---|---|---|---|---|---|\n")
+    L.append("| template | OOS Sharpe | WFE | prof. windows | Pardo | CPCV mean+/-sd | P(CPCV<0) | boot p | DSR | "
+             "exposure | notional | net exp. | weight |\n")
+    L.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|\n")
     for name in selected:
         s = results[name]["summary"]; cp = results[name]["cpcv"]; f = finalists[name]
         L.append(f"| {name} | {s['oos_sharpe']:.2f} | {s['wfe']:.2f} | {s['pct_profitable_windows']:.0%} | "
                  f"{'yes' if s['pardo_pass'] else 'no'} | {cp['sharpe_mean']:.2f}+/-{cp['sharpe_std']:.2f} | "
-                 f"{cp['prob_sharpe_negative']:.0%} | {f['bootstrap_p']:.3f} | {f['dsr']:.2f} | {port['weights'][name]:.2f} |\n")
+                 f"{cp['prob_sharpe_negative']:.0%} | {f['bootstrap_p']:.3f} | {f['dsr']:.2f} | "
+                 f"{s['oos_exposure']:.0%} | {s['oos_notional']:.2f} | {s['oos_avg_net_exposure']:+.2f} | "
+                 f"{port['weights'][name]:.2f} |\n")
+    L.append("\nexposure = share of OOS bars with a position; notional = mean |position notional| / equity over all "
+             "OOS bars (a leverage, 0 when flat); net exp. = the same signed (long > 0, short < 0).\n")
     for name, f in finalists.items():
         if "wfa_matrix" in f and len(f["wfa_matrix"]):
             m = f["wfa_matrix"]

@@ -19,7 +19,7 @@ portfolio construction) plus the modern overfitting diagnostics.
 ```bash
 conda create -p ./env python=3.12 pandas scikit-learn scipy matplotlib yfinance numba
 conda activate ./env
-python -m unittest discover -s tests -v      # 96 tests (engine, templates, hedge learner, walk-forward, robustness, live signals, dashboard)
+python -m unittest discover -s tests -v      # 99 tests (engine, templates, hedge learner, walk-forward, robustness, live signals, dashboard)
 python main.py                                # synthetic data, 72 templates, ~1 min on 8 cores
 ```
 

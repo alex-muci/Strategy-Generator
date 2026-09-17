@@ -174,7 +174,39 @@ def window_backtest(df: pd.DataFrame, tpl, start: int, end: int, *,
     out["entries"] = res["entries"][off:]
     out["stats"] = performance_stats(eq, res["trades"], initial_equity)
     out["window_start"] = df.index[start]
+    out["exposure"] = exposure_totals(out, df["Close"].to_numpy()[start:end])
     return out
+
+
+def position_notional(res: dict, close: np.ndarray) -> np.ndarray:
+    """Signed notional held at the close of each bar of a backtest result
+    (shares x close x side), rebuilt from its closed trades and the position
+    still open at the end. A trade holds from its entry bar up to the bar
+    BEFORE its exit bar: the exit fills intrabar, so the position is flat at
+    the exit bar's close (the same convention as `bars_held`)."""
+    idx = res["equity"].index
+    n = len(idx)
+    shares = np.zeros(n)
+    for t in res["trades"]:
+        i, j = idx.get_loc(t["entry_date"]), idx.get_loc(t["exit_date"])
+        shares[i:j] += t["side"] * t["shares"]
+    pos = res.get("open_position")
+    if pos is not None:
+        i = idx.get_loc(pos["entry_date"]) if pos["entry_date"] in idx else 0
+        shares[i:] += pos["side"] * pos["shares"]
+    return shares * close[:n]
+
+
+def exposure_totals(res: dict, close: np.ndarray) -> dict:
+    """Bar-count and notional-over-equity totals of a backtest result, so
+    windows can be pooled: held_bars (bars with a position), gross (sum over
+    bars of |notional| / equity) and net (sum of signed notional / equity)."""
+    notional = position_notional(res, close)
+    eq = res["equity"].to_numpy()
+    with np.errstate(invalid="ignore", divide="ignore"):
+        lev = np.where(eq > 0, notional / eq, 0.0)
+    return dict(n_bars=int(len(eq)), held_bars=int((notional != 0).sum()),
+                gross=float(np.abs(lev).sum()), net=float(lev.sum()))
 
 
 def optimize_window(df: pd.DataFrame, tpl, combos: list, idx: np.ndarray, start: int, end: int, *,
@@ -276,6 +308,9 @@ def walk_forward(
             sharpe=annualized_sharpe(oos_rets),
             n_trades=len(oos_res["trades"]),
             n_bars=len(oos_rets),
+            held_bars=oos_res["exposure"]["held_bars"],
+            gross_notional=oos_res["exposure"]["gross"],
+            net_notional=oos_res["exposure"]["net"],
         )
         is_stats = stats_list[best]
         is_ann, oos_ann = _annualized_return(is_stats), _annualized_return(oos_stats)
@@ -316,7 +351,8 @@ def summarize_walk_forward(windows: list, oos_returns: pd.Series) -> dict:
         return dict(n_windows=n_win, n_live_windows=0, oos_sharpe=0.0, oos_cagr=0.0,
                     oos_max_drawdown=0.0, oos_total_return=0.0, is_sharpe_mean=0.0,
                     wfe=np.nan, pct_profitable_windows=0.0, param_change_rate=np.nan,
-                    oos_is_sharpe_ratio=np.nan, n_trades_oos=0, pardo_pass=False)
+                    oos_is_sharpe_ratio=np.nan, n_trades_oos=0, pardo_pass=False,
+                    oos_exposure=0.0, oos_notional=0.0, oos_avg_net_exposure=0.0)
 
     eq = (1 + oos_returns).cumprod()
     total = float(eq.iloc[-1] - 1)
@@ -348,6 +384,12 @@ def summarize_walk_forward(windows: list, oos_returns: pd.Series) -> dict:
     pardo_pass = bool(
         len(live) >= 3 and total > 0 and pct_profitable >= 0.5 and (np.isfinite(wfe) and wfe >= 0.5)
     )
+    # exposure over EVERY OOS bar (skipped windows are flat and count in the
+    # denominator): share of bars with a position, mean |notional| / equity
+    # (a leverage; 0 when flat) and mean signed notional / equity (long > 0)
+    held = sum(w["oos_stats"].get("held_bars", 0) for w in live)
+    gross = sum(w["oos_stats"].get("gross_notional", 0.0) for w in live)
+    net = sum(w["oos_stats"].get("net_notional", 0.0) for w in live)
     return dict(
         n_windows=n_win,
         n_live_windows=len(live),
@@ -362,6 +404,9 @@ def summarize_walk_forward(windows: list, oos_returns: pd.Series) -> dict:
         oos_is_sharpe_ratio=(oos_sharpe / is_mean) if is_mean > 0 else np.nan,
         n_trades_oos=int(sum(w["oos_stats"]["n_trades"] for w in live)),
         pardo_pass=pardo_pass,
+        oos_exposure=float(held / n_bars),
+        oos_notional=float(gross / n_bars),
+        oos_avg_net_exposure=float(net / n_bars),
     )
 
 
