@@ -34,7 +34,8 @@ import numpy as np
 import pandas as pd
 
 from strategy import (
-    backtest, annualized_sharpe, periods_per_year, performance_stats, REGIME_INDICATORS, hedge_warmup,
+    backtest, annualized_sharpe, max_drawdown, periods_per_year, performance_stats, REGIME_INDICATORS,
+    hedge_warmup,
 )
 
 
@@ -358,7 +359,7 @@ def summarize_walk_forward(windows: list, oos_returns: pd.Series) -> dict:
     total = float(eq.iloc[-1] - 1)
     n_bars = len(oos_returns)
     cagr = float(eq.iloc[-1] ** (periods_per_year() / n_bars) - 1) if eq.iloc[-1] > 0 else -1.0
-    max_dd = float((eq / eq.cummax() - 1).min())
+    max_dd = max_drawdown(eq)
     oos_sharpe = annualized_sharpe(oos_returns)
 
     is_sharpes = np.array([w["is_stats"]["sharpe"] for w in live])
@@ -410,25 +411,42 @@ def summarize_walk_forward(windows: list, oos_returns: pd.Series) -> dict:
     )
 
 
+MATRIX_TRAIN_LENGTHS = (250, 375, 500, 750)
+MATRIX_TEST_LENGTHS = (63, 125, 250)
+
+
+def matrix_cells(n_bars: int, train_lengths=MATRIX_TRAIN_LENGTHS, test_lengths=MATRIX_TEST_LENGTHS) -> list:
+    """The (train, test) settings of Pardo's matrix that fit in `n_bars`."""
+    return [(tr, te) for tr, te in iproduct(train_lengths, test_lengths) if tr + te < n_bars]
+
+
+def matrix_row(df: pd.DataFrame, tpl, param_grid: dict, train_bars: int, test_bars: int, **kwargs) -> dict:
+    """One cell of the walk-forward matrix. Separate from the loop so a caller
+    with a process pool can run the cells in parallel (see pipeline.py)."""
+    s = walk_forward(df, tpl, param_grid, train_bars=train_bars, test_bars=test_bars, **kwargs)["summary"]
+    return dict(train_bars=train_bars, test_bars=test_bars, oos_sharpe=s["oos_sharpe"], wfe=s["wfe"],
+                pct_profitable=s["pct_profitable_windows"], n_windows=s["n_windows"],
+                pardo_pass=s["pardo_pass"])
+
+
+def matrix_frame(rows: list) -> pd.DataFrame:
+    """Rows of `matrix_row` -> DataFrame indexed by (train_bars, test_bars);
+    an empty frame when no cell was feasible."""
+    out = pd.DataFrame(rows)
+    return out.set_index(["train_bars", "test_bars"]).sort_index() if len(out) else out
+
+
 def walk_forward_matrix(
     df: pd.DataFrame,
     tpl,
     param_grid: dict,
-    train_lengths=(250, 375, 500, 750),
-    test_lengths=(63, 125, 250),
+    train_lengths=MATRIX_TRAIN_LENGTHS,
+    test_lengths=MATRIX_TEST_LENGTHS,
     **kwargs,
 ) -> pd.DataFrame:
     """Pardo's walk-forward matrix: re-run the WFA over a grid of
     train/test lengths. Returns a DataFrame indexed by (train, test)
     with OOS Sharpe, WFE, % profitable windows and the Pardo pass flag.
     A robust template shows positive OOS Sharpe in MOST cells."""
-    rows = []
-    for tr, te in iproduct(train_lengths, test_lengths):
-        if tr + te >= len(df):
-            continue
-        s = walk_forward(df, tpl, param_grid, train_bars=tr, test_bars=te, **kwargs)["summary"]
-        rows.append(dict(train_bars=tr, test_bars=te, oos_sharpe=s["oos_sharpe"], wfe=s["wfe"],
-                         pct_profitable=s["pct_profitable_windows"], n_windows=s["n_windows"],
-                         pardo_pass=s["pardo_pass"]))
-    out = pd.DataFrame(rows)
-    return out.set_index(["train_bars", "test_bars"]) if len(out) else out
+    return matrix_frame([matrix_row(df, tpl, param_grid, tr, te, **kwargs)
+                         for tr, te in matrix_cells(len(df), train_lengths, test_lengths)])

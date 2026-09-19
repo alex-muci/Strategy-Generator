@@ -1104,6 +1104,15 @@ def annualized_sharpe(rets: pd.Series | np.ndarray, ppy: int | None = None) -> f
     return float(r.mean() / sd * np.sqrt(ppy)) if sd > 0 else 0.0
 
 
+def max_drawdown(equity) -> float:
+    """Deepest peak-to-trough fall of an equity path, as a (negative) fraction
+    of the running peak; 0.0 for an empty path."""
+    eq = np.asarray(equity, dtype=float)
+    if len(eq) == 0:
+        return 0.0
+    return float((eq / np.maximum.accumulate(eq) - 1).min())
+
+
 def performance_stats(equity, trades: list, initial_equity: float, rets=None, pnls=None, bars_held=None) -> dict:
     """Summary stats from an equity path. Accepts a numpy array or a Series;
     `rets`, `pnls` and `bars_held` may be passed to skip recomputation."""
@@ -1121,9 +1130,8 @@ def performance_stats(equity, trades: list, initial_equity: float, rets=None, pn
     total_return = final / initial_equity - 1
     cagr = (final / initial_equity) ** (1 / n_years) - 1 if final > 0 else -1.0
     sharpe = annualized_sharpe(rets[1:])
-    running_max = np.maximum.accumulate(eq)
-    max_dd = float((eq / running_max - 1).min())
-    wins = pnls[pnls > 0].sum()
+    max_dd = max_drawdown(eq)
+    wins =pnls[pnls > 0].sum()
     losses = -pnls[pnls < 0].sum()
     profit_factor = wins / losses if losses > 0 else (np.inf if wins > 0 else 0.0)
     n_tr = len(pnls)

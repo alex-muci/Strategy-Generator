@@ -33,10 +33,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from strategy import (
-    StrategyTemplate, backtest, periods_per_year, _compute_indicators,
-    ENTRY_CODES, EXIT_CODES,
-)
+from strategy import StrategyTemplate, backtest
 from walkforward import grid_combos, optimize_window, warmup_bars
 
 
@@ -242,13 +239,18 @@ def _entry_orders(df, tpl: StrategyTemplate, ind: dict, pending, equity: float) 
     channel on the LAST CLOSED bar.
     """
     n = len(df)
+    # checked BEFORE the resting order: on a bar whose indicators are unusable
+    # the engine cancels a working pullback limit (`pend_active = False`), so
+    # republishing it here would keep alive an order the backtest had pulled
+    if not _last_ready(ind, n):
+        return []
     if pending is not None:
         side = pending["side"]
         return [dict(kind="limit", side=side, level=pending["level"],
                      shares=_size(equity, tpl, ind, n, pending["level"]),
                      note=f"pullback limit already working, expires in "
                           f"{max(pending['expires_bar'] - (n - 1), 0)} bar(s)")]
-    if not _last_ready(ind, n) or _filter_block(df, tpl, ind):
+    if _filter_block(df, tpl, ind):
         return []
 
     upper, lower = float(ind["upper"][n - 1]), float(ind["lower"][n - 1])

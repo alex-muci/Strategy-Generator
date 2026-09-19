@@ -19,7 +19,12 @@ portfolio construction) plus the modern overfitting diagnostics.
 ```bash
 conda create -p ./env python=3.12 pandas scikit-learn scipy matplotlib yfinance numba
 conda activate ./env
-python -m unittest discover -s tests -v      # 99 tests (engine, templates, hedge learner, walk-forward, robustness, live signals, dashboard)
+# or, with pip:  pip install -r requirements.txt   (the versions the suite was last run against)
+
+python -m unittest discover -s tests -v      # 174 tests (engine, templates, hedge learner, walk-forward, robustness, selection, data, live signals, both entry points)
+# faster (about 2.5 min instead of 4.5): pip install -r requirements-dev.txt, then, with ./env active,
+python -m pytest -n auto --dist loadscope   # same tests in parallel; loadscope keeps a class (and its one-off setup) on one worker
+
 python main.py                                # synthetic data, 72 templates, ~1 min on 8 cores
 ```
 
@@ -147,8 +152,15 @@ portfolio.py    Candidate filter (Sharpe / windows / Pardo), greedy or
                 cluster-based subset selection, equal or HRP weights,
                 and the NESTED walk-forward of the selection step.
 
+pipeline.py     The research orchestration main.py and etf_dashboard.py share:
+                the pool workers (slot evaluation, walk-forward matrix cells),
+                family diagnostics, static + nested portfolios, finalist
+                statistics, the buy-and-hold benchmark, and loading real data
+                without its forming bar. Every number both entry points
+                report is computed here, once.
+
 main.py         Single-asset research run: everything in a process pool,
-                then the report.
+                then the report. `main(argv)` returns what it computed.
 
 live.py         The live layer: current position and stop levels read out of
                 the engine, the next bar's orders and their order types,
@@ -162,7 +174,9 @@ dashboard_html.py  Renders that into one self-contained HTML page: no CDN,
 tests/          unittest suite: no look-ahead, costs, stops, CPCV path
                 coverage, PBO on noise vs. signal, DSR, bootstrap, HRP,
                 the annualization contract, the live order predictions
-                against the engine, and the dashboard round trip.
+                against the engine, the dashboard round trip, main.py end
+                to end (incl. a --jobs 2 run) and its parity with the
+                dashboard's research, the data loader against a fake yfinance.
 ```
 
 ## The strategy templates

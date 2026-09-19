@@ -49,26 +49,24 @@ import json
 import os
 import time
 from dataclasses import asdict
-from multiprocessing import Pool
 
 import numpy as np
 import pandas as pd
 
-from data import load_yfinance, synthetic_ohlc
+from data import synthetic_ohlc
 from generator import generate_templates, param_grid_for, FAMILIES
 from live import (
-    drop_forming_bar, refit_params, due_for_refit, strategy_state,
+    refit_params, due_for_refit, strategy_state,
     portfolio_targets, trade_list, utcnow,
 )
-from portfolio import returns_frame, select_portfolio, walk_forward_portfolio
-from robustness import (
-    cscv_pbo, merge_block_stats, reality_check, effective_n_trials,
-    deflated_sharpe_ratio, min_backtest_length, bootstrap_sharpe_pvalue,
-    evaluate_template,
+from pipeline import (
+    resolve_interval, load_real, eval_config, worker_pool, evaluate_slots,
+    family_diagnostics, build_portfolios, finalist_stats,
 )
+from portfolio import returns_frame
 from strategy import (
-    StrategyTemplate, annualized_sharpe, periods_per_year, set_periods_per_year,
-    periods_per_year_for_interval, BARS_PER_YEAR, SIDES,
+    StrategyTemplate, annualized_sharpe, max_drawdown, set_periods_per_year,
+    periods_per_year_for_interval, SIDES, BARS_PER_YEAR,
 )
 from dashboard_html import render_dashboard
 
@@ -117,7 +115,7 @@ def parse_args(argv=None):
     r.add_argument("--corr-ceiling", type=float, default=0.6)
     r.add_argument("--require-pardo", action="store_true")
     r.add_argument("--select-method", default="greedy", choices=["greedy", "cluster"])
-    r.add_argument("--weighting", default="hrp", choices=["equal", "hrp"])
+    r.add_argument("--weighting", default="equal", choices=["equal", "hrp"])
     r.add_argument("--cpcv-groups", type=int, default=8)
     r.add_argument("--cpcv-k", type=int, default=2)
     r.add_argument("--n-boot", type=int, default=1000)
@@ -157,8 +155,7 @@ def load_assets(assets, *, interval, start, synthetic, bars, now=None, quiet=Fal
             # a different seed per asset, so the assets are not the same series
             raw[a] = synthetic_ohlc(n_bars=bars, seed=100 + 7 * i, trend_prob=0.45 + 0.05 * i)
         else:
-            raw[a] = load_yfinance(a, start=start, interval=interval)
-            raw[a] = drop_forming_bar(raw[a], interval, now=now)
+            raw[a] = load_real(a, start=start, interval=interval, now=now)
         if not quiet:
             print(f"  {a}: {len(raw[a])} bars, {raw[a].index[0].date()} to {raw[a].index[-1].date()}")
 
@@ -181,7 +178,7 @@ def _history_bars_needed(spec: dict) -> int:
 
 def _start_for_bars(n_bars: int, interval: str) -> str:
     """A start date comfortably older than `n_bars` bars ago."""
-    per_year = BARS_PER_YEAR[interval]
+    per_year = periods_per_year_for_interval(interval)
     years = n_bars / per_year * 1.6 + 0.5
     return (utcnow() - pd.Timedelta(days=365.25 * years)).strftime("%Y-%m-%d")
 
@@ -190,39 +187,13 @@ def _start_for_bars(n_bars: int, interval: str) -> str:
 # research phase
 # ==========================================================================
 
-_DATA = None
-_CFG = None
-
-
-def _init_worker(data, cfg):
-    global _DATA, _CFG
-    _DATA, _CFG = data, cfg
-    set_periods_per_year(cfg["periods_per_year"])
-
-
-def _evaluate_slot(job):
-    """One (asset, template) slot: walk-forward + CPCV. Runs in the pool."""
-    asset, tpl = job
-    c = _CFG
-    tpl = tpl.with_params(cost_bps=c["cost_bps"], risk_pct=c["risk_pct"],
-                          max_leverage=c["max_leverage"])
-    df = _DATA[asset]
-    grid = param_grid_for(tpl, wide=c["wide_grid"])
-    wfa = evaluate_template(
-        df, tpl, grid, train_bars=c["train_bars"], test_bars=c["test_bars"],
-        anchored=c["anchored"], metric=c["metric"], selection=c["selection"],
-        cpcv_groups=c["cpcv_groups"], cpcv_k=c["cpcv_k"],
-        cscv_partitions_n=16 if len(df) >= 1600 else 8,
-    )
-    wfa["asset"] = asset
-    return f"{asset}|{tpl.name}", wfa
-
-
 def research(args) -> dict:
     t0 = time.time()
     os.makedirs(args.state_dir, exist_ok=True)
-    ppy = periods_per_year_for_interval(args.interval)
-    set_periods_per_year(ppy)
+    interval = resolve_interval(args.interval, args.synthetic)
+    if interval != args.interval:
+        print(f"NOTE: --interval {args.interval} ignored, the synthetic series is {interval} bars")
+    args.interval = interval
 
     print(f"Loading {len(args.assets)} assets ({args.interval} bars)"
           f"{' [synthetic]' if args.synthetic else ''}...")
@@ -236,38 +207,27 @@ def research(args) -> dict:
 
     overrides = {"sides": args.sides} if args.sides else {}
     templates = generate_templates(args.family, max_templates=args.max_templates, **overrides)
-    cfg = dict(
-        interval=args.interval, periods_per_year=ppy, start=args.start,
-        family=args.family, sides=args.sides, train_bars=args.train, test_bars=args.test,
-        anchored=args.anchored, metric=args.metric, selection=args.selection,
-        wide_grid=args.wide_grid, cost_bps=args.cost_bps, risk_pct=args.risk_pct,
-        max_leverage=args.max_leverage, cpcv_groups=args.cpcv_groups, cpcv_k=args.cpcv_k,
+    cfg = eval_config(args, args.interval) | dict(
+        start=args.start, family=args.family, sides=args.sides,
         min_sharpe=args.min_sharpe, corr_ceiling=args.corr_ceiling,
         weighting=args.weighting, select_method=args.select_method,
     )
-    jobs = [(a, t) for a in args.assets for t in templates]
+    jobs = [(f"{a}|{t.name}", a, t) for a in args.assets for t in templates]
     print(f"{len(templates)} templates x {len(args.assets)} assets = {len(jobs)} slots; "
           f"walk-forward train={args.train} test={args.test} "
           f"{'anchored' if args.anchored else 'rolling'}, {args.cost_bps} bps/side")
 
-    pool = Pool(args.jobs, initializer=_init_worker, initargs=(data, cfg)) if args.jobs > 1 else None
-    _init_worker(data, cfg)
-    try:
-        results = {}
-        mapper = pool.imap_unordered if pool is not None else map
-        for i, (key, res) in enumerate(mapper(_evaluate_slot, jobs), 1):
-            results[key] = res
-            if i % max(1, len(jobs) // 20) == 0 or i == len(jobs):
-                print(f"  [{i}/{len(jobs)}] {key:<52} oos_sharpe="
-                      f"{res['summary']['oos_sharpe']:>6.2f} cpcv={res['cpcv']['sharpe_mean']:>6.2f}")
-        spec = _assemble_spec(data, results, args, cfg, pool)
-    finally:
-        if pool is not None:
-            pool.close()
-            pool.join()
+    def progress(i, total, key, res):
+        if i % max(1, total // 20) == 0 or i == total:
+            print(f"  [{i}/{total}] {key:<52} oos_sharpe="
+                  f"{res['summary']['oos_sharpe']:>6.2f} cpcv={res['cpcv']['sharpe_mean']:>6.2f}")
+
+    with worker_pool(args.jobs, data, cfg) as pool:
+        results = evaluate_slots(jobs, pool, on_result=progress)
+        spec = _assemble_spec(data, results, args, cfg)
 
     path = os.path.join(args.state_dir, "portfolio.json")
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(spec, f, indent=2, default=str)
     _write_research_report(spec, os.path.join(args.state_dir, "research_report.md"))
     # a re-run invalidates any params fitted for the previous slot list
@@ -281,34 +241,21 @@ def research(args) -> dict:
     return spec
 
 
-def _assemble_spec(data, results, args, cfg, pool) -> dict:
+def _assemble_spec(data, results, args, cfg) -> dict:
     rets = returns_frame(results)
     if rets.empty:
         raise SystemExit("no slot produced a usable out-of-sample series -- history too short")
 
-    port = select_portfolio(
-        results, min_sharpe=args.min_sharpe, max_strategies=args.max_strategies,
-        corr_ceiling=args.corr_ceiling, require_pardo=args.require_pardo,
-        method=args.select_method, weighting=args.weighting,
-    )
-    boundaries = next(iter(results.values()))["boundaries"]
-    nested = walk_forward_portfolio(
-        rets, boundaries, min_sharpe=args.min_sharpe, max_strategies=args.max_strategies,
-        corr_ceiling=args.corr_ceiling, method=args.select_method, weighting=args.weighting,
-    )
+    port, nested = build_portfolios(results, rets, args)
 
     print("\nFamily-level diagnostics over every (asset, template) trial...")
     diag = _diagnostics(results, rets, nested, port, args)
     selected = port["selected"]
     weights = port["weights"] if len(selected) else pd.Series(dtype=float)
 
-    finalists = {}
-    for name in selected:
-        boot = bootstrap_sharpe_pvalue(results[name]["oos_returns"], n_boot=args.n_boot)
-        dsr = deflated_sharpe_ratio(results[name]["oos_returns"], n_trials=diag["n_eff"],
-                                    var_sr_trials=diag["var_sr_period"])
-        finalists[name] = dict(bootstrap_p=boot["p_value"], dsr=dsr["dsr"], psr0=dsr["psr0"])
-        print(f"  {name:<52} boot p={boot['p_value']:.3f}  DSR={dsr['dsr']:.2f}")
+    finalists = finalist_stats(results, selected, diag, n_boot=args.n_boot)
+    for name, f in finalists.items():
+        print(f"  {name:<52} boot p={f['bootstrap_p']:.3f}  DSR={f['dsr']:.2f}")
 
     slots = []
     for name in selected:
@@ -346,16 +293,11 @@ def _assemble_spec(data, results, args, cfg, pool) -> dict:
 
 
 def _diagnostics(results, rets, nested, port, args) -> dict:
-    n_trials = sum(r["n_trials"] for r in results.values())
-    pbo = cscv_pbo(blocks=merge_block_stats([r["trial_blocks"] for r in results.values()]))
-    pbo_slots = (cscv_pbo(rets.to_numpy(), n_partitions=16 if len(rets) >= 1600 else 8)
-                 if rets.shape[1] > 1 else None)
-    rc = reality_check(rets, n_boot=args.n_boot)
-    oos_sharpes = rets.apply(annualized_sharpe)
-    best = oos_sharpes.idxmax()
-    eff = effective_n_trials(rets)
-    dsr_best = deflated_sharpe_ratio(rets[best], n_trials=eff["n_eff"],
-                                     var_sr_trials=eff["var_sr_period"])
+    # the numbers are pipeline.family_diagnostics' (the same ones main.py
+    # reports); this only flattens them into JSON and adds the portfolio's
+    fam = family_diagnostics(results, rets, n_boot=args.n_boot)
+    n_trials, pbo, pbo_slots, rc = fam["n_trials"], fam["pbo_trials"], fam["pbo_templates"], fam["reality_check"]
+    dsr_best = fam["dsr_best"]
     pr, ne = port["portfolio_returns"], nested["portfolio_equity"]
     out = dict(
         n_slots=int(rets.shape[1]), n_trials=int(n_trials),
@@ -363,14 +305,15 @@ def _diagnostics(results, rets, nested, port, args) -> dict:
         prob_oos_loss=float(pbo["prob_oos_loss"]),
         pbo_slots=None if pbo_slots is None else float(pbo_slots["pbo"]),
         reality_check_best=str(rc["best"]), reality_check_p=float(rc["p_value"]),
-        n_eff=int(eff["n_eff"]), var_sr_period=float(eff["var_sr_period"]),
-        best_slot=str(best), best_oos_sharpe=float(dsr_best["sharpe_annual"]),
+        n_eff=int(fam["n_eff"]), var_sr_period=float(fam["var_sr_period"]),
+        best_slot=str(fam["best_template"]), best_oos_sharpe=float(dsr_best["sharpe_annual"]),
         sr_star_annual=float(dsr_best["sr_star_annual"]), dsr_best=float(dsr_best["dsr"]),
-        min_btl_years=float(min_backtest_length(eff["n_eff"], max(float(oos_sharpes.max()), 1e-6))),
-        years_available=float(len(rets) / periods_per_year()),
+        dsr_raw=float(fam["dsr_raw"]["dsr"]),
+        min_btl_years=float(fam["min_btl_years"]),
+        years_available=float(fam["years_available"]),
         static_sharpe=float(annualized_sharpe(pr)) if len(pr) > 2 else 0.0,
         nested_sharpe=float(nested["sharpe"]),
-        nested_max_drawdown=float((ne / ne.cummax() - 1).min()) if len(ne) else 0.0,
+        nested_max_drawdown=max_drawdown(ne),
         n_reselections=len(nested["selections"]),
     )
     print(f"  PBO over {n_trials} parameter trials: {out['pbo_trials']:.2f}"

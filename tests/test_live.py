@@ -16,7 +16,6 @@ from __future__ import annotations
 import os
 import sys
 import unittest
-import numpy as np
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -251,6 +250,57 @@ class RefitCadenceTests(unittest.TestCase):
     def test_refit_refuses_a_short_history(self):
         with self.assertRaises(ValueError):
             refit_params(self.df.iloc[:100], self.tpl, self.grid, train_bars=400)
+
+
+class StalePullbackOrderTests(unittest.TestCase):
+    """A resting pullback limit, then a halt: three flat bars zero the ATR(3).
+    On the next bar the engine cancels the order before it can fill (it starts
+    nothing while the indicators are unusable); the published orders used to
+    keep it working."""
+
+    @classmethod
+    def setUpClass(cls):
+        df = synthetic_ohlc(600, seed=17)
+        cls.tpl = StrategyTemplate("pb", direction_logic="trend", channel_type="donchian",
+                                   entry_style="pullback", exit_style="atr_trail", n_entry=20,
+                                   atr_n=3, pullback_valid_bars=10, cost_bps=0.0)
+        for k in range(100, 599):
+            res = backtest(df.iloc[:k + 1], cls.tpl)
+            p = res["pending_order"]
+            if p is not None and res["open_position"] is None and p["expires_bar"] == k + 10:
+                break
+        else:
+            raise AssertionError("fixture never leaves a fresh pullback order working")
+        c = float(df["Close"].iloc[k])
+        idx = pd.bdate_range(df.index[k] + pd.Timedelta(days=1), periods=4)
+        flat = pd.DataFrame({"Open": c, "High": c, "Low": c, "Close": c, "Volume": 1}, index=idx[:3])
+        cls.pending, cls.halted = p, pd.concat([df.iloc[:k + 1], flat])
+        # the bar after the halt trades straight through the limit
+        lvl = p["level"]
+        lo, hi = min(c, lvl * 0.99), max(c, lvl * 1.01)
+        cls.next_bar = pd.DataFrame({"Open": c, "High": hi, "Low": lo, "Close": c, "Volume": 1}, index=idx[3:])
+
+    def test_the_fixture_has_a_working_order_and_a_dead_atr(self):
+        res = backtest(self.halted, self.tpl)
+        self.assertEqual(res["pending_order"], self.pending)
+        self.assertEqual(res["indicators"]["atr"][-1], 0.0)
+
+    def test_the_engine_pulls_the_order(self):
+        before = backtest(self.halted, self.tpl)
+        after = backtest(pd.concat([self.halted, self.next_bar]), self.tpl)
+        self.assertIsNone(after["open_position"])
+        self.assertIsNone(after["pending_order"])
+        self.assertEqual(len(after["trades"]), len(before["trades"]))
+
+    def test_so_the_published_orders_do_not_carry_it(self):
+        st = strategy_state(self.halted, self.tpl, lookback_bars=len(self.halted))
+        self.assertEqual(st["entry_orders"], [])
+        self.assertTrue(st["blocked_by"])
+
+    def test_a_healthy_bar_still_republishes_it(self):
+        st = strategy_state(self.halted.iloc[:-3], self.tpl, lookback_bars=len(self.halted))
+        self.assertEqual([o["kind"] for o in st["entry_orders"]], ["limit"])
+        self.assertAlmostEqual(st["entry_orders"][0]["level"], self.pending["level"])
 
 
 class HygieneTests(unittest.TestCase):

@@ -315,7 +315,7 @@ def probabilistic_sharpe_ratio(sr: float, sr_benchmark: float, T: int, skew: flo
 def expected_max_sharpe(n_trials: int, var_sr: float) -> float:
     """E[max SR] of n_trials i.i.d. trials with Sharpe variance var_sr
     (per-period units), Bailey & Lopez de Prado (2014) eq. (6)."""
-    if n_trials <= 1 or var_sr <= 0:
+    if n_trials <= 1 or not var_sr > 0:     # also catches a NaN variance
         return 0.0
     return float(np.sqrt(var_sr) * (
         (1 - EULER_GAMMA) * norm.ppf(1 - 1 / n_trials) + EULER_GAMMA * norm.ppf(1 - 1 / (n_trials * np.e))

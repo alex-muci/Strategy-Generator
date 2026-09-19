@@ -1,0 +1,9 @@
+# The versions the test suite was last run against (Python 3.12).
+# matplotlib >= 3.9 is a hard floor: main.py uses boxplot(tick_labels=...).
+numpy==2.5.2
+pandas==3.0.5
+scipy==1.18.1
+scikit-learn==1.9.0
+matplotlib==3.11.2
+numba==0.67.0
+yfinance==1.7.0
