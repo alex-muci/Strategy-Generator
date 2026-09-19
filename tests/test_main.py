@@ -179,14 +179,17 @@ class ParallelTests(unittest.TestCase):
             shutil.rmtree(d2, ignore_errors=True)
 
     def test_an_error_terminates_the_pool_instead_of_draining_it(self):
-        """close()+join() would sit through all the queued sleeps (~18 s)."""
-        t0 = time.time()
+        """close()+join() would sit through the ten sleeps still queued (~15 s).
+        The clock starts at the error, not at the pool: spawning two workers
+        (each imports numba and pandas) takes longer than that on its own when
+        the suite runs in parallel and every core is busy."""
         with self.assertRaises(RuntimeError):
             with P.worker_pool(2, {}, _cfg()) as pool:
                 it = pool.imap_unordered(time.sleep, [3.0] * 12)
                 next(it)
+                t0 = time.time()
                 raise RuntimeError("something downstream failed")
-        self.assertLess(time.time() - t0, 12.0)
+        self.assertLess(time.time() - t0, 8.0)
 
     def test_no_pool_for_a_single_job(self):
         with P.worker_pool(1, {"x": None}, _cfg()) as pool:
