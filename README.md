@@ -19,7 +19,12 @@ portfolio construction) plus the modern overfitting diagnostics.
 ```bash
 conda create -p ./env python=3.12 pandas scikit-learn scipy matplotlib yfinance numba
 conda activate ./env
-python -m unittest discover -s tests -v      # 99 tests (engine, templates, hedge learner, walk-forward, robustness, live signals, dashboard)
+# or, with pip:  pip install -r requirements.txt   (the versions the suite was last run against)
+
+python -m unittest discover -s tests -v      # 180 tests (engine, templates, hedge learner, walk-forward, robustness, selection, data, live signals, both entry points)
+# faster (about 2.5 min instead of 4.5): pip install -r requirements-dev.txt, then, with ./env active,
+python -m pytest -n auto --dist loadscope   # same tests in parallel; loadscope keeps a class (and its one-off setup) on one worker
+
 python main.py                                # synthetic data, 72 templates, ~1 min on 8 cores
 ```
 
@@ -79,6 +84,11 @@ daily bars:   10 17 * * 1-5   cd <repo> && python etf_dashboard.py signals
 hourly bars:  35 10-16 * * 1-5  ...  (a few minutes after each bar closes)
 ```
 
+Those times are New York's (`CRON_TZ=America/New_York`, or convert them). A
+daily bar counts as closed 15 minutes after the 16:00 New York bell
+(`live.SESSION_CLOSE`); any run from then until the next open sees the same
+bars, so the European morning works as well.
+
 Add `--interval 1h` to both phases for hourly bars; every annualized statistic
 follows the bar frequency (`strategy.BARS_PER_YEAR`).
 
@@ -102,7 +112,9 @@ Two rules keep the live path honest, both in `live.py`:
   `test_bars`-long parameter holds. `due_for_refit` enforces the same cadence.
 - **The forming bar is dropped.** A feed queried at 11:15 returns an 11:00 bar
   built from 15 minutes of trading; its high, low and close all still move, so
-  acting on it is a decision you could not have taken.
+  acting on it is a decision you could not have taken. A daily bar is dropped
+  until its session has closed, by the exchange's clock and not by the date
+  it is stamped with.
 
 Everything the dashboard reports about the *current* position (side, size, stop,
 target, trailing anchor, resting order) is read out of the same
@@ -147,8 +159,15 @@ portfolio.py    Candidate filter (Sharpe / windows / Pardo), greedy or
                 cluster-based subset selection, equal or HRP weights,
                 and the NESTED walk-forward of the selection step.
 
+pipeline.py     The research orchestration main.py and etf_dashboard.py share:
+                the pool workers (slot evaluation, walk-forward matrix cells),
+                family diagnostics, static + nested portfolios, finalist
+                statistics, the buy-and-hold benchmark, and loading real data
+                without its forming bar. Every number both entry points
+                report is computed here, once.
+
 main.py         Single-asset research run: everything in a process pool,
-                then the report.
+                then the report. `main(argv)` returns what it computed.
 
 live.py         The live layer: current position and stop levels read out of
                 the engine, the next bar's orders and their order types,
@@ -162,7 +181,9 @@ dashboard_html.py  Renders that into one self-contained HTML page: no CDN,
 tests/          unittest suite: no look-ahead, costs, stops, CPCV path
                 coverage, PBO on noise vs. signal, DSR, bootstrap, HRP,
                 the annualization contract, the live order predictions
-                against the engine, and the dashboard round trip.
+                against the engine, the dashboard round trip, main.py end
+                to end (incl. a --jobs 2 run) and its parity with the
+                dashboard's research, the data loader against a fake yfinance.
 ```
 
 ## The strategy templates
@@ -319,84 +340,6 @@ walked forward. With `--trend-prob 0.8 --trend-drift 0.002` (a real
 edge) the finalist passes all 12 walk-forward matrix cells, its
 bootstrap p-value is 0, and the nested portfolio keeps a Sharpe near 1.
 
-## Bugs fixed in the third review pass (walk-forward and the bar loop)
-
-- The out-of-sample window was backtested from a cold start `warmup_bars`
-  before it, and that buffer was allowed to TRADE. A position opened on the
-  buffer was chosen by parameters fitted on exactly those bars, and its P&L
-  inside the window was counted as out-of-sample (5 % of OOS bars and 8 % of
-  OOS trades on the synthetic default). `backtest()` now takes
-  `first_trade_bar`: the buffer only forms indicators, the first trade is on
-  the window's first bar, and `walkforward.window_backtest` is the one way
-  both the training and the test window are run. Training windows get the
-  same warm-up, so a grid point with a 60-bar channel is no longer scored on
-  fewer bars than one with a 20-bar channel, and `live.refit_params` calls
-  the same optimizer as the walk-forward loop.
-- The warm-up was far too short for exponentially smoothed indicators: an
-  EMA carries `(1-alpha)^t` of its arbitrary seed forever, and after the old
-  buffer a Keltner channel or a Wilder ADX still differed from the value a
-  trader with full history sees (the ADX by 27 % at the first bar of a test
-  window). `warmup_bars` now budgets the settle time of the EMA.
-- Pardo's WFE annualized the COMPOUNDED total return of the whole OOS
-  history and divided it by the mean per-window IS return, so it grew with
-  the length of the history alone: a flat 10 %/y in-sample and out-of-sample
-  reported a WFE of 1.6 over ten years and 6 over thirty. It is now the mean
-  of the per-window annualized OOS returns over the mean of the IS ones.
-- With a trend template's channel exit, a bar that traded through both the
-  channel and the hard stop always filled at the stop, although the channel
-  (the nearer level) is hit first on the way through; 4.6 % of channel-exit
-  trades on the synthetic default were filled at the wrong, further level.
-- The indicator cache was keyed on sampled closes only, so two frames with
-  the same closes and different highs and lows shared one (wrong) ATR and
-  channel. High and Low are now part of the key.
-
-## Bugs fixed in the second review pass
-
-- An open position was left completely unmanaged whenever the previous bar's
-  indicators were not fully formed or ATR(n) was zero: the bar loop skipped
-  the whole exit block, so the hard stop, the target and the trailing stop all
-  went quiet. Real data has flat stretches that drive ATR(n) to exactly zero,
-  and in the regression fixture a trade sized to risk 1% of equity rode one of
-  them straight into a gap and lost 13.5%. Exits are now honoured on every bar;
-  only NEW business waits for formed indicators.
-- The ATR chandelier ignored the entry bar's own extreme, so a large favourable
-  move on the entry bar was never locked in (the fixture gave the whole spike
-  back and turned a winner into a loser).
-- `portfolio._qualifying` could name a template with no column in the aligned
-  returns frame, raising KeyError for any `--min-sharpe <= 0`.
-- `hrp_weights` divided by zero on a never-traded (zero-variance) strategy, and
-  the resulting NaN cluster variance silently degraded the bisection to a 50/50
-  split -- handing a dead strategy a quarter of the book.
-- `load_yfinance` returned an empty frame on a wrong symbol, a rate limit or no
-  network, which surfaced much later as an obscure IndexError.
-- `warmup_bars` budgeted n bars for ADX, which is smoothed twice and needs ~2n.
-- `PERIODS_PER_YEAR` was imported by value into four modules and baked into two
-  default arguments, so the project could not be run on anything but daily bars.
-  `strategy.set_periods_per_year()` is now the single source of truth, read at
-  call time and set in the worker processes too.
-
-## Bugs fixed relative to the first version
-
-- Trailing stop was updated with the current bar's high *before* being
-  tested against the current bar's low (intrabar look-ahead).
-- Equity was marked to market with the *previous* close and realised
-  P&L landed one bar late; the last bar merged two days of returns.
-- Every template waited for a 100-bar volatility-percentile warm-up
-  even when it had no vol filter, wasting a fifth of each training
-  window. Warm-up now depends on the indicators actually used.
-- Countertrend + opposite-channel exit bought a 40-bar low and exited
-  on the next 15-bar low, i.e. almost immediately at a loss. The
-  countertrend channel exit is now the mean-reversion midline target.
-- No transaction costs at all (README claimed a fixed penalty).
-  `cost_bps` per side is charged on notional, default 5 bps.
-- No leverage cap on ATR position sizing (`max_leverage`).
-- Stops were not checked on the entry bar.
-- Windows with too few in-sample trades were silently dropped from the
-  stitched OOS curve, shortening it; they are now flat.
-- The last partial test window was never evaluated.
-- Portfolio candidates' Sharpes were computed on zero-padded returns
-  over the union of dates; the frame is now aligned on the common dates.
-- Pullback limit orders expired after one bar (now `pullback_valid_bars`).
 
 ## Caveats
 
@@ -407,6 +350,50 @@ walk. Results on synthetic data are a pipeline check. Real conclusions
 need real data, realistic costs for the instrument, and -- as the
 Reality Check numbers make painfully clear -- a lot more history than
 a decade of daily bars for a family of hundreds of trials.
+
+### Known approximations
+
+Each point below was measured on the synthetic data (2500 bars, 
+the 72 templates of the `quick` family, once as noise and once with 
+`--trend-prob 0.8 --trend-drift 0.002`) and is deliberately NOT changed. 
+They are listed with the number that would justify reopening each one.
+
+- **Every walk-forward window starts flat.** A position still open at the
+  end of test window N is marked to market on its last bar and is gone in
+  window N+1, which waits for a new signal (about 40 % of windows end
+  with a position open). This is the price of the `first_trade_bar` rule
+  above: a position carried into a window was opened on bars the window's
+  parameters were fitted on. The bias is CONSERVATIVE. Letting each
+  window inherit the state of its parameters' continuous path instead
+  raised the mean OOS Sharpe by 0.04 with an edge and by 0.01 on noise,
+  and left the ranking of the templates unchanged (Spearman 0.99 and
+  0.90), so no selection decision depends on it.
+- **The position open at the end of a window never pays its exit cost.**
+  This one flatters the result, by `cost_bps` x notional / equity per
+  window that ends in a position: 1.3 bp of CAGR per year and 0.005 of
+  Sharpe at the defaults (5 bps, ATR sizing at 1 % risk), far below
+  anything the pipeline decides on. Charging it means editing the
+  window's equity, returns, trade list and exposure consistently, for a
+  bias an order of magnitude smaller than the conservative one above.
+  It scales linearly with cost and leverage: reopen it if
+  `cost_bps * max_leverage` goes up, say, tenfold.
+- **CPCV and CSCV slice a full-history trials matrix**, so a test block
+  can begin in the middle of a trade that was opened before it. This is
+  how CSCV is defined (Bailey et al. 2015) and it is not look-ahead: the
+  trade was opened by fixed rules on a fixed parameter set, and nothing
+  from the test block reaches the selection. What is left is serial
+  dependence across the train/test boundary, which is what purging is
+  for. Purging `2 * n_entry` bars before every test group (`cpcv(...,
+  purge_bars=)`) moved the mean path Sharpe by -0.006 with an edge and
+  +0.006 on noise, no systematic sign, against a spread of 0.3 to 1.1
+  across templates; it mostly changed results by shrinking the training
+  set. The default stays at 0. CSCV cannot be purged by construction;
+  its blocks (T/16 bars) are long next to a trade and PBO is a rank
+  statistic with every trial treated alike.
+- **`adx()` seeds Wilder's smoothing with the first observation**, not
+  with the SMA of the first n as charting platforms do. The two differ
+  only while the seed is remembered, and `warmup_bars` already keeps the
+  strategy from trading until the seed has decayed. `atr()` is a plain rolling mean and has no seed.
 
 ## Extending this
 

@@ -47,7 +47,11 @@ EULER_GAMMA = 0.5772156649015329
 def trial_returns(df: pd.DataFrame, tpl, combos: list, initial_equity: float = 100_000.0):
     """Backtest every param combo over the FULL history.
     Returns (R, E): float array T x N of per-bar returns and int8 array
-    T x N flagging bars on which a trade was opened."""
+    T x N flagging bars on which a trade was opened.
+
+    The strategy is path-dependent, so a block cut out of R can start in the
+    middle of a trade. That is serial dependence, not look-ahead; see the
+    README ("Known approximations") for why cpcv's `purge_bars` stays at 0."""
     T, N = len(df), len(combos)
     R = np.zeros((T, N))
     E = np.zeros((T, N), dtype=np.int8)
@@ -315,7 +319,7 @@ def probabilistic_sharpe_ratio(sr: float, sr_benchmark: float, T: int, skew: flo
 def expected_max_sharpe(n_trials: int, var_sr: float) -> float:
     """E[max SR] of n_trials i.i.d. trials with Sharpe variance var_sr
     (per-period units), Bailey & Lopez de Prado (2014) eq. (6)."""
-    if n_trials <= 1 or var_sr <= 0:
+    if n_trials <= 1 or not var_sr > 0:     # also catches a NaN variance
         return 0.0
     return float(np.sqrt(var_sr) * (
         (1 - EULER_GAMMA) * norm.ppf(1 - 1 / n_trials) + EULER_GAMMA * norm.ppf(1 - 1 / (n_trials * np.e))

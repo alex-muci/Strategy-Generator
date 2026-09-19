@@ -35,7 +35,7 @@ from strategy import StrategyTemplate, backtest, _compute_indicators, atr  # noq
 from generator import generate_templates, param_grid_for  # noqa: E402
 from walkforward import (  # noqa: E402
     walk_forward, walk_forward_matrix, window_backtest, warmup_bars, summarize_walk_forward,
-    grid_combos, _ema_settle_bars, position_notional, exposure_totals,
+    grid_combos, optimize_window, _ema_settle_bars, position_notional, exposure_totals,
 )
 from live import refit_params  # noqa: E402
 
@@ -129,7 +129,50 @@ class WalkForwardWindowTests(unittest.TestCase):
                     self.assertEqual(float(win["returns"].iloc[0]), 0.0)
                 pd.testing.assert_series_equal(win["returns"], res["oos_returns"].loc[w["test_start"]:w["test_end"]],
                                                check_names=False)
-                self.assertEqual(w["is_stats"]["n_bars"], 400)
+                # 400 scored bars, fewer only where the window began before the warm-up ended
+                scored = df.index.get_loc(w["train_end"]) + 1 - df.index.get_loc(w["train_start"])
+                self.assertEqual(w["is_stats"]["n_bars"], scored)
+                self.assertLessEqual(scored, 400)
+            self.assertEqual(live[-1]["is_stats"]["n_bars"], 400, tpl.name)
+
+    def test_a_window_without_history_is_scored_from_the_end_of_the_warm_up(self):
+        """At bar 0 there is nothing to warm up on. Scored from bar 0, the
+        window's dead bars dilute the IS return against an OOS window that has
+        none (inflating Pardo's WFE), and a 20-bar channel trades, and is
+        scored, on more bars than a 60-bar one."""
+        df = self.df
+        tpl = StrategyTemplate("t", exit_style="channel")
+        combos, idx = grid_combos({"n_entry": [20, 60]})
+        warm = max(warmup_bars(tpl.with_params(**p)) for p in combos)
+        opt = optimize_window(df, tpl, combos, idx, 0, 500)
+        self.assertEqual((opt["warmup"], opt["start"]), (warm, warm))
+        for params, stats in zip(combos, opt["stats"]):
+            self.assertEqual(stats["n_bars"], 500 - warm)
+            # exactly the window a later one gets: warmed up, first trade at `warm`
+            self.assertEqual(stats, window_backtest(df, tpl.with_params(**params), warm, 500, warmup=warm)["stats"])
+        # the short channel is ready long before `warm`, and used to trade there
+        early = backtest(df.iloc[:500], tpl.with_params(n_entry=20))
+        self.assertTrue(any(t["entry_date"] < df.index[warm] for t in early["trades"]))
+        # a window with history behind it is left alone
+        self.assertEqual(optimize_window(df, tpl, combos, idx, 300, 800)["start"], 300)
+        # and one too short to trade at all still runs (and scores nothing)
+        tiny = optimize_window(df, tpl, combos, idx, 0, warm)
+        self.assertEqual(tiny["start"], 0)
+        self.assertIsNone(tiny["best"])
+
+    def test_anchored_windows_report_the_bars_they_scored(self):
+        tpl = StrategyTemplate("t", exit_style="channel")
+        grid = {"n_entry": [20, 60]}
+        warm = max(warmup_bars(tpl.with_params(n_entry=n)) for n in grid["n_entry"])
+        res = walk_forward(self.df, tpl, grid, train_bars=400, test_bars=100, anchored=True, min_trades=1)
+        live = [w for w in res["windows"] if not w["skipped"]]
+        self.assertGreater(len(live), 4)
+        for w in live:
+            self.assertEqual(w["train_start"], self.df.index[warm])
+            self.assertEqual(w["is_stats"]["n_bars"], self.df.index.get_loc(w["train_end"]) + 1 - warm)
+        fit = refit_params(self.df, tpl, grid, anchored=True, min_trades=1)
+        self.assertEqual(fit["train_start"], self.df.index[warm])
+        self.assertEqual(fit["train_bars"], len(self.df) - warm)
 
     def test_walk_forward_handles_every_template(self):
         df = self.df.iloc[:900]

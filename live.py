@@ -33,10 +33,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from strategy import (
-    StrategyTemplate, backtest, periods_per_year, _compute_indicators,
-    ENTRY_CODES, EXIT_CODES,
-)
+from strategy import StrategyTemplate, backtest
 from walkforward import grid_combos, optimize_window, warmup_bars
 
 
@@ -49,24 +46,53 @@ def utcnow() -> pd.Timestamp:
     return pd.Timestamp.now("UTC").tz_convert(None)
 
 
-def drop_forming_bar(df: pd.DataFrame, interval: str, now: pd.Timestamp | None = None) -> pd.DataFrame:
+SESSION_CLOSE = ("16:00", "America/New_York")   # regular close of the US cash session
+SESSION_CLOSE_GRACE = pd.Timedelta(minutes=15)  # Yahoo's last print is delayed and settles after the auction
+
+
+def drop_forming_bar(df: pd.DataFrame, interval: str, now: pd.Timestamp | None = None,
+                     session_close: tuple[str, str] = SESSION_CLOSE) -> pd.DataFrame:
     """Drop the last bar if it has not closed yet.
 
     A feed queried at 11:15 returns an 11:00 hourly bar built from 15 minutes
     of trading. Its high, low and close will all move, so any decision taken
     on it is a decision you cannot actually have taken. Daily bars are treated
     the same way: today's bar is dropped until the session is over.
+
+    `now` is UTC (naive, or aware in any zone). `session_close` is the
+    exchange's closing time and IANA timezone, used for daily and longer
+    bars only; pass e.g. ("17:30", "Europe/Berlin") for a Xetra listing.
     """
     if df.empty:
         return df
     now = utcnow() if now is None else pd.Timestamp(now)
+    if now.tz is not None:
+        now = now.tz_convert("UTC").tz_localize(None)
     last = df.index[-1]
-    if getattr(last, "tz", None) is not None:
-        last = last.tz_convert("UTC").tz_localize(None)
     step = _interval_to_timedelta(interval)
-    # a bar stamped at `last` covers [last, last + step); it is only final once
-    # that window has passed
-    if last + step > now:
+    if step < pd.Timedelta(days=1):
+        if getattr(last, "tz", None) is not None:
+            last = last.tz_convert("UTC").tz_localize(None)
+        # a bar stamped at `last` covers [last, last + step); it is only final
+        # once that window has passed
+        final_at = last + step
+    else:
+        # A daily bar is stamped with its DATE (midnight, no timezone), so
+        # `last + step` would be the next midnight UTC: hours after the close,
+        # and a run in between would silently trade on yesterday's bar. It is
+        # final when the session of its last day closes -- the day itself for
+        # a daily bar; for a weekly or monthly one, no later than the last
+        # calendar day of its span (an earlier last session errs on the safe
+        # side: the bar is dropped a little longer, never kept while forming).
+        if getattr(last, "tz", None) is not None:
+            last = last.tz_localize(None)
+        hhmm, zone = session_close
+        last_day = (last + step - pd.Timedelta(days=1)).normalize()
+        if interval == "1mo":  # the table's 30 days would release a 31-day month a session early
+            last_day = last.normalize() + pd.offsets.MonthEnd(0)
+        close = (last_day + pd.Timedelta(f"{hhmm}:00")).tz_localize(zone)
+        final_at = close.tz_convert("UTC").tz_localize(None) + SESSION_CLOSE_GRACE
+    if final_at > now:
         return df.iloc[:-1]
     return df
 
@@ -110,12 +136,13 @@ def refit_params(
     start = 0 if anchored else len(df) - train_bars
     if start < 0:
         raise ValueError(f"need {train_bars} bars to refit, have {len(df)}")
-    train = df.iloc[start:]
 
     # the window's indicators warm up on the bars before it (when there are
-    # any), exactly as the walk-forward's training windows do
+    # any), exactly as the walk-forward's training windows do; when there are
+    # not, the optimizer scores the window from the end of the warm-up on
     opt = optimize_window(df, tpl, combos, idx, start, len(df), metric=metric, selection=selection,
                           min_trades=min_trades, initial_equity=initial_equity)
+    train = df.iloc[opt["start"]:]
     best, scores, stats_list = opt["best"], opt["scores"], opt["stats"]
     return dict(
         params=None if best is None else combos[best],
@@ -242,13 +269,18 @@ def _entry_orders(df, tpl: StrategyTemplate, ind: dict, pending, equity: float) 
     channel on the LAST CLOSED bar.
     """
     n = len(df)
+    # checked BEFORE the resting order: on a bar whose indicators are unusable
+    # the engine cancels a working pullback limit (`pend_active = False`), so
+    # republishing it here would keep alive an order the backtest had pulled
+    if not _last_ready(ind, n):
+        return []
     if pending is not None:
         side = pending["side"]
         return [dict(kind="limit", side=side, level=pending["level"],
                      shares=_size(equity, tpl, ind, n, pending["level"]),
                      note=f"pullback limit already working, expires in "
                           f"{max(pending['expires_bar'] - (n - 1), 0)} bar(s)")]
-    if not _last_ready(ind, n) or _filter_block(df, tpl, ind):
+    if _filter_block(df, tpl, ind):
         return []
 
     upper, lower = float(ind["upper"][n - 1]), float(ind["lower"][n - 1])

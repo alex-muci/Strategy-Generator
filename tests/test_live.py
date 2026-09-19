@@ -16,7 +16,6 @@ from __future__ import annotations
 import os
 import sys
 import unittest
-import numpy as np
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -253,6 +252,57 @@ class RefitCadenceTests(unittest.TestCase):
             refit_params(self.df.iloc[:100], self.tpl, self.grid, train_bars=400)
 
 
+class StalePullbackOrderTests(unittest.TestCase):
+    """A resting pullback limit, then a halt: three flat bars zero the ATR(3).
+    On the next bar the engine cancels the order before it can fill (it starts
+    nothing while the indicators are unusable); the published orders used to
+    keep it working."""
+
+    @classmethod
+    def setUpClass(cls):
+        df = synthetic_ohlc(600, seed=17)
+        cls.tpl = StrategyTemplate("pb", direction_logic="trend", channel_type="donchian",
+                                   entry_style="pullback", exit_style="atr_trail", n_entry=20,
+                                   atr_n=3, pullback_valid_bars=10, cost_bps=0.0)
+        for k in range(100, 599):
+            res = backtest(df.iloc[:k + 1], cls.tpl)
+            p = res["pending_order"]
+            if p is not None and res["open_position"] is None and p["expires_bar"] == k + 10:
+                break
+        else:
+            raise AssertionError("fixture never leaves a fresh pullback order working")
+        c = float(df["Close"].iloc[k])
+        idx = pd.bdate_range(df.index[k] + pd.Timedelta(days=1), periods=4)
+        flat = pd.DataFrame({"Open": c, "High": c, "Low": c, "Close": c, "Volume": 1}, index=idx[:3])
+        cls.pending, cls.halted = p, pd.concat([df.iloc[:k + 1], flat])
+        # the bar after the halt trades straight through the limit
+        lvl = p["level"]
+        lo, hi = min(c, lvl * 0.99), max(c, lvl * 1.01)
+        cls.next_bar = pd.DataFrame({"Open": c, "High": hi, "Low": lo, "Close": c, "Volume": 1}, index=idx[3:])
+
+    def test_the_fixture_has_a_working_order_and_a_dead_atr(self):
+        res = backtest(self.halted, self.tpl)
+        self.assertEqual(res["pending_order"], self.pending)
+        self.assertEqual(res["indicators"]["atr"][-1], 0.0)
+
+    def test_the_engine_pulls_the_order(self):
+        before = backtest(self.halted, self.tpl)
+        after = backtest(pd.concat([self.halted, self.next_bar]), self.tpl)
+        self.assertIsNone(after["open_position"])
+        self.assertIsNone(after["pending_order"])
+        self.assertEqual(len(after["trades"]), len(before["trades"]))
+
+    def test_so_the_published_orders_do_not_carry_it(self):
+        st = strategy_state(self.halted, self.tpl, lookback_bars=len(self.halted))
+        self.assertEqual(st["entry_orders"], [])
+        self.assertTrue(st["blocked_by"])
+
+    def test_a_healthy_bar_still_republishes_it(self):
+        st = strategy_state(self.halted.iloc[:-3], self.tpl, lookback_bars=len(self.halted))
+        self.assertEqual([o["kind"] for o in st["entry_orders"]], ["limit"])
+        self.assertAlmostEqual(st["entry_orders"][0]["level"], self.pending["level"])
+
+
 class HygieneTests(unittest.TestCase):
     def test_a_forming_bar_is_dropped(self):
         idx = pd.date_range("2026-03-10 09:30", periods=5, freq="h")
@@ -272,6 +322,44 @@ class HygieneTests(unittest.TestCase):
         self.assertEqual(len(during), 3)
         after = drop_forming_bar(df, "1d", now=idx[-1] + pd.Timedelta(days=1, hours=1))
         self.assertEqual(len(after), 4)
+
+    @staticmethod
+    def _daily(last_day, periods=4):
+        idx = pd.bdate_range(end=last_day, periods=periods)
+        return pd.DataFrame({"Open": 1.0, "High": 1.0, "Low": 1.0, "Close": 1.0, "Volume": 1}, index=idx)
+
+    def test_a_closed_daily_bar_is_kept_the_same_evening(self):
+        """A daily bar is stamped at midnight, so `last + 1 day` is the NEXT
+        midnight UTC: the evening run after the close would drop the finished
+        bar and publish orders off yesterday's. The session close decides,
+        in New York time, summer and winter."""
+        for day, close_utc in (("2026-07-15", "20:00"),    # EDT: 16:00 New York = 20:00 UTC
+                               ("2026-01-15", "21:00")):   # EST: 16:00 New York = 21:00 UTC
+            df = self._daily(day)
+            close = pd.Timestamp(f"{day} {close_utc}")
+            self.assertEqual(len(drop_forming_bar(df, "1d", now=close - pd.Timedelta(minutes=1))), 3, day)
+            # the feed's last print still settles for a few minutes after the bell
+            self.assertEqual(len(drop_forming_bar(df, "1d", now=close + pd.Timedelta(minutes=5))), 3, day)
+            # 17:10 New York, the README's cron line
+            self.assertEqual(len(drop_forming_bar(df, "1d", now=close + pd.Timedelta(minutes=70))), 4, day)
+            # an aware `now` means the same instant
+            aware = (close + pd.Timedelta(minutes=70)).tz_localize("UTC").tz_convert("Europe/Rome")
+            self.assertEqual(len(drop_forming_bar(df, "1d", now=aware)), 4, day)
+
+    def test_the_session_close_is_the_exchanges(self):
+        df = self._daily("2026-07-15")
+        now = pd.Timestamp("2026-07-15 16:00")             # 18:00 in Frankfurt, 12:00 in New York
+        self.assertEqual(len(drop_forming_bar(df, "1d", now=now)), 3)
+        self.assertEqual(len(drop_forming_bar(df, "1d", now=now, session_close=("17:30", "Europe/Berlin"))), 4)
+
+    def test_weekly_and_monthly_bars_wait_for_their_last_session(self):
+        row = {"Open": 1.0, "High": 1.0, "Low": 1.0, "Close": 1.0, "Volume": 1}
+        wk = pd.DataFrame(row, index=pd.date_range("2026-06-22", periods=4, freq="W-MON"))  # last: Mon 13 Jul
+        self.assertEqual(len(drop_forming_bar(wk, "1wk", now=pd.Timestamp("2026-07-17 15:00"))), 3)  # Friday, open
+        self.assertEqual(len(drop_forming_bar(wk, "1wk", now=pd.Timestamp("2026-07-20 08:00"))), 4)
+        mo = pd.DataFrame(row, index=pd.date_range("2026-04-01", periods=4, freq="MS"))     # last: 1 Jul, 31 days
+        self.assertEqual(len(drop_forming_bar(mo, "1mo", now=pd.Timestamp("2026-07-31 15:00"))), 3)  # last session, open
+        self.assertEqual(len(drop_forming_bar(mo, "1mo", now=pd.Timestamp("2026-07-31 21:00"))), 4)
 
 
 class PortfolioTargetTests(unittest.TestCase):

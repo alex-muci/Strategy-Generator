@@ -34,7 +34,8 @@ import numpy as np
 import pandas as pd
 
 from strategy import (
-    backtest, annualized_sharpe, periods_per_year, performance_stats, REGIME_INDICATORS, hedge_warmup,
+    backtest, annualized_sharpe, max_drawdown, periods_per_year, performance_stats, REGIME_INDICATORS,
+    hedge_warmup,
 )
 
 
@@ -160,6 +161,11 @@ def window_backtest(df: pd.DataFrame, tpl, start: int, end: int, *,
     Returns the `backtest` dict with `returns`, `equity` and `stats` cut to
     the window (the equity starts the window at `initial_equity`; all trades
     lie inside it) plus `window_start`, the window's first timestamp.
+
+    A position still open on the last bar is marked to market and stays in
+    `open_position`: it is neither carried into the next window nor charged
+    an exit cost. Both effects are measured in the README ("Known
+    approximations"); the first is conservative and the larger of the two.
     """
     n = len(df)
     start, end = int(start), int(min(end, n))
@@ -217,8 +223,18 @@ def optimize_window(df: pd.DataFrame, tpl, combos: list, idx: np.ndarray, start:
     one with `selection`. Shared by the walk-forward loop and the live refit
     so the two cannot choose parameters differently.
 
-    Returns dict(best=index into combos or None, scores, stats)."""
+    A window that starts before the grid's longest warm-up (the first rolling
+    window, every anchored one) has no earlier bars to warm up on, so it is
+    scored from bar `warm` on. Left at `start`, its dead bars would dilute
+    the IS return and Sharpe against an OOS window that has none (inflating
+    Pardo's WFE), and a short-lookback grid point would trade, and be scored,
+    on more bars than a long-lookback one.
+
+    Returns dict(best=index into combos or None, scores, stats, warmup,
+    start=the first bar actually scored)."""
     warm = max(warmup_bars(tpl.with_params(**p)) for p in combos)
+    if warm < end - 1:  # otherwise nothing can trade and the window is skipped anyway
+        start = max(int(start), warm)
     scores = np.empty(len(combos))
     stats_list = []
     for j, params in enumerate(combos):
@@ -227,7 +243,7 @@ def optimize_window(df: pd.DataFrame, tpl, combos: list, idx: np.ndarray, start:
         stats_list.append(res["stats"])
         scores[j] = score_stats(res["stats"], metric, min_trades)
     best = select_params(scores, idx, selection)
-    return dict(best=best, scores=scores, stats=stats_list, warmup=warm)
+    return dict(best=best, scores=scores, stats=stats_list, warmup=warm, start=start)
 
 
 # --------------------------------------------------------------------------
@@ -279,6 +295,7 @@ def walk_forward(
         opt = optimize_window(df, tpl, combos, idx, train_start, train_end, metric=metric,
                               selection=selection, min_trades=min_trades, initial_equity=initial_equity)
         best, scores, stats_list = opt["best"], opt["scores"], opt["stats"]
+        train_start = opt["start"]  # report the bars that were scored (see optimize_window)
 
         boundaries.append(df.index[test_start])
         oos_slice_index = df.index[test_start:test_end]
@@ -358,7 +375,7 @@ def summarize_walk_forward(windows: list, oos_returns: pd.Series) -> dict:
     total = float(eq.iloc[-1] - 1)
     n_bars = len(oos_returns)
     cagr = float(eq.iloc[-1] ** (periods_per_year() / n_bars) - 1) if eq.iloc[-1] > 0 else -1.0
-    max_dd = float((eq / eq.cummax() - 1).min())
+    max_dd = max_drawdown(eq)
     oos_sharpe = annualized_sharpe(oos_returns)
 
     is_sharpes = np.array([w["is_stats"]["sharpe"] for w in live])
@@ -410,25 +427,42 @@ def summarize_walk_forward(windows: list, oos_returns: pd.Series) -> dict:
     )
 
 
+MATRIX_TRAIN_LENGTHS = (250, 375, 500, 750)
+MATRIX_TEST_LENGTHS = (63, 125, 250)
+
+
+def matrix_cells(n_bars: int, train_lengths=MATRIX_TRAIN_LENGTHS, test_lengths=MATRIX_TEST_LENGTHS) -> list:
+    """The (train, test) settings of Pardo's matrix that fit in `n_bars`."""
+    return [(tr, te) for tr, te in iproduct(train_lengths, test_lengths) if tr + te < n_bars]
+
+
+def matrix_row(df: pd.DataFrame, tpl, param_grid: dict, train_bars: int, test_bars: int, **kwargs) -> dict:
+    """One cell of the walk-forward matrix. Separate from the loop so a caller
+    with a process pool can run the cells in parallel (see pipeline.py)."""
+    s = walk_forward(df, tpl, param_grid, train_bars=train_bars, test_bars=test_bars, **kwargs)["summary"]
+    return dict(train_bars=train_bars, test_bars=test_bars, oos_sharpe=s["oos_sharpe"], wfe=s["wfe"],
+                pct_profitable=s["pct_profitable_windows"], n_windows=s["n_windows"],
+                pardo_pass=s["pardo_pass"])
+
+
+def matrix_frame(rows: list) -> pd.DataFrame:
+    """Rows of `matrix_row` -> DataFrame indexed by (train_bars, test_bars);
+    an empty frame when no cell was feasible."""
+    out = pd.DataFrame(rows)
+    return out.set_index(["train_bars", "test_bars"]).sort_index() if len(out) else out
+
+
 def walk_forward_matrix(
     df: pd.DataFrame,
     tpl,
     param_grid: dict,
-    train_lengths=(250, 375, 500, 750),
-    test_lengths=(63, 125, 250),
+    train_lengths=MATRIX_TRAIN_LENGTHS,
+    test_lengths=MATRIX_TEST_LENGTHS,
     **kwargs,
 ) -> pd.DataFrame:
     """Pardo's walk-forward matrix: re-run the WFA over a grid of
     train/test lengths. Returns a DataFrame indexed by (train, test)
     with OOS Sharpe, WFE, % profitable windows and the Pardo pass flag.
     A robust template shows positive OOS Sharpe in MOST cells."""
-    rows = []
-    for tr, te in iproduct(train_lengths, test_lengths):
-        if tr + te >= len(df):
-            continue
-        s = walk_forward(df, tpl, param_grid, train_bars=tr, test_bars=te, **kwargs)["summary"]
-        rows.append(dict(train_bars=tr, test_bars=te, oos_sharpe=s["oos_sharpe"], wfe=s["wfe"],
-                         pct_profitable=s["pct_profitable_windows"], n_windows=s["n_windows"],
-                         pardo_pass=s["pardo_pass"]))
-    out = pd.DataFrame(rows)
-    return out.set_index(["train_bars", "test_bars"]) if len(out) else out
+    return matrix_frame([matrix_row(df, tpl, param_grid, tr, te, **kwargs)
+                         for tr, te in matrix_cells(len(df), train_lengths, test_lengths)])

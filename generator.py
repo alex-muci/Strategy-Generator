@@ -39,7 +39,7 @@ from strategy import (
 
 # (indicator, filter) pairs; the indicator is irrelevant when filter == 'none'
 _ALL_REGIMES = [("er", "none")] + [
-    (ind, mode) for ind in REGIME_INDICATORS for mode in ("trend_only", "range_only")
+    (ind, mode) for ind in REGIME_INDICATORS for mode in REGIME_FILTERS if mode != "none"
 ]
 
 FAMILIES = {
