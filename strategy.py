@@ -347,16 +347,31 @@ def _adahedge_run(loss, t0, t1, w):
         w[e] = 1.0 / N
     for t in range(t0, t1):
         l = loss[t]
-        lm = l.min()
         # Hedge loss of the current mixture vs. the mix loss
         h = 0.0
         for e in range(N):
             h += w[e] * l[e]
         if delta > 0.0:
-            s = 0.0
+            # The mix loss -log(sum_e w[e] exp(-eta l[e])) / eta, from the
+            # cumulative losses the weights were made of (w[e] ~ exp(-eta d[e]),
+            # d = L - min L), not from w itself. While delta is tiny eta is huge
+            # and a trailing expert's weight underflows to exactly 0; on the
+            # round it beats the leaders by a wide margin every term of the sum
+            # over w is 0, the mix loss comes out +inf, the round's gap is
+            # discarded and eta stays huge -- on the very round that should end
+            # follow-the-leader. Here the smallest exponent of each sum is 0, so
+            # both sums lie in [1, N].
+            m0 = L.min()
+            m1 = np.inf                        # min over e of d[e] + l[e]
             for e in range(N):
-                s += w[e] * np.exp(-eta * (l[e] - lm))
-            mix = lm - np.log(s) / eta
+                if L[e] - m0 + l[e] < m1:
+                    m1 = L[e] - m0 + l[e]
+            s0 = 0.0
+            s1 = 0.0
+            for e in range(N):
+                s0 += np.exp(-eta * (L[e] - m0))
+                s1 += np.exp(-eta * (L[e] - m0 + l[e] - m1))
+            mix = m1 - np.log(s1 / s0) / eta
         else:                                  # eta = inf: mix loss is the best supported expert
             mix = 1.0
             for e in range(N):

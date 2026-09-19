@@ -183,6 +183,26 @@ class HedgeChannelTests(unittest.TestCase):
         self.assertEqual(int(np.argmax(W[-1])), 2)
         self.assertTrue(np.isfinite(eta[-1]))  # learning rate shrank from FTL to a finite eta
 
+    def test_a_written_off_expert_still_ends_follow_the_leader(self):
+        """While the mixability gap is tiny, eta is huge and a trailing
+        expert's weight underflows to exactly 0. When that expert then beats
+        the leader by a mile, a mix loss summed over the WEIGHTS is -log(0):
+        the round's gap was discarded, eta stayed at 74,000 and the learner
+        flipped all-in, on the one round built to teach it caution."""
+        c = 1e-5
+        loss = np.array([(0, c), (0, c), (0, c), (0, 10 * c), (0, 300 * c), (0, 3000 * c),   # expert 0 leads ...
+                         (1.0, 0.0)])                                                        # ... and is routed
+        W, eta = _adahedge_loop(loss, HEDGE_MEMORY)
+        np.testing.assert_array_equal(W[5], [1.0, 0.0])      # the precondition: written off completely
+        self.assertGreater(eta[5], 745.0)                    # and exp(-eta * 1) underflows as well
+        # the last round's mix loss is the written-off expert's 3313c deficit
+        # (it is the better of "leader loses 1" and "catch up 3313c, lose 0"),
+        # the Hedge loss is 1, so delta gains 1 - 3313c on top of what it had
+        delta = np.log(2) / eta[5] + 1.0 - 3313 * c
+        self.assertAlmostEqual(eta[6], np.log(2) / delta, places=9)
+        # expert 1 now leads by exactly that gap: weights 2/3 and 1/3, not 1 and 0
+        np.testing.assert_allclose(W[6], [1 / 3, 2 / 3], atol=1e-5)
+
     def test_bounded_memory_tracks_a_change_of_leader(self):
         loss = np.full((2000, 4), 0.6)
         loss[:1000, 0] = 0.4                   # expert 0 leads for 1000 rounds...
