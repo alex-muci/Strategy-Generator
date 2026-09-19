@@ -47,7 +47,11 @@ EULER_GAMMA = 0.5772156649015329
 def trial_returns(df: pd.DataFrame, tpl, combos: list, initial_equity: float = 100_000.0):
     """Backtest every param combo over the FULL history.
     Returns (R, E): float array T x N of per-bar returns and int8 array
-    T x N flagging bars on which a trade was opened."""
+    T x N flagging bars on which a trade was opened.
+
+    The strategy is path-dependent, so a block cut out of R can start in the
+    middle of a trade. That is serial dependence, not look-ahead; see the
+    README ("Known approximations") for why cpcv's `purge_bars` stays at 0."""
     T, N = len(df), len(combos)
     R = np.zeros((T, N))
     E = np.zeros((T, N), dtype=np.int8)

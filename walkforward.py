@@ -161,6 +161,11 @@ def window_backtest(df: pd.DataFrame, tpl, start: int, end: int, *,
     Returns the `backtest` dict with `returns`, `equity` and `stats` cut to
     the window (the equity starts the window at `initial_equity`; all trades
     lie inside it) plus `window_start`, the window's first timestamp.
+
+    A position still open on the last bar is marked to market and stays in
+    `open_position`: it is neither carried into the next window nor charged
+    an exit cost. Both effects are measured in the README ("Known
+    approximations"); the first is conservative and the larger of the two.
     """
     n = len(df)
     start, end = int(start), int(min(end, n))
