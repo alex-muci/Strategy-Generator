@@ -21,7 +21,7 @@ conda create -p ./env python=3.12 pandas scikit-learn scipy matplotlib yfinance 
 conda activate ./env
 # or, with pip:  pip install -r requirements.txt   (the versions the suite was last run against)
 
-python -m unittest discover -s tests -v      # 174 tests (engine, templates, hedge learner, walk-forward, robustness, selection, data, live signals, both entry points)
+python -m unittest discover -s tests -v      # 179 tests (engine, templates, hedge learner, walk-forward, robustness, selection, data, live signals, both entry points)
 # faster (about 2.5 min instead of 4.5): pip install -r requirements-dev.txt, then, with ./env active,
 python -m pytest -n auto --dist loadscope   # same tests in parallel; loadscope keeps a class (and its one-off setup) on one worker
 
@@ -84,6 +84,11 @@ daily bars:   10 17 * * 1-5   cd <repo> && python etf_dashboard.py signals
 hourly bars:  35 10-16 * * 1-5  ...  (a few minutes after each bar closes)
 ```
 
+Those times are New York's (`CRON_TZ=America/New_York`, or convert them). A
+daily bar counts as closed 15 minutes after the 16:00 New York bell
+(`live.SESSION_CLOSE`); any run from then until the next open sees the same
+bars, so the European morning works as well.
+
 Add `--interval 1h` to both phases for hourly bars; every annualized statistic
 follows the bar frequency (`strategy.BARS_PER_YEAR`).
 
@@ -107,7 +112,9 @@ Two rules keep the live path honest, both in `live.py`:
   `test_bars`-long parameter holds. `due_for_refit` enforces the same cadence.
 - **The forming bar is dropped.** A feed queried at 11:15 returns an 11:00 bar
   built from 15 minutes of trading; its high, low and close all still move, so
-  acting on it is a decision you could not have taken.
+  acting on it is a decision you could not have taken. A daily bar is dropped
+  until its session has closed, by the exchange's clock and not by the date
+  it is stamped with.
 
 Everything the dashboard reports about the *current* position (side, size, stop,
 target, trailing anchor, resting order) is read out of the same
@@ -386,8 +393,7 @@ They are listed with the number that would justify reopening each one.
 - **`adx()` seeds Wilder's smoothing with the first observation**, not
   with the SMA of the first n as charting platforms do. The two differ
   only while the seed is remembered, and `warmup_bars` already keeps the
-  strategy from trading until the seed has decayed (see the third review
-  pass). `atr()` is a plain rolling mean and has no seed.
+  strategy from trading until the seed has decayed. `atr()` is a plain rolling mean and has no seed.
 
 ## Extending this
 

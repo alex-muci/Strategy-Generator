@@ -323,6 +323,44 @@ class HygieneTests(unittest.TestCase):
         after = drop_forming_bar(df, "1d", now=idx[-1] + pd.Timedelta(days=1, hours=1))
         self.assertEqual(len(after), 4)
 
+    @staticmethod
+    def _daily(last_day, periods=4):
+        idx = pd.bdate_range(end=last_day, periods=periods)
+        return pd.DataFrame({"Open": 1.0, "High": 1.0, "Low": 1.0, "Close": 1.0, "Volume": 1}, index=idx)
+
+    def test_a_closed_daily_bar_is_kept_the_same_evening(self):
+        """A daily bar is stamped at midnight, so `last + 1 day` is the NEXT
+        midnight UTC: the evening run after the close would drop the finished
+        bar and publish orders off yesterday's. The session close decides,
+        in New York time, summer and winter."""
+        for day, close_utc in (("2026-07-15", "20:00"),    # EDT: 16:00 New York = 20:00 UTC
+                               ("2026-01-15", "21:00")):   # EST: 16:00 New York = 21:00 UTC
+            df = self._daily(day)
+            close = pd.Timestamp(f"{day} {close_utc}")
+            self.assertEqual(len(drop_forming_bar(df, "1d", now=close - pd.Timedelta(minutes=1))), 3, day)
+            # the feed's last print still settles for a few minutes after the bell
+            self.assertEqual(len(drop_forming_bar(df, "1d", now=close + pd.Timedelta(minutes=5))), 3, day)
+            # 17:10 New York, the README's cron line
+            self.assertEqual(len(drop_forming_bar(df, "1d", now=close + pd.Timedelta(minutes=70))), 4, day)
+            # an aware `now` means the same instant
+            aware = (close + pd.Timedelta(minutes=70)).tz_localize("UTC").tz_convert("Europe/Rome")
+            self.assertEqual(len(drop_forming_bar(df, "1d", now=aware)), 4, day)
+
+    def test_the_session_close_is_the_exchanges(self):
+        df = self._daily("2026-07-15")
+        now = pd.Timestamp("2026-07-15 16:00")             # 18:00 in Frankfurt, 12:00 in New York
+        self.assertEqual(len(drop_forming_bar(df, "1d", now=now)), 3)
+        self.assertEqual(len(drop_forming_bar(df, "1d", now=now, session_close=("17:30", "Europe/Berlin"))), 4)
+
+    def test_weekly_and_monthly_bars_wait_for_their_last_session(self):
+        row = {"Open": 1.0, "High": 1.0, "Low": 1.0, "Close": 1.0, "Volume": 1}
+        wk = pd.DataFrame(row, index=pd.date_range("2026-06-22", periods=4, freq="W-MON"))  # last: Mon 13 Jul
+        self.assertEqual(len(drop_forming_bar(wk, "1wk", now=pd.Timestamp("2026-07-17 15:00"))), 3)  # Friday, open
+        self.assertEqual(len(drop_forming_bar(wk, "1wk", now=pd.Timestamp("2026-07-20 08:00"))), 4)
+        mo = pd.DataFrame(row, index=pd.date_range("2026-04-01", periods=4, freq="MS"))     # last: 1 Jul, 31 days
+        self.assertEqual(len(drop_forming_bar(mo, "1mo", now=pd.Timestamp("2026-07-31 15:00"))), 3)  # last session, open
+        self.assertEqual(len(drop_forming_bar(mo, "1mo", now=pd.Timestamp("2026-07-31 21:00"))), 4)
+
 
 class PortfolioTargetTests(unittest.TestCase):
     def _state(self, asset, tpl, side, shares, price, stop):

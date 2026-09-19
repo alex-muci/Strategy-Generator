@@ -284,8 +284,11 @@ class WalkForwardTests(unittest.TestCase):
 
     def test_anchored_uses_all_history(self):
         res = walk_forward(self.df, self.tpl, self.grid, train_bars=400, test_bars=100, anchored=True)
+        # bar 0 has nothing to warm up on: every window is scored from the end
+        # of the grid's longest warm-up, the earliest bar that can be
+        warm = max(warmup_bars(self.tpl.with_params(**p)) for p in grid_combos(self.grid)[0])
         for w in res["windows"]:
-            self.assertEqual(w["train_start"], self.df.index[0])
+            self.assertEqual(w["train_start"], self.df.index[warm])
 
     def test_embargo_gap(self):
         res = walk_forward(self.df, self.tpl, self.grid, train_bars=400, test_bars=100, embargo_bars=10)

@@ -223,8 +223,18 @@ def optimize_window(df: pd.DataFrame, tpl, combos: list, idx: np.ndarray, start:
     one with `selection`. Shared by the walk-forward loop and the live refit
     so the two cannot choose parameters differently.
 
-    Returns dict(best=index into combos or None, scores, stats)."""
+    A window that starts before the grid's longest warm-up (the first rolling
+    window, every anchored one) has no earlier bars to warm up on, so it is
+    scored from bar `warm` on. Left at `start`, its dead bars would dilute
+    the IS return and Sharpe against an OOS window that has none (inflating
+    Pardo's WFE), and a short-lookback grid point would trade, and be scored,
+    on more bars than a long-lookback one.
+
+    Returns dict(best=index into combos or None, scores, stats, warmup,
+    start=the first bar actually scored)."""
     warm = max(warmup_bars(tpl.with_params(**p)) for p in combos)
+    if warm < end - 1:  # otherwise nothing can trade and the window is skipped anyway
+        start = max(int(start), warm)
     scores = np.empty(len(combos))
     stats_list = []
     for j, params in enumerate(combos):
@@ -233,7 +243,7 @@ def optimize_window(df: pd.DataFrame, tpl, combos: list, idx: np.ndarray, start:
         stats_list.append(res["stats"])
         scores[j] = score_stats(res["stats"], metric, min_trades)
     best = select_params(scores, idx, selection)
-    return dict(best=best, scores=scores, stats=stats_list, warmup=warm)
+    return dict(best=best, scores=scores, stats=stats_list, warmup=warm, start=start)
 
 
 # --------------------------------------------------------------------------
@@ -285,6 +295,7 @@ def walk_forward(
         opt = optimize_window(df, tpl, combos, idx, train_start, train_end, metric=metric,
                               selection=selection, min_trades=min_trades, initial_equity=initial_equity)
         best, scores, stats_list = opt["best"], opt["scores"], opt["stats"]
+        train_start = opt["start"]  # report the bars that were scored (see optimize_window)
 
         boundaries.append(df.index[test_start])
         oos_slice_index = df.index[test_start:test_end]
