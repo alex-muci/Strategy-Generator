@@ -68,6 +68,32 @@ class _RestoresAnnualization(unittest.TestCase):
         S.set_periods_per_year(self._ppy)
 
 
+class VolTargetRunTests(unittest.TestCase):
+    """A run sized to a vol target: the flag reaches every template, the report
+    says so, and the chart is drawn (buy & hold on the strategies' axis)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.dir = tempfile.mkdtemp(prefix="main-vt-")
+        cls.out = _main(BASE + ["--jobs", "1", "--no-matrix", "--vol-target", "0.15", "--out", cls.dir])
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.dir, ignore_errors=True)
+
+    def test_every_template_is_sized_to_the_target(self):
+        for res in self.out["results"].values():
+            self.assertEqual(res["template"].vol_target, 0.15)
+            self.assertEqual(res["template"].vol_target_n, 60)
+
+    def test_report_and_chart_state_the_rule(self):
+        text = open(os.path.join(self.dir, "report.md"), encoding="utf-8").read()
+        self.assertIn("15% annualized volatility", text)
+        self.assertNotIn("smaller scale than an unlevered holding", text)
+        p = os.path.join(self.dir, "equity_curves.png")
+        self.assertTrue(os.path.exists(p) and os.path.getsize(p) > 0)
+
+
 class EndToEndTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -296,6 +322,8 @@ class ParseArgsTests(unittest.TestCase):
         # the sizing the run uses is the engine's own default unless asked otherwise
         tpl = S.StrategyTemplate(name="x")
         self.assertEqual((a.cost_bps, a.risk_pct, a.max_leverage), (tpl.cost_bps, tpl.risk_pct, tpl.max_leverage))
+        self.assertEqual((a.vol_target, a.vol_target_n), (tpl.vol_target, tpl.vol_target_n))
+        self.assertEqual(a.vol_target, 0.0, "the vol target is opt-in")
 
     def test_bad_choices_are_rejected(self):
         for argv in (["--family", "nope"], ["--interval", "2h"], ["--metric", "sortino"], ["--sides", "up"]):
@@ -303,9 +331,15 @@ class ParseArgsTests(unittest.TestCase):
                 M.parse_args(argv)
 
     def test_sizing_and_sides_reach_the_templates(self):
-        cfg = _cfg(risk_pct=0.02, max_leverage=1.0, cost_bps=9.0)
+        cfg = _cfg(risk_pct=0.02, max_leverage=1.0, cost_bps=9.0, vol_target=0.12, vol_target_n=40)
         tpl = P._costed(generate_templates("quick", max_templates=1, sides=["long_only"])[0], cfg)
         self.assertEqual((tpl.risk_pct, tpl.max_leverage, tpl.cost_bps, tpl.sides), (0.02, 1.0, 9.0, "long_only"))
+        self.assertEqual((tpl.vol_target, tpl.vol_target_n), (0.12, 40))
+
+    def test_sizing_text_describes_the_rule_in_force(self):
+        self.assertIn("1.0% of equity", P.sizing_text(dict(risk_pct=0.01)))              # a pre-feature spec
+        self.assertIn("1.0% of equity", P.sizing_text(dict(risk_pct=0.01, vol_target=0.0)))
+        self.assertIn("15% annualized vol target", P.sizing_text(dict(risk_pct=0.01, vol_target=0.15, vol_target_n=60)))
 
     def test_the_two_entry_points_evaluate_with_the_same_settings(self):
         """Every evaluation setting of one CLI exists, with the same default, in

@@ -60,6 +60,12 @@ class PipelineTests(unittest.TestCase):
             tpl = StrategyTemplate(**slot["template"])
             tpl.validate()
             self.assertAlmostEqual(tpl.cost_bps, s["config"]["cost_bps"])
+            self.assertEqual(tpl.vol_target, s["config"]["vol_target"])
+            self.assertEqual(tpl.vol_target_n, s["config"]["vol_target_n"])
+            # a spec written before the vol target existed rehydrates with it off,
+            # which is exactly the rule that spec was researched with
+            old = {k: v for k, v in slot["template"].items() if not k.startswith("vol_target")}
+            self.assertEqual((StrategyTemplate(**old).vol_target, StrategyTemplate(**old).vol_target_n), (0.0, 60))
         self.assertAlmostEqual(sum(x["weight"] for x in s["slots"]), 1.0, places=6)
         for k in ("pbo_trials", "reality_check_p", "nested_sharpe", "dsr_best", "n_eff"):
             self.assertIn(k, s["diagnostics"])

@@ -33,7 +33,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from strategy import StrategyTemplate, backtest
+from strategy import StrategyTemplate, backtest, periods_per_year
 from walkforward import grid_combos, optimize_window, warmup_bars
 
 
@@ -223,15 +223,18 @@ def strategy_state(
     return state
 
 
-def _last_ready(ind: dict, n: int) -> bool:
-    return bool(ind["ready"][n - 1]) and ind["atr"][n - 1] > 0
+def _last_ready(tpl: StrategyTemplate, ind: dict, n: int) -> bool:
+    """The engine's `a_ok` on the last closed bar: indicators formed, ATR usable,
+    and the realized vol usable when the size targets it."""
+    ok = bool(ind["ready"][n - 1]) and ind["atr"][n - 1] > 0
+    return ok and (tpl.vol_target <= 0 or ind["rvol"][n - 1] > 0)
 
 
 def _filter_block(df: pd.DataFrame, tpl: StrategyTemplate, ind: dict) -> list:
     """Which entry filters are switched off for the next bar (and why)."""
     n = len(df)
     out = []
-    if not _last_ready(ind, n):
+    if not _last_ready(tpl, ind, n):
         out.append("indicators not fully formed on the last bar")
         return out
     if tpl.regime_filter != "none":
@@ -272,7 +275,7 @@ def _entry_orders(df, tpl: StrategyTemplate, ind: dict, pending, equity: float) 
     # checked BEFORE the resting order: on a bar whose indicators are unusable
     # the engine cancels a working pullback limit (`pend_active = False`), so
     # republishing it here would keep alive an order the backtest had pulled
-    if not _last_ready(ind, n):
+    if not _last_ready(tpl, ind, n):
         return []
     if pending is not None:
         side = pending["side"]
@@ -336,12 +339,19 @@ def _entry_orders(df, tpl: StrategyTemplate, ind: dict, pending, equity: float) 
 
 
 def _size(equity: float, tpl: StrategyTemplate, ind: dict, n: int, price: float) -> float:
-    """Shares the engine would buy: fixed fractional risk on the ATR stop,
-    capped by the leverage limit. Same formula as `strategy._bar_loop`."""
+    """Shares the engine would buy: fixed fractional risk on the ATR stop, or
+    the volatility-target notional when `vol_target` > 0, capped by the
+    leverage limit. Same formula as `strategy._bar_loop`."""
     a = float(ind["atr"][n - 1])
     if not (a > 0) or not (price > 0):
         return 0.0
-    qty = equity * tpl.risk_pct / (tpl.atr_mult_stop * a)
+    if tpl.vol_target > 0:
+        rv = float(ind["rvol"][n - 1])
+        if not (rv > 0):
+            return 0.0
+        qty = equity * (tpl.vol_target / np.sqrt(periods_per_year())) / rv / price
+    else:
+        qty = equity * tpl.risk_pct / (tpl.atr_mult_stop * a)
     return float(max(min(qty, tpl.max_leverage * equity / price), 0.0))
 
 

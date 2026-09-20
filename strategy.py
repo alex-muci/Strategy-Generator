@@ -88,9 +88,16 @@ Numeric params (walk-forward optimized, see generator.param_grid_for):
   atr_mult_trail, pullback_atr_mult, pullback_valid_bars, max_hold_bars,
   regime_n, regime_threshold, vol_lookback, vol_low_pct, vol_high_pct,
   bias_n, risk_pct, max_leverage, cost_bps.
+  vol_target, vol_target_n are sizing settings like risk_pct: set once per
+  run from the CLI, never tuned by the walk-forward.
 
 Execution model (no look-ahead):
   * every decision on bar i uses indicator values fully formed on bar i-1
+  * position size, fixed at entry and held to the exit: `risk_pct` of equity
+    lost at the `atr_mult_stop` ATR stop, or, when `vol_target` > 0, a
+    notional of equity x (vol_target / sqrt(bars per year)) / realized
+    per-bar vol (std of close-to-close returns over `vol_target_n` bars).
+    Either way capped at `max_leverage` x equity; the ATR stop is unchanged
   * stops/limits are filled intrabar at the level, or at the open if the
     open gapped through the level
   * costs: `cost_bps` (commission + slippage) charged per side on notional
@@ -584,6 +591,8 @@ class StrategyTemplate:
     bias_n: int = 200
     risk_pct: float = 0.01
     max_leverage: float = 2.0
+    vol_target: float = 0.0      # annualized vol the entry is sized to; 0 = risk_pct on the ATR stop
+    vol_target_n: int = 60       # bars of close-to-close returns in the realized-vol estimate
     cost_bps: float = 5.0        # per side, commission + slippage, in basis points of notional
 
     def with_params(self, **kwargs) -> "StrategyTemplate":
@@ -712,6 +721,12 @@ def _compute_indicators(df: pd.DataFrame, tpl: StrategyTemplate, dfkey=None) -> 
         use("vol_rank", _cached(df, ("vol_rank", tpl.atr_n, tpl.vol_lookback),
                                 lambda: _to_arr(atr(df, tpl.atr_n).rolling(tpl.vol_lookback).rank(pct=True)), dfkey))
 
+    if tpl.vol_target > 0:
+        # realized per-bar vol (NOT annualized, so the cached array does not
+        # depend on periods_per_year()); the target is scaled to per-bar in backtest()
+        use("rvol", _cached(df, ("rvol", tpl.vol_target_n),
+                            lambda: _to_arr(df["Close"].pct_change().rolling(tpl.vol_target_n).std()), dfkey))
+
     if tpl.bias_filter == "sma":
         use("bias", _cached(df, ("sma", tpl.bias_n), lambda: _to_arr(sma(df["Close"], tpl.bias_n)), dfkey))
 
@@ -731,13 +746,17 @@ REASONS = ["stop", "channel", "midline", "target", "time", "stop_same_bar"]
 
 def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
               upper_x, lower_x, mid_x, regime, vol_rank, bias,
-              direction, entry_style, exit_style, regime_mode, regime_thr,
+              direction, rvol, entry_style, exit_style, regime_mode, regime_thr,
               has_vol, vol_low, vol_high, has_bias, allow_long, allow_short,
               atr_mult_stop, atr_mult_target, atr_mult_trail, pullback_atr_mult,
-              pullback_valid_bars, max_hold_bars, risk_pct, max_leverage, cost_rate,
+              pullback_valid_bars, max_hold_bars, risk_pct, max_leverage, vol_target_bar, cost_rate,
               initial_equity, first_trade_bar):
     """The bar loop. Plain numpy code so numba can compile it unchanged;
     the pure-Python version is used when numba is not installed.
+
+    Sizing: `risk_pct` of cash lost at the ATR stop, or, when `vol_target_bar`
+    > 0, a notional of cash * vol_target_bar / rvol[i-1] (both per-bar vols);
+    capped at `max_leverage` either way and fixed for the life of the trade.
 
     Bars before `first_trade_bar` are indicator warm-up only: nothing is
     entered on them (and no order rests on them), so the walk-forward can
@@ -783,17 +802,19 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
         # direction in force for NEW signals on bar i (constant unless 'learned')
         is_trend = direction[i - 1] > 0.0
         # `a_ok`: every indicator this template uses is fully formed on bar i-1
-        # and the ATR is usable. New business (filters, orders, entries) needs
-        # that; an OPEN POSITION is managed on every bar regardless, otherwise a
-        # flat patch that drives the ATR to zero would suspend its stop just when
-        # the gap through it arrives. `last_a` is the most recent usable ATR and
-        # is always > 0 while a position is open (entering required a_ok).
-        a_ok = ready[i - 1] and atr_v[i - 1] > 0.0
-        if a_ok:
+        # and the ATR is usable (and the realized vol, when the size targets
+        # it). New business (filters, orders, entries) needs that; an OPEN
+        # POSITION is managed on every bar regardless, otherwise a flat patch
+        # that drives the ATR to zero would suspend its stop just when the gap
+        # through it arrives. `last_a` is the most recent usable ATR and is
+        # always > 0 while a position is open (entering required a_ok).
+        atr_ok = ready[i - 1] and atr_v[i - 1] > 0.0
+        if atr_ok:
             a = atr_v[i - 1]
             last_a = a
         else:
             a = last_a
+        a_ok = atr_ok and (vol_target_bar <= 0.0 or rvol[i - 1] > 0.0)
 
         # ---- manage open position: exits (checked intrabar on bar i) ----
         if position != 0:
@@ -969,7 +990,12 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
         entered = False
         if fill_side != 0:
             stop_dist = atr_mult_stop * a
-            qty = cash * risk_pct / stop_dist
+            if vol_target_bar > 0.0:
+                # constant-volatility notional: the stop still sits atr_mult_stop
+                # ATRs away, but the loss there is no longer risk_pct of equity
+                qty = cash * (vol_target_bar / rvol[i - 1]) / fill_px
+            else:
+                qty = cash * risk_pct / stop_dist
             qty = min(qty, max_leverage * cash / fill_px)
             if qty > 0:
                 entry_cost = cost_rate * qty * fill_px
@@ -1056,17 +1082,21 @@ def backtest(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: float = 10
 
     ind = _compute_indicators(df, tpl, _df_key(df, close))
     zeros = np.zeros(n)
+    # annualized target -> per-bar, read through periods_per_year() (never the
+    # constant) so a worker's set_periods_per_year is honoured and the cached
+    # realized-vol array stays frequency-agnostic
+    vol_target_bar = float(tpl.vol_target) / np.sqrt(periods_per_year()) if tpl.vol_target > 0 else 0.0
     out = _bar_loop_fast(
         open_, high, low, close, ind["ready"], ind["upper"], ind["lower"], ind["atr"],
         ind.get("upper_x", zeros), ind.get("lower_x", zeros), ind.get("mid_x", zeros),
         ind.get("regime", zeros), ind.get("vol_rank", zeros), ind.get("bias", zeros),
-        ind["direction"], ENTRY_CODES[tpl.entry_style], EXIT_CODES[tpl.exit_style],
+        ind["direction"], ind.get("rvol", zeros), ENTRY_CODES[tpl.entry_style], EXIT_CODES[tpl.exit_style],
         REGIME_CODES[tpl.regime_filter], float(ind.get("regime_threshold", 0.0)),
         bool(tpl.vol_filter), float(tpl.vol_low_pct), float(tpl.vol_high_pct), tpl.bias_filter == "sma",
         tpl.sides != "short_only", tpl.sides != "long_only",
         float(tpl.atr_mult_stop), float(tpl.atr_mult_target), float(tpl.atr_mult_trail), float(tpl.pullback_atr_mult),
         int(tpl.pullback_valid_bars), int(tpl.max_hold_bars), float(tpl.risk_pct), float(tpl.max_leverage),
-        tpl.cost_bps / 1e4, float(initial_equity), first_trade_bar,
+        float(vol_target_bar), tpl.cost_bps / 1e4, float(initial_equity), first_trade_bar,
     )
     (equity, entries, t_entry, t_exit, t_side, t_entry_px, t_exit_px, t_shares, t_pnl, t_cost,
      t_reason, n_trades, f_position, f_shares, f_entry_price, f_stop, f_target, f_trail,

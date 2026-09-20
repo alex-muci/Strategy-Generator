@@ -21,8 +21,8 @@ conda create -p ./env python=3.12 pandas scikit-learn scipy matplotlib yfinance 
 conda activate ./env
 # or, with pip:  pip install -r requirements.txt   (the versions the suite was last run against)
 
-python -m unittest discover -s tests -v      # 180 tests (engine, templates, hedge learner, walk-forward, robustness, selection, data, live signals, both entry points)
-# faster (about 2.5 min instead of 4.5): pip install -r requirements-dev.txt, then, with ./env active,
+python -m unittest discover -s tests -v      # 195 tests (engine, templates, hedge learner, walk-forward, robustness, selection, data, live signals, both entry points)
+# faster (about 1:35 min instead of 4.5): pip install -r requirements-dev.txt, then, with ./env active,
 python -m pytest -n auto --dist loadscope   # same tests in parallel; loadscope keeps a class (and its one-off setup) on one worker
 
 python main.py                                # synthetic data, 72 templates, ~1 min on 8 cores
@@ -37,6 +37,7 @@ python main.py --family default                     # ~770 templates, all switch
 python main.py --family online                      # ~290 templates on the online-learned channel (no lookback to fit)
 python main.py --real SPY --start 2005-01-01 --family default --jobs 8
 python main.py --real SPY --start 2005-01-01 --family quick --sides long_only   # one-sided family (an asset with a drift)
+python main.py --real SPY --start 2005-01-01 --family quick --vol-target 0.1  # use vol-target rather than ATR
 python main.py --real QQQ --start 2010-01-01 --train 500 --test 125   # rolling window (default): each window re-optimizes on the last 500 bars only
 python main.py --real GC=F --train 750 --test 250 --anchored --selection best   # anchored: training (window expands from bar 0)
 python main.py --trend-prob 0.8 --trend-drift 0.002  # synthetic data with a KNOWN trend edge
@@ -136,8 +137,9 @@ strategy.py     Indicators (ATR, Donchian, Keltner, Bollinger, the AdaHedge
                 online-learned channel and direction, Kaufman ER,
                 ADX, Ehlers CTI, Choppiness, variance ratio), the
                 StrategyTemplate switches, and a bar-by-bar backtest
-                engine (ATR position sizing, leverage cap, costs, next-bar
-                fills, same-bar stop, close-of-bar mark-to-market). The
+                engine (ATR-stop or volatility-target position sizing,
+                leverage cap, costs, next-bar fills, same-bar stop,
+                close-of-bar mark-to-market). The
                 bar loop is Numba-compiled (pure-Python fallback if numba
                 is missing) and indicator arrays are cached per slice.
 
@@ -207,6 +209,30 @@ re-optimized every walk-forward window from a small lattice grid
 (`generator.param_grid_for`), so "the strategy" in the final portfolio
 is the template plus a time-varying parameter set chosen only from
 information available up to that point.
+
+### Position sizing
+
+Size is decided once, at entry, and held to the exit. Two rules, chosen
+from the command line (never tuned by the walk-forward):
+
+* **ATR stop, fixed fractional** (default): shares such that the loss at
+  the `atr_mult_stop` ATR stop is `--risk-pct` of equity (1 %).
+* **Volatility target** (`--vol-target 0.15`): notional = equity x
+  (target / realized vol), where realized vol is the standard deviation
+  of close-to-close returns over `--vol-target-n` bars (60), both
+  annualized with the bar frequency. The ATR stop stays where it was, so
+  the loss at the stop is now `atr_mult_stop x ATR x shares` rather than
+  `risk_pct` of equity.
+
+Both are capped at `--max-leverage` x equity. Set the target near the
+asset's own volatility and the strategies trade at about 1x notional
+while in position, so `equity_curves.png` puts buy & hold on the same
+axis as the strategies (the ATR rule leaves them on different scales and
+the asset gets a secondary axis). Across assets the same target assigns
+the same risk to every slot, which is what the multi-asset dashboard
+wants. Two things keep a strategy's realized vol below the target: time
+spent flat, and the leverage cap, which binds all the time on a quiet
+asset (a 15 % target on a 5 % vol asset asks for 3x).
 
 ### The `hedge` channel: an online-learned alternative to fitted lookbacks
 
@@ -345,8 +371,9 @@ bootstrap p-value is 0, and the nested portfolio keeps a Sharpe near 1.
 
 This is a research framework, not a production trading system. The
 cost model is a flat bps charge, position sizing is fixed-fractional on
-an ATR stop, and the synthetic data is a toy regime-switching random
-walk. Results on synthetic data are a pipeline check. Real conclusions
+an ATR stop (or, with `--vol-target`, a constant-volatility notional
+fixed at entry and never rebalanced), and the synthetic data is a toy
+regime-switching random walk. Results on synthetic data are a pipeline check. Real conclusions
 need real data, realistic costs for the instrument, and -- as the
 Reality Check numbers make painfully clear -- a lot more history than
 a decade of daily bars for a family of hundreds of trials.

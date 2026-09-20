@@ -61,7 +61,7 @@ from live import (
 )
 from pipeline import (
     resolve_interval, load_real, eval_config, worker_pool, evaluate_slots,
-    family_diagnostics, build_portfolios, finalist_stats,
+    family_diagnostics, build_portfolios, finalist_stats, sizing_text,
 )
 from portfolio import returns_frame
 from strategy import (
@@ -110,6 +110,10 @@ def parse_args(argv=None):
     r.add_argument("--cost-bps", type=float, default=5.0, help="commission+slippage per side")
     r.add_argument("--risk-pct", type=float, default=0.01, help="equity risked per trade, per slot")
     r.add_argument("--max-leverage", type=float, default=2.0)
+    r.add_argument("--vol-target", type=float, default=0.0,
+                   help="annualized volatility each entry is sized to, per slot (e.g. 0.15); "
+                        "0 = risk --risk-pct on the ATR stop. The same target gives every asset the same risk")
+    r.add_argument("--vol-target-n", type=int, default=60, help="bars of close-to-close returns in the realized-vol estimate")
     r.add_argument("--min-sharpe", type=float, default=0.3)
     r.add_argument("--max-strategies", type=int, default=8)
     r.add_argument("--corr-ceiling", type=float, default=0.6)
@@ -642,7 +646,7 @@ def _write_research_report(spec, path):
          f"{d['n_trials']} parameter trials in total.\n",
          f"Walk-forward train={c['train_bars']} test={c['test_bars']} "
          f"{'anchored' if c['anchored'] else 'rolling'}, selection={c['selection']}, "
-         f"costs {c['cost_bps']} bps/side, {c['risk_pct']:.1%} equity risked per trade.\n\n",
+         f"costs {c['cost_bps']} bps/side, {sizing_text(c)}.\n\n",
          f"## Verdict: {v['level'].upper()}\n\n{v['headline']}\n\n"]
     for r in v["reasons"]:
         L.append(f"- {r}\n")

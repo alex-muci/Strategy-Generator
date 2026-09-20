@@ -167,6 +167,17 @@ class TemplateParamTests(unittest.TestCase):
                     self.assertEqual(grid["regime_threshold"],
                                      REGIME_INDICATORS[t.regime_indicator]["thresholds"])
 
+    def test_sizing_settings_are_never_searched(self):
+        """risk_pct, max_leverage, cost_bps and the vol target are run
+        settings: every template is generated with them off/default and no
+        grid ever varies them."""
+        for t in generate_templates("full"):
+            self.assertEqual((t.vol_target, t.vol_target_n), (0.0, 60), t.name)
+            for wide in (False, True):
+                grid = param_grid_for(t, wide=wide)
+                for k in ("vol_target", "vol_target_n", "risk_pct", "max_leverage", "cost_bps"):
+                    self.assertNotIn(k, grid, f"{t.name}: {k} is a run setting, not a searched parameter")
+
     def test_regime_defaults_come_from_the_indicator_registry(self):
         df = synthetic_ohlc(500, seed=1)
         for name, spec in REGIME_INDICATORS.items():

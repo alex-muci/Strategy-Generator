@@ -32,6 +32,7 @@ import numpy as np
 import pandas as pd
 
 from live import utcnow
+from pipeline import sizing_text
 
 # Palette: the data-viz reference instance, validated in both modes with
 # scripts/validate_palette.js (2 categorical slots, all checks PASS).
@@ -594,7 +595,7 @@ def _diagnostics_section(spec: dict) -> str:
            f'<b>{_e(c["family"])}</b>. Walk-forward train={c["train_bars"]} test='
            f'{c["test_bars"]} {"anchored" if c["anchored"] else "rolling"}, '
            f'{_e(c["selection"])} parameter selection, {_n(c["cost_bps"], 1)} bps/side costs, '
-           f'{_pct(c["risk_pct"], 1)} of slot equity risked per trade, '
+           f'{_e(sizing_text(c))} (per slot), '
            f'{_e(c["weighting"])} weights.')
     return f'<p class="ink2">{cfg}</p>' + _table(["measure", "value", "what it means"],
                                                  rows, left_cols=(0, 2))
@@ -690,7 +691,7 @@ def render_dashboard(spec, states, targets, trades, run, path=None,
     <h2>Orders to work on the next bar</h2>
     <p class="ink2">A breakout entry is a <b>stop</b> order (it fills as price runs through the
       level); fading a break is a <b>limit</b> order (it fills as price reaches it). Sizes come
-      from the engine's own fixed-fractional rule on the ATR stop.</p>
+      from the engine's own rule: {_e(sizing_text(spec["config"]))}.</p>
     {_orders_section(states)}
   </div>
 

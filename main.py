@@ -71,6 +71,10 @@ def parse_args(argv=None):
     p.add_argument("--cost-bps", type=float, default=5.0, help="commission+slippage per side, bps of notional")
     p.add_argument("--risk-pct", type=float, default=0.01, help="equity risked per trade")
     p.add_argument("--max-leverage", type=float, default=2.0)
+    p.add_argument("--vol-target", type=float, default=0.0,
+                   help="annualized volatility each entry is sized to (e.g. 0.15); 0 = risk --risk-pct on the ATR stop. "
+                        "Set it near the asset's own vol to put the strategies on the buy & hold scale")
+    p.add_argument("--vol-target-n", type=int, default=60, help="bars of close-to-close returns in the realized-vol estimate")
     p.add_argument("--min-sharpe", type=float, default=0.3)
     p.add_argument("--max-strategies", type=int, default=8)
     p.add_argument("--corr-ceiling", type=float, default=0.6)
@@ -258,22 +262,28 @@ def _report(df, results, port, nested, fam, finalists, bench, args):
         neq = nested["portfolio_equity"] / nested["portfolio_equity"].iloc[0]
         ax.plot(neq.index, neq.values, linewidth=3.0, color="red", linestyle="--", label="PORTFOLIO (nested walk-forward selection)")
     ax.set_title("Out-of-sample walk-forward equity: all templates (grey), selected, portfolios, buy & hold")
-    ax.set_ylabel("Strategies: growth of 1.0")
     ax.grid(alpha=0.3)
-    handles, labels = ax.get_legend_handles_labels()
-    # buy & hold is unlevered while the strategies risk 1%/trade, so its
-    # curve lives on a different scale: secondary axis
+    # With a vol target the strategies are sized to the asset's scale, so buy &
+    # hold shares their axis. Sized 1%/trade on the ATR stop they are on a
+    # different scale and the unlevered asset gets a secondary axis.
+    same_axis = args.vol_target > 0
     bh_eq = (1 + bench["returns"]).cumprod()
-    if len(bh_eq) > 1:
-        ax2 = ax.twinx()
-        ax2.plot(bh_eq.index, bh_eq.values, linewidth=1.8, color="#444444", linestyle=":",
-                 label=f"BUY & HOLD {args.real or 'the asset'} (Sharpe {bench['buy_hold']['sharpe']:.2f}; "
-                       "unlevered, right axis)")
-        ax2.set_ylabel(f"Buy & hold {args.real or 'the asset'}: growth of 1.0 (right axis)", color="#444444")
-        ax2.tick_params(axis="y", colors="#444444")
-        h2, l2 = ax2.get_legend_handles_labels()
-        handles, labels = handles + h2, labels + l2
-    ax.legend(handles, labels, fontsize=7, ncol=2, loc="upper left")
+    bh_label = (f"BUY & HOLD {args.real or 'the asset'} (Sharpe {bench['buy_hold']['sharpe']:.2f}; "
+                f"unlevered{'' if same_axis else ', right axis'})")
+    handles, labels = [], []
+    if len(bh_eq) > 1 and same_axis:
+        ax.plot(bh_eq.index, bh_eq.values, linewidth=1.8, color="#444444", linestyle=":", label=bh_label)
+        ax.set_ylabel(f"Growth of 1.0 (strategies sized to {args.vol_target:.0%} annualized vol)")
+    else:
+        ax.set_ylabel("Strategies: growth of 1.0")
+        if len(bh_eq) > 1:
+            ax2 = ax.twinx()
+            ax2.plot(bh_eq.index, bh_eq.values, linewidth=1.8, color="#444444", linestyle=":", label=bh_label)
+            ax2.set_ylabel(f"Buy & hold {args.real or 'the asset'}: growth of 1.0 (right axis)", color="#444444")
+            ax2.tick_params(axis="y", colors="#444444")
+            handles, labels = ax2.get_legend_handles_labels()
+    h1, l1 = ax.get_legend_handles_labels()
+    ax.legend(h1 + handles, l1 + labels, fontsize=7, ncol=2, loc="upper left")
     fig.tight_layout()
     fig.savefig(f"{out}/equity_curves.png", dpi=140)
     plt.close(fig)
@@ -428,8 +438,15 @@ def _report(df, results, port, nested, fam, finalists, bench, args):
     asset = args.real or "the synthetic series"
     L.append(f"\n## Benchmark: buy and hold {asset}\n\n")
     L.append("The asset was not optimized, selected or stress-tested, so it is the one curve with no "
-             "selection bias. Compare Sharpe: the templates risk 1 % of equity per trade, so their CAGR "
-             "and drawdown are on a smaller scale than an unlevered holding.\n\n")
+             "selection bias. ")
+    if args.vol_target > 0:
+        L.append(f"The templates size every entry to {args.vol_target:.0%} annualized volatility "
+                 f"(realized over {args.vol_target_n} bars, capped at {args.max_leverage:g}x), so their "
+                 "CAGR and drawdown are on a scale comparable to the unlevered holding; time spent flat "
+                 "and the leverage cap keep their realized vol below the target.\n\n")
+    else:
+        L.append(f"Compare Sharpe: the templates risk {args.risk_pct:.1%} of equity per trade, so their CAGR "
+                 "and drawdown are on a smaller scale than an unlevered holding.\n\n")
     L.append("| curve | period | Sharpe | CAGR | max DD | beta to B&H | corr | info ratio |\n")
     L.append("|---|---|---|---|---|---|---|---|\n")
     bh = b["buy_hold"]

@@ -29,6 +29,7 @@ from live import (  # noqa: E402
 )
 
 LOOKBACK = 450
+SWEEP_STRIDE = 137      # prime, so it does not alias with the generator's switch cycles
 
 
 def _fill_price_for(order, open_, level):
@@ -50,7 +51,21 @@ class LiveOrderTests(unittest.TestCase):
 
     def test_predicted_orders_match_what_the_engine_does(self):
         checked_entries = checked_exits = checked_blocks = 0
-        for tpl in generate_templates("full")[::23]:
+        # The sweep costs ~55 cold indicator builds per template, so the sample
+        # is sized by COUNT, not by a fixed stride: the universe grew 6x with the
+        # hedge channel and a stride of 23 turned this test into an hour's run.
+        full = generate_templates("full")
+        base = full[::SWEEP_STRIDE]
+        self.assertLess(len(base), 200, "the template universe grew: raise SWEEP_STRIDE")
+        # every fourth one again, sized to a vol target: exercises the
+        # realized-vol readiness gate and the sizing branch live.py restates.
+        # It runs right after its twin so the indicator cache is still warm.
+        sample = []
+        for k, tpl in enumerate(base):
+            sample.append(tpl)
+            if k % 4 == 0:
+                sample.append(tpl.with_params(vol_target=0.15))
+        for tpl in sample:
             for t in range(LOOKBACK + 20, len(self.df), 17):
                 w0 = t - LOOKBACK
                 tail, tail1 = self.df.iloc[w0:t], self.df.iloc[w0:t + 1]
@@ -196,8 +211,16 @@ class LiveOrderTests(unittest.TestCase):
     def test_sizing_matches_the_engine(self):
         """The share count on a predicted order must equal what the engine
         would actually buy at that level."""
-        tpl = StrategyTemplate("t", entry_style="stop", exit_style="target_stop",
-                               risk_pct=0.01, max_leverage=2.0)
+        self._check_sizing(StrategyTemplate("t", entry_style="stop", exit_style="target_stop",
+                                            risk_pct=0.01, max_leverage=2.0))
+
+    def test_sizing_matches_the_engine_with_a_vol_target(self):
+        """Same contract for the volatility-target rule: live.py's size must be
+        the engine's, not a restatement that has drifted."""
+        self._check_sizing(StrategyTemplate("t", entry_style="stop", exit_style="target_stop",
+                                            vol_target=0.15, vol_target_n=60, max_leverage=2.0))
+
+    def _check_sizing(self, tpl):
         hits = 0
         for t in range(LOOKBACK + 20, len(self.df), 2):
             st = strategy_state(self.df.iloc[:t], tpl, equity=100_000.0, lookback_bars=LOOKBACK)
@@ -213,6 +236,8 @@ class LiveOrderTests(unittest.TestCase):
             else:
                 shares = after["open_position"]["shares"]
             o = [o for o in st["entry_orders"] if o["side"] == side][0]
+            self.assertGreater(o["shares"], 0.0, f"bar {t}")
+            self.assertEqual(st["blocked_by"], [], f"bar {t}")
             # the engine sizes off the equity it holds at that moment, which has
             # drifted from the slot's starting equity; compare the ratio instead
             self.assertAlmostEqual(o["shares"] / shares, 100_000.0 / after["equity"].iloc[-2],

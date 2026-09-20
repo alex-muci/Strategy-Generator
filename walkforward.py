@@ -92,6 +92,9 @@ def warmup_bars(tpl) -> int:
             need.append(rn + 10)
     if tpl.vol_filter:
         need.append(tpl.vol_lookback + tpl.atr_n)
+    if tpl.vol_target > 0:
+        # pct_change eats one bar, then the rolling std needs a full window (exact once full)
+        need.append(tpl.vol_target_n + 1)
     if tpl.bias_filter == "sma":
         need.append(tpl.bias_n)
     return int(max(need)) + 5

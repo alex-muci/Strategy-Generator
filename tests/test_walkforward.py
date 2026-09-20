@@ -50,6 +50,23 @@ class WarmupGateTests(unittest.TestCase):
     def setUpClass(cls):
         cls.df = synthetic_ohlc(1500, seed=23)
 
+    def test_the_vol_target_lookback_is_in_the_warmup(self):
+        """A window sized to a vol target needs its realized vol formed on
+        its first bar, or its first trades are silently skipped."""
+        tpl = StrategyTemplate("t", vol_target=0.15, vol_target_n=300)
+        off = tpl.with_params(vol_target=0.0)
+        self.assertGreater(warmup_bars(tpl), 300)
+        self.assertGreater(warmup_bars(tpl), warmup_bars(off))
+        n, start = len(self.df), 700
+        win = window_backtest(self.df, tpl, start, n)
+        full = backtest(self.df, tpl, first_trade_bar=start)
+        np.testing.assert_allclose(win["equity"].to_numpy(), full["equity"].to_numpy()[start:], rtol=1e-9)
+        self.assertEqual(len(win["trades"]), len(full["trades"]))
+        self.assertGreater(len(win["trades"]), 0)
+        # teeth: the ATR rule's warm-up is not enough for this template
+        short = window_backtest(self.df, tpl, start, n, warmup=warmup_bars(off))
+        self.assertFalse(np.allclose(short["equity"].to_numpy(), win["equity"].to_numpy()))
+
     def test_first_trade_bar_gates_entries_and_equity(self):
         tpl = StrategyTemplate("t")
         k = 400
@@ -236,7 +253,8 @@ class ExposureTests(unittest.TestCase):
         df = self.df
         close = df["Close"].to_numpy()
         for tpl in (StrategyTemplate("t"), StrategyTemplate("ct", direction_logic="countertrend", exit_style="time_stop"),
-                    StrategyTemplate("L", sides="long_only", exit_style="target_stop")):
+                    StrategyTemplate("L", sides="long_only", exit_style="target_stop"),
+                    StrategyTemplate("v", vol_target=0.15)):
             res = backtest(df, tpl)
             notional = position_notional(res, close)
             self.assertEqual(len(notional), len(df))
@@ -255,7 +273,7 @@ class ExposureTests(unittest.TestCase):
             tot = exposure_totals(res, close)
             self.assertEqual(tot["held_bars"], expected)
             self.assertGreaterEqual(tot["gross"], abs(tot["net"]))
-            # 1% risk on a 3-ATR stop, 2x leverage cap: notional / equity stays under the cap
+            # 1% risk on a 3-ATR stop (or a vol target), 2x leverage cap: notional / equity stays under the cap
             eq = res["equity"].to_numpy()
             self.assertLessEqual(float(np.max(np.abs(notional) / eq)), tpl.max_leverage + 1e-9)
 

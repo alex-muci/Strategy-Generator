@@ -141,7 +141,9 @@ class EngineTests(unittest.TestCase):
         fast = S._bar_loop_fast
         try:
             S._bar_loop_fast = S._bar_loop      # plain Python
-            for tpl in generate_templates("full")[::211]:
+            sample = generate_templates("full")[::211]
+            sample += [t.with_params(vol_target=0.15) for t in generate_templates("full")[::503]]
+            for tpl in sample:
                 slow = backtest(self.df, tpl)
                 S._bar_loop_fast = fast
                 quick = backtest(self.df, tpl)
@@ -161,6 +163,165 @@ class EngineTests(unittest.TestCase):
         # CTI of a perfect straight line is +1
         line = pd.Series(np.arange(100, dtype=float))
         self.assertAlmostEqual(cti(line, 20).iloc[-1], 1.0, places=9)
+
+
+class VolTargetSizingTests(unittest.TestCase):
+    """`vol_target` > 0 sizes an entry to a constant annualized volatility
+    instead of risk_pct on the ATR stop. Off, nothing may change."""
+
+    K = 100        # first_trade_bar: past every warm-up used below
+
+    @classmethod
+    def setUpClass(cls):
+        cls.df = synthetic_ohlc(1200, seed=3)
+        cls.close = cls.df["Close"]
+
+    def setUp(self):
+        import strategy as S
+        self._ppy = S.periods_per_year()
+
+    def tearDown(self):
+        import strategy as S
+        S.set_periods_per_year(self._ppy)
+
+    @staticmethod
+    def _rvol(df, n):
+        return df["Close"].pct_change().rolling(n).std()
+
+    def _flat_entries(self, res):
+        """(bar, trade) for every trade opened from a flat book, so the cash
+        the engine sized on is the previous bar's equity."""
+        exits = {t["exit_date"] for t in res["trades"]}
+        out = []
+        for t in res["trades"]:
+            i = self.df.index.get_loc(t["entry_date"])
+            if self.df.index[i] not in exits or t["exit_date"] == t["entry_date"]:
+                out.append((i, t))
+        return out
+
+    def test_off_is_byte_identical_and_the_lookback_is_inert(self):
+        tpl = StrategyTemplate("t")
+        a = backtest(self.df, tpl)
+        b = backtest(self.df, tpl.with_params(vol_target=0.0, vol_target_n=17))
+        np.testing.assert_array_equal(a["equity"].values, b["equity"].values)
+        self.assertNotIn("rvol", a["indicators"])
+        self.assertNotIn("rvol", b["indicators"])
+
+    def test_entry_notional_is_the_target_over_the_realized_vol(self):
+        import strategy as S
+        tpl = StrategyTemplate("t", vol_target=0.15, vol_target_n=60, cost_bps=0.0, max_leverage=1e9)
+        res = backtest(self.df, tpl, first_trade_bar=self.K)
+        rv = self._rvol(self.df, 60)
+        eq = res["equity"]
+        checked = 0
+        for i, t in self._flat_entries(res):
+            notional = t["shares"] * t["entry_price"] / eq.iloc[i - 1]
+            self.assertAlmostEqual(notional, (0.15 / np.sqrt(S.periods_per_year())) / rv.iloc[i - 1],
+                                   places=8, msg=str(t["entry_date"]))
+            checked += 1
+        self.assertGreater(checked, 5)
+
+    def test_a_target_equal_to_the_realized_vol_gives_unit_notional(self):
+        """The whole point: at the asset's own vol the strategy holds ~1x, the
+        buy-and-hold scale."""
+        import strategy as S
+        base = StrategyTemplate("t", vol_target=0.15, vol_target_n=60, cost_bps=0.0, max_leverage=1e9)
+        first = backtest(self.df, base, first_trade_bar=self.K)
+        i0, t0 = self._flat_entries(first)[0]
+        rv = self._rvol(self.df, 60)
+        tuned = base.with_params(vol_target=float(rv.iloc[i0 - 1] * np.sqrt(S.periods_per_year())))
+        res = backtest(self.df, tuned, first_trade_bar=self.K)
+        np.testing.assert_array_equal(res["entries"], first["entries"])
+        t = [tr for tr in res["trades"] if tr["entry_date"] == t0["entry_date"]][0]
+        self.assertAlmostEqual(t["shares"] * t["entry_price"] / res["equity"].iloc[i0 - 1], 1.0, places=8)
+
+    def test_when_you_trade_does_not_depend_on_how_much(self):
+        base = StrategyTemplate("t", cost_bps=0.0, max_leverage=1e9)
+        a = backtest(self.df, base, first_trade_bar=self.K)
+        b = backtest(self.df, base.with_params(vol_target=0.15), first_trade_bar=self.K)
+        np.testing.assert_array_equal(a["entries"], b["entries"])
+        self.assertEqual([t["entry_date"] for t in a["trades"]], [t["entry_date"] for t in b["trades"]])
+        self.assertEqual([t["exit_date"] for t in a["trades"]], [t["exit_date"] for t in b["trades"]])
+        self.assertGreater(len(a["trades"]), 5)
+
+    def test_the_leverage_cap_still_binds(self):
+        tpl = StrategyTemplate("t", vol_target=3.0, max_leverage=2.0, cost_bps=0.0)
+        res = backtest(self.df, tpl, first_trade_bar=self.K)
+        # the cap is on the notional AT ENTRY: the size is then fixed, so a
+        # losing position drifts above it mark-to-market (under either rule)
+        lev = [t["shares"] * t["entry_price"] / res["equity"].iloc[i - 1] for i, t in self._flat_entries(res)]
+        self.assertLessEqual(max(lev), 2.0 + 1e-9)
+        self.assertGreater(sum(abs(x - 2.0) < 1e-6 for x in lev), 5)
+
+    def test_the_stop_is_still_atr_mult_stop_away(self):
+        tpl = StrategyTemplate("t", exit_style="target_stop", vol_target=0.15, cost_bps=0.0)
+        res = backtest(self.df, tpl, first_trade_bar=self.K)
+        atr_v = res["indicators"]["atr"]
+        checked = 0
+        for t in res["trades"]:
+            if t["reason"] != "stop":
+                continue
+            i = self.df.index.get_loc(t["entry_date"])
+            j = self.df.index.get_loc(t["exit_date"])
+            # the stop was set off the ATR on the bar before entry, filled at the
+            # level or at the open if it gapped through
+            level = t["entry_price"] - t["side"] * tpl.atr_mult_stop * atr_v[i - 1]
+            open_j = float(self.df["Open"].iloc[j])
+            expected = min(open_j, level) if t["side"] == 1 else max(open_j, level)
+            self.assertAlmostEqual(t["exit_price"], expected, places=8)
+            checked += 1
+        self.assertGreater(checked, 3)
+
+    def test_no_entry_until_the_realized_vol_is_formed(self):
+        tpl = StrategyTemplate("t", vol_target=0.15, vol_target_n=300)
+        res = backtest(self.df, tpl)
+        ready = res["indicators"]["ready"]
+        # pct_change eats bar 0, so the 300-return window is first full ON bar
+        # 300; bar 301 is the first that can decide off it
+        self.assertEqual(int(ready[:300].sum()), 0)
+        self.assertTrue(ready[300])
+        self.assertEqual(int(res["entries"][:301].sum()), 0)
+        self.assertGreater(int(res["entries"][301:].sum()), 0)
+        base_ready = backtest(self.df, tpl.with_params(vol_target=0.0))["indicators"]["ready"]
+        np.testing.assert_array_equal(ready, base_ready & ~np.isnan(res["indicators"]["rvol"]))
+
+    def test_a_zero_realized_vol_starts_nothing_new(self):
+        """Twenty identical closes make the realized vol exactly zero: the
+        engine must not divide by it (and must not size to infinity), so no
+        new business starts until a return shows up again -- the same rule the
+        ATR already follows. The ATR rule keeps trading on the same bars."""
+        rng = np.random.default_rng(5)
+        pre = _ohlc_from_close(100 * np.cumprod(1 + rng.normal(0, 0.01, 200)), rng)
+        L = 1.02 * float(pre["High"].max())              # a break into a dead-flat patch
+        flat = pd.DataFrame({"Open": L, "High": L * 1.001, "Low": L * 0.999, "Close": L, "Volume": 1},
+                            index=pd.bdate_range(pre.index[-1] + pd.Timedelta(days=1), periods=120))
+        df = pd.concat([pre, flat])
+        vol = StrategyTemplate("v", exit_style="time_stop", max_hold_bars=10, vol_target=0.15, vol_target_n=20)
+        base = vol.with_params(vol_target=0.0)
+        rv, rb = backtest(df, vol), backtest(df, base)
+        rvol = rv["indicators"]["rvol"]
+        dead = np.where(rvol == 0.0)[0]                   # bars whose 20 returns are all zero
+        dead = dead[dead + 1 < len(df)]                   # the last bar has no next bar to decide on
+        self.assertGreater(len(dead), 40)
+        self.assertTrue(rv["indicators"]["ready"][dead].all(), "the block is a_ok, not the warm-up")
+        self.assertTrue((rv["indicators"]["atr"][dead] > 0).all(), "the wicks keep the ATR alive")
+        # the bars that DECIDE off a dead vol are the ones after it
+        self.assertEqual(int(rv["entries"][dead + 1].sum()), 0)
+        self.assertGreater(int(rb["entries"][dead + 1].sum()), 0)
+        # ... and the vol-target template did trade while the vol was alive
+        self.assertGreater(int(rv["entries"][:dead[0] + 1].sum()), 0)
+
+    def test_the_target_is_read_at_the_bar_frequency_in_force(self):
+        """The cached realized vol is per-bar; the annualized target is scaled
+        by periods_per_year() at call time, so a worker's setting is honoured."""
+        import strategy as S
+        tpl = StrategyTemplate("t", vol_target=0.15, cost_bps=0.0, max_leverage=1e9)
+        S.set_periods_per_year(252)
+        daily = backtest(self.df, tpl, first_trade_bar=self.K)
+        S.set_periods_per_year(252 * 7)
+        hourly = backtest(self.df, tpl, first_trade_bar=self.K)
+        np.testing.assert_array_equal(daily["entries"], hourly["entries"])
+        self.assertAlmostEqual(daily["trades"][0]["shares"] / hourly["trades"][0]["shares"], np.sqrt(7.0), places=6)
 
 
 class HedgeChannelTests(unittest.TestCase):

@@ -70,8 +70,18 @@ def eval_config(args, interval: str) -> dict:
         train_bars=args.train, test_bars=args.test, anchored=args.anchored,
         metric=args.metric, selection=args.selection, wide_grid=args.wide_grid,
         cost_bps=args.cost_bps, risk_pct=args.risk_pct, max_leverage=args.max_leverage,
+        vol_target=args.vol_target, vol_target_n=args.vol_target_n,
         cpcv_groups=args.cpcv_groups, cpcv_k=args.cpcv_k,
     )
+
+
+def sizing_text(c: dict) -> str:
+    """One phrase describing the sizing rule of a research config (old specs
+    have no vol_target keys: they were run with the ATR-stop rule)."""
+    vt = float(c.get("vol_target", 0.0) or 0.0)
+    if vt > 0:
+        return f"{vt:.0%} annualized vol target per entry ({c.get('vol_target_n', 60)}-bar realized vol)"
+    return f"{c['risk_pct']:.1%} of equity risked per trade"
 
 
 # --------------------------------------------------------------------------
@@ -90,7 +100,8 @@ def init_worker(data: dict, cfg: dict) -> None:
 
 
 def _costed(tpl, c: dict):
-    return tpl.with_params(cost_bps=c["cost_bps"], risk_pct=c["risk_pct"], max_leverage=c["max_leverage"])
+    return tpl.with_params(cost_bps=c["cost_bps"], risk_pct=c["risk_pct"], max_leverage=c["max_leverage"],
+                           vol_target=c["vol_target"], vol_target_n=c["vol_target_n"])
 
 
 def _wfa_kwargs(c: dict) -> dict:
@@ -253,7 +264,8 @@ def against_benchmark(r: pd.Series, bh: pd.Series) -> dict:
     """Beta, correlation and information ratio of a return stream against
     buy-and-hold over the stream's own dates. The IR (annualized Sharpe of the
     residual after removing beta x benchmark) is scale-free, so it compares
-    a strategy risking 1 % per trade with an unlevered holding."""
+    a strategy sized on its own rule (1 % per trade, or a vol target) with an
+    unlevered holding."""
     x = bh.reindex(r.index).fillna(0.0).to_numpy()
     y = r.to_numpy()
     if len(y) < 3 or x.std(ddof=1) == 0 or y.std(ddof=1) == 0:
@@ -268,8 +280,9 @@ def benchmark_stats(bh_returns: pd.Series, rets: pd.DataFrame, port: dict, neste
 
     Every template here was walked forward, selected and stress-tested; the
     asset itself was not, so it is the one curve with no selection bias at
-    all. Sharpe is the number to compare (the templates risk 1 % of equity
-    per trade, so their CAGR is on a different scale); beta says how much of a
+    all. Sharpe is the number to compare (the templates are sized on their
+    own rule, 1 % of equity per trade unless a vol target is set, so their
+    CAGR can be on a different scale); beta says how much of a
     portfolio is just the asset's own drift, and the information ratio how
     much is left once that is removed."""
     bh = bh_returns.reindex(rets.index).fillna(0.0)
