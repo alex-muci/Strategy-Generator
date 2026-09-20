@@ -16,7 +16,8 @@ import pandas as pd
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from futures_map import (  # noqa: E402
-    CONTRACTS, hedge_ratio, target_contracts, fut_level, to_contracts, translate_orders,
+    CONTRACTS, LISTINGS, FX_SYMBOLS, hedge_ratio, target_contracts, fut_level, to_contracts,
+    translate_orders, parse_quotes,
 )
 
 
@@ -170,6 +171,117 @@ class BookTests(unittest.TestCase):
             self.assertGreater(c.multiplier, 0)
             self.assertGreater(c.tick, 0)
             self.assertLess(c.notional_range[0], c.notional_range[1])
+            if c.currency != "USD":
+                self.assertIn(c.currency, FX_SYMBOLS, f"{etf}: no FX symbol for {c.currency}")
+            if c.yahoo is None:
+                # nothing to estimate against unless a proxy series is named:
+                # the contract must say what ratio to start from
+                self.assertIsNotNone(c.default_ratio, f"{etf}: no price feed and no default ratio")
+                self.assertIn("futures_quotes.json", c.note)
+        for etf, l in LISTINGS.items():
+            self.assertIn(l.currency, FX_SYMBOLS)
+            self.assertEqual(len(l.session_close), 2)
+        # the euro ETFs the table maps are listings the loader knows to restate
+        for etf, c in CONTRACTS.items():
+            if etf.endswith((".DE", ".MI")):
+                self.assertIn(etf, LISTINGS)
+
+    def test_the_new_markets_are_mapped(self):
+        want = {"FEZ": "FSXE", "EXHD.DE": "FGBL", "IITB.MI": "FBTP", "VIXY": "VXM",
+                "CORN": "MZC", "WEAT": "MZW", "SOYB": "MZS", "CANE": "SB", "PPLT": "PL", "PALL": "PA"}
+        for etf, root in want.items():
+            self.assertEqual(CONTRACTS[etf].root, root)
+        for etf in ("FEZ", "EXHD.DE", "IITB.MI"):
+            self.assertEqual(CONTRACTS[etf].currency, "EUR")
+        self.assertEqual(CONTRACTS["VIXY"].default_ratio, 1.0)
+
+
+class QuotesTests(unittest.TestCase):
+    def test_bare_prices_and_objects_both_parse(self):
+        q = parse_quotes({"FGBL": 129.55, "FBTP": {"price": 118.2, "hedge_ratio": 0.85}})
+        self.assertEqual(q["FGBL"], dict(price=129.55, hedge_ratio=None))
+        self.assertEqual(q["FBTP"], dict(price=118.2, hedge_ratio=0.85))
+        self.assertEqual(parse_quotes({}), {})
+        self.assertEqual(parse_quotes(None), {})
+
+    def test_a_bad_entry_is_an_error_not_a_zero(self):
+        for bad in ({"FGBL": "abc"}, {"FGBL": -1}, {"FGBL": {"hedge_ratio": 0.9}},
+                    {"FGBL": {"price": 129.0, "hedge_ratio": 0}}):
+            with self.assertRaises(ValueError):
+                parse_quotes(bad)
+
+
+class EuroAndProxyTests(unittest.TestCase):
+    """Contracts quoted in euros, priced by hand, or hedged against a proxy series."""
+
+    def setUp(self):
+        px, r = _walk()
+        self.px, self.r = px, r
+        self.etf = {"EXHD.DE": _frame(px), "FEZ": _frame(px), "VIXY": _frame(px)}
+        self.fx = {"EUR": 1.10}
+
+    def test_a_euro_contract_is_valued_in_dollars(self):
+        fut = {"FEZ": _frame(self.px / self.px[-1] * 5000.0)}          # one FSXE = EUR 5,000
+        out = to_contracts(_book(FEZ=27_500), self.etf, fut, fx=self.fx)
+        b = out["book"]
+        self.assertEqual(b.loc["FEZ", "currency"], "EUR")
+        self.assertAlmostEqual(b.loc["FEZ", "contract_value"], 5500.0)
+        self.assertAlmostEqual(b.loc["FEZ", "raw"], 5.0)
+        self.assertEqual(b.loc["FEZ", "target"], 5)
+        self.assertEqual(b.loc["FEZ", "price_source"], "^STOXX50E")
+
+    def test_without_the_rate_the_contract_is_left_out(self):
+        fut = {"FEZ": _frame(self.px / self.px[-1] * 5000.0)}
+        out = to_contracts(_book(FEZ=27_500), self.etf, fut)
+        self.assertNotIn("FEZ", out["book"].index)
+        self.assertTrue(any("EUR/USD rate" in n for n in out["notes"]))
+
+    def test_the_sanity_band_is_in_dollars(self):
+        fut = {"FEZ": _frame(self.px / self.px[-1] * 50.0)}            # EUR 50 a contract: not an index
+        out = to_contracts(_book(FEZ=27_500), self.etf, fut, fx=self.fx)
+        self.assertNotIn("FEZ", out["book"].index)
+        self.assertTrue(any("mis-scaled" in n and "EUR" in n for n in out["notes"]))
+
+    def test_a_hand_kept_price_and_the_default_ratio(self):
+        quotes = parse_quotes({"FGBL": 130.0})
+        out = to_contracts(_book(**{"EXHD.DE": 143_000 * 2 / 0.9}), self.etf, {}, fx=self.fx, quotes=quotes)
+        b = out["book"]
+        self.assertAlmostEqual(b.loc["EXHD.DE", "contract_value"], 130.0 * 1000 * 1.10)
+        self.assertEqual(b.loc["EXHD.DE", "price_source"], "futures_quotes.json")
+        self.assertEqual(b.loc["EXHD.DE", "hedge_ratio"], CONTRACTS["EXHD.DE"].default_ratio)
+        self.assertEqual(b.loc["EXHD.DE", "ratio_source"], "default")
+        self.assertAlmostEqual(b.loc["EXHD.DE", "raw"], 2.0)
+        self.assertTrue(any("default 0.9" in n for n in out["notes"]))
+
+    def test_no_feed_and_no_quote_says_what_to_do(self):
+        out = to_contracts(_book(**{"EXHD.DE": 100_000}), self.etf, {}, fx=self.fx)
+        self.assertTrue(out["book"].empty)
+        self.assertTrue(any("futures_quotes.json" in n and "FGBL" in n for n in out["notes"]))
+
+    def test_a_quoted_ratio_overrides_the_estimate(self):
+        quotes = parse_quotes({"FGBL": {"price": 130.0, "hedge_ratio": 0.75}})
+        series = {"EXHD.DE": _frame(100 * np.cumprod(1 + 2 * self.r))}   # would estimate 0.5
+        out = to_contracts(_book(**{"EXHD.DE": 100_000}), self.etf, {}, fx=self.fx,
+                           quotes=quotes, series=series)
+        self.assertEqual(out["book"].loc["EXHD.DE", "hedge_ratio"], 0.75)
+        self.assertEqual(out["book"].loc["EXHD.DE", "ratio_source"], "futures_quotes.json")
+
+    def test_the_ratio_comes_from_the_proxy_series_when_given(self):
+        quotes = parse_quotes({"FGBL": 130.0})
+        series = {"EXHD.DE": _frame(100 * np.cumprod(1 + 2 * self.r))}
+        out = to_contracts(_book(**{"EXHD.DE": 100_000}), self.etf, {}, fx=self.fx,
+                           quotes=quotes, series=series)
+        b = out["book"]
+        self.assertAlmostEqual(b.loc["EXHD.DE", "hedge_ratio"], 0.5, delta=0.02)
+        self.assertEqual(b.loc["EXHD.DE", "ratio_source"], "^SPEUBDP")
+
+    def test_a_short_proxy_falls_back_to_the_contract_default(self):
+        fut = {"VIXY": _frame(self.px[-20:] / self.px[-1] * 18.0)}       # 20 bars of the front month
+        out = to_contracts(_book(VIXY=3_600), self.etf, fut)
+        b = out["book"]
+        self.assertEqual(b.loc["VIXY", "hedge_ratio"], 1.0)
+        self.assertEqual(b.loc["VIXY", "target"], 2)
+        self.assertTrue(any("using 1" in n for n in out["notes"]))
 
 
 if __name__ == "__main__":

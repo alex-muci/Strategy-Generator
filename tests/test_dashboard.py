@@ -266,6 +266,39 @@ class FuturesBookTests(unittest.TestCase):
         with open(os.path.join(self.dir, "live_state.json")) as f:
             self.assertIn("last_futures_targets", json.load(f))
 
+    def test_a_hand_priced_euro_contract_goes_through_the_quotes_file(self):
+        # the same spec on a Bund ETF and VIXY: FGBL has no feed even live, so
+        # its price must come from futures_quotes.json and its ratio from the
+        # contract default; VXM has a (synthetic) feed
+        d = self._copy()
+        for name in ("portfolio.json", "live_state.json"):
+            path = os.path.join(d, name)
+            if os.path.exists(path):
+                txt = open(path, encoding="utf-8").read().replace('"SPY', '"EXHD.DE').replace('"IEF', '"VIXY')
+                open(path, "w", encoding="utf-8").write(txt)
+        out = ED.main(SIGNALS + [d, "--futures", "--max-gross", "100"])
+        fut = out["run"]["futures"]
+        self.assertTrue(any("FGBL" in n and "futures_quotes.json" in n for n in fut["notes"]))
+        self.assertNotIn("EXHD.DE", fut["book"].index)
+        with open(os.path.join(d, "futures_quotes.json"), "w") as f:
+            json.dump({"FGBL": 130.0}, f)
+        out = ED.main(SIGNALS + [d, "--futures", "--max-gross", "100", "--no-refit"])
+        fut = out["run"]["futures"]
+        b = fut["book"]
+        if "EXHD.DE" in b.index:
+            self.assertEqual(b.loc["EXHD.DE", "price_source"], "futures_quotes.json")
+            self.assertEqual(b.loc["EXHD.DE", "currency"], "EUR")
+            self.assertEqual(b.loc["EXHD.DE", "hedge_ratio"], 0.9)
+            self.assertAlmostEqual(b.loc["EXHD.DE", "contract_value"], 130_000.0)   # synthetic FX is 1
+        if "VIXY" in b.index:
+            self.assertEqual(b.loc["VIXY", "root"], "VXM")
+        self.assertFalse(any("stale" in n for n in fut["notes"]))
+        os.utime(os.path.join(d, "futures_quotes.json"), (0, 0))
+        fut = ED.main(SIGNALS + [d, "--futures", "--max-gross", "100", "--no-refit"])["run"]["futures"]
+        self.assertTrue(any("days old" in n for n in fut["notes"]))
+        html = open(os.path.join(d, "dashboard.html"), encoding="utf-8").read()
+        self.assertIn("futures_quotes.json", html)
+
     def test_without_the_flag_the_page_has_no_futures_section(self):
         d = self._copy()
         out = ED.main(SIGNALS + [d, "--no-refit"])

@@ -133,18 +133,55 @@ The signals stay on ETFs and the orders go to micro (or small) futures:
 
 ```bash
 python etf_dashboard.py research \
-    --assets SPY QQQ IWM IEF TLT GLD SLV USO UNG FXE FXY FXB FXA --start 2007-05-01 \
+    --assets SPY QQQ IWM FEZ IEF TLT EXHD.DE IITB.MI VIXY GLD SLV PPLT USO UNG \
+             CORN WEAT SOYB CANE FXE FXY FXB FXA --start 2012-06-01 \
     --family online --vol-target 0.15 --max-leverage 6 --portfolio-vol 0.15 \
-    --sides-map SPY=long_only QQQ=long_only IWM=long_only --max-strategies 10
+    --sides-map SPY=long_only QQQ=long_only IWM=long_only FEZ=long_only --max-strategies 10
+echo '{"FGBL": 129.55, "FBTP": 118.20}' > state/futures_quotes.json   # keep current
 python etf_dashboard.py signals --account-equity 200000 --max-gross 5 --futures
 ```
 
-- **Why ETFs for the signals.** Long dividend-adjusted histories that all close
-  with the New York cash session (one forming-bar rule, one shared bar index),
-  and for USO or UNG the *rolled* return a futures trader earns. Yahoo's `=F`
-  series are unadjusted splices with a gap at every roll; `futures_map.py` uses
-  them only as the price that turns dollars into contracts. Every asset added to
-  `--assets` shortens the shared history to its own, so a young ETF costs years.
+The universe (`futures_map.CONTRACTS`), one Yahoo ETF with a long history per
+market and the contract that expresses it:
+
+| market | ETF (since) | contract | priced off |
+|---|---|---|---|
+| S&P 500, Nasdaq-100, Russell 2000, Dow | SPY, QQQ, IWM, DIA | MES, MNQ, M2K, MYM | `=F` |
+| EURO STOXX 50 | FEZ (2002) | FSXE micro, EUR 1 x index (Eurex) | `^STOXX50E` cash index |
+| US Treasuries 2y, 5y, 10y, bond | SHY, IEI, IEF, TLT | ZT, ZF, ZN, ZB | `=F` |
+| German Bund | EXHD.DE (2003, EUR) | FGBL, EUR 100k (Eurex) | `futures_quotes.json` |
+| Italian BTP | IITB.MI (2012, EUR) | FBTP, EUR 100k (Eurex) | `futures_quotes.json` |
+| VIX | VIXY (2011) | VXM mini, $100 x VIX (Cboe) | `^VFTW1`, the front month's end-of-day TWAP |
+| gold, silver, copper | GLD, SLV, CPER | MGC, SIL, MHG | `=F` |
+| platinum, palladium | PPLT, PALL (2010) | PL (50 oz), PA (100 oz) | `=F` |
+| WTI crude, natural gas | USO, UNG | MCL, MNG | `=F` |
+| corn, wheat, soybeans | CORN (2010), WEAT, SOYB (2011) | MZC, MZW, MZS micro, 500 bu (CBOT) | `ZC=F`, `ZW=F`, `ZS=F` |
+| sugar | CANE (2011) | SB, 112,000 lb (ICE) | `SB=F` |
+| EUR, GBP, AUD, CAD, JPY | FXE, FXB, FXA, FXC, FXY | M6E, M6B, M6A, MCD, MJY | `=F` |
+
+- **Why ETFs for the signals.** Long dividend-adjusted histories (one shared
+  bar index), and for the ETFs that hold futures themselves -- USO, UNG, VIXY,
+  the Teucrium grains, CANE -- the *rolled* return a futures trader earns: the
+  roll schedule, the contango, all of it is in the price you fit on. Yahoo's
+  `=F` series are unadjusted splices with a gap at every roll; `futures_map.py`
+  uses them only as the price that turns dollars into contracts. Every asset
+  added to `--assets` shortens the shared history to its own, so a young ETF
+  costs years (IITB.MI starts in 2012, the Teucrium funds in 2010-11).
+- **Euro listings.** There is no dollar ETF for the Bund or the BTP, so those
+  come from Xetra and Milan (`futures_map.LISTINGS`: currency and closing
+  time). They are loaded in euros and restated in dollars at *today's* rate --
+  the returns stay the local ones the future pays, the notional is in dollars,
+  which is what a hedged share class shows. A euro future is hedged the same
+  way: its P&L accrues in euros and only the variation margin is exposed. FEZ
+  is the unhedged dollar ETF, so its signal carries EUR/USD on top of the index
+  (the vol ratio absorbs part of that); `EXW1.DE` is the euro alternative.
+- **Contracts Yahoo has no series for** (Eurex FGBL, FBTP) take their price from
+  `state/futures_quotes.json`, which you keep current: `{"FGBL": 129.55}` or
+  `{"FGBL": {"price": 129.55, "hedge_ratio": 0.85}}`. A file older than three
+  days is flagged on the page. Without a price the contract is left out and the
+  note says so. The Bund's hedge ratio is estimated against S&P's rolled
+  Euro-Bund futures index (`^SPEUBDP`) when Yahoo serves it, the BTP's starts
+  from a duration guess (`default_ratio`); both can be pinned in the file.
 - **`--sides-map`** sets the sides per asset. Whether a market drifts is a fact
   about the market, decided before the run; the others keep `--sides`.
 - **`--portfolio-vol`** is the book's volatility target. `--vol-target` gives
@@ -167,10 +204,18 @@ python etf_dashboard.py signals --account-equity 200000 --max-gross 5 --futures
   small risk, so a futures book needs it well above 1.
 - Judge a contract by the dollars it moves in a year, not by its notional: a
   10-year note future is $105k of notional and about the risk of one micro S&P.
-  The contract table is in `futures_map.CONTRACTS`. **Check multipliers and ticks
-  against the exchange before trading**; a quote that would make a contract worth
-  an implausible amount is refused rather than sized on.
-- The research traded the ETF in the cash session. A futures stop that fills
+  There is no micro Bund or BTP: at EUR 100k face (~$150k) a $200k account's
+  bond legs round to zero or one contract, and the page's rounding line shows
+  it. **Check multipliers and ticks against the exchange before trading**; a
+  quote that would make a contract worth an implausible amount is refused
+  rather than sized on.
+- VIXY is a rolled long position in the first two VIX futures, so its dollars
+  map about one-to-one onto futures notional (`default_ratio` 1). It is priced
+  off `^VFTW1`, Cboe's end-of-day TWAP of the front month -- the price the
+  contract trades at, not spot VIX, which is far more volatile than any future.
+  The Teucrium grains hold the 2nd, 3rd and a deferred contract, never the
+  front; the vol ratio against the front-month splice absorbs most of that.
+- The research traded the ETF in its cash session. A futures stop that fills
   overnight is a fill the backtest never had; a price-conditional order on the
   ETF is the faithful implementation.
 
@@ -224,7 +269,8 @@ live.py         The live layer: current position and stop levels read out of
                 forming bar, and per-asset target positions / trade list.
 etf_dashboard.py  `research` (multi-asset pipeline -> portfolio.json + verdict)
                 and `signals` (apply it -> dashboard.html + CSVs).
-futures_map.py  ETF -> futures contract table, volatility hedge ratio, whole-
+futures_map.py  ETF -> futures contract table (US, Eurex, Cboe, ICE), euro
+                listings, hand-kept quotes, volatility hedge ratio, whole-
                 contract rounding with a no-trade buffer, levels on the future.
 dashboard_html.py  Renders that into one self-contained HTML page: no CDN,
                 no font file, inline SVG charts, light and dark.

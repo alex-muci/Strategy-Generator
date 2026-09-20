@@ -554,16 +554,24 @@ def _futures_section(fut: dict) -> str:
             f'<span class="num">{int(r["target"]):+d}</span>',
             f'<span class="num">{"–" if act == "hold" else int(r["order_contracts"])}</span>',
             f'<span class="num">{_n(r["raw"])}</span>',
-            f'<span class="num">{_n(r["fut_price"], 4)}</span>',
-            f'<span class="num">{_n(r["hedge_ratio"])}</span>',
+            f'<span class="num">{_n(r["fut_price"], 4)}'
+            + ("" if r["currency"] == "USD" else f' <span class="muted">{_e(r["currency"])}</span>')
+            + f'</span><br><span class="muted">{_e(r["price_source"])}</span>',
+            f'<span class="num">{_n(r["hedge_ratio"])}</span>'
+            + ("" if r["ratio_source"] in (None, "") else f'<br><span class="muted">{_e(r["ratio_source"])}</span>'),
             f'<span class="num">{_money(r["fut_notional"])}</span>',
         ])
+    fx = {k: v for k, v in (fut.get("fx") or {}).items() if k != "USD"}
+    fx_txt = ("" if not fx else " Euro contracts are valued at "
+              + ", ".join(f"{k}/USD {v:.4f}" for k, v in sorted(fx.items())) + ".")
     head = (f'<p class="ink2">The ETF book above in whole contracts. "Wanted" is the unrounded '
             f'count: ETF notional &times; hedge ratio (ETF vol over futures vol) &divide; contract '
             f'value. A held count is kept while the target stays within 0.6 of a contract of it. '
             f'Rounding leaves <b>{_money(fut["rounding_error"])}</b> '
             f'({_pct(fut["rounding_error_pct"])} of the ETF book) untracked. "Held" comes from '
-            f'<b>{_e(fut["holdings_source"])}</b>.</p>')
+            f'<b>{_e(fut["holdings_source"])}</b>.{_e(fx_txt)} Under each price and ratio is where it '
+            f'came from: a Yahoo symbol, futures_quotes.json (yours to keep current) or the '
+            f'contract\'s default.</p>')
     book = _table(["contract", "action", "held", "target", "order", "wanted", "price", "hedge ratio",
                    "notional"], rows, left_cols=(0, 1), empty="flat – no contract to hold")
     lv = []
