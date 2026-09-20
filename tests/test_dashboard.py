@@ -173,6 +173,106 @@ class PipelineTests(unittest.TestCase):
             shutil.rmtree(d, ignore_errors=True)
 
 
+class FuturesBookTests(unittest.TestCase):
+    """Per-asset sides, the portfolio vol scale and the futures restatement,
+    on synthetic series named after ETFs that have a contract."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.dir = tempfile.mkdtemp(prefix="etfdash-fut-")
+        research = [a for a in RESEARCH if a not in ("AAA", "BBB")]
+        i = research.index("--assets") + 1
+        research[i:i] = ["SPY", "IEF"]
+        cls.research = research
+        cls.spec = ED.main(research + [cls.dir, "--vol-target", "0.15", "--max-leverage", "6",
+                                       "--portfolio-vol", "0.15", "--sides-map", "SPY=long_only",
+                                       "--max-strategies", "6", "--corr-ceiling", "1.0"])
+        cls.out = ED.main(SIGNALS + [cls.dir, "--futures", "--max-gross", "10"])
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.dir, ignore_errors=True)
+
+    def _copy(self) -> str:
+        """The state dir, copied: a second signals run rewrites the page and the
+        live state the other tests read."""
+        d = tempfile.mkdtemp(prefix="etfdash-fut-copy-")
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        shutil.copytree(self.dir, d, dirs_exist_ok=True)
+        return d
+
+    def test_the_sides_map_reaches_its_asset_only(self):
+        by_asset = {}
+        for row in self.spec["universe"]:
+            by_asset.setdefault(row["asset"], []).append(row["slot"])
+        self.assertTrue(all(s.endswith("-L") for s in by_asset["SPY"]))
+        self.assertFalse(any(s.endswith(("-L", "-S")) for s in by_asset["IEF"]))
+        self.assertEqual(len(by_asset["SPY"]), len(by_asset["IEF"]))
+        for slot in self.spec["slots"]:
+            self.assertEqual(slot["template"]["sides"], "long_only" if slot["asset"] == "SPY" else "both")
+        self.assertEqual(self.spec["config"]["sides_map"], {"SPY": ["long_only"]})
+
+    def test_a_bad_sides_map_is_an_error(self):
+        for bad in ("QQQ=long_only", "SPY=sideways"):
+            with self.assertRaises(SystemExit):
+                ED.main(self.research + [self.dir, "--sides-map", bad])
+
+    def test_the_risk_scale_takes_the_nested_curve_to_the_target(self):
+        vol, scale = self.spec["diagnostics"]["nested_vol"], self.spec["risk_scale"]
+        self.assertGreater(vol, 0)
+        lo, hi = ED.RISK_SCALE_BOUNDS
+        self.assertAlmostEqual(scale, float(np.clip(0.15 / vol, lo, hi)), places=9)
+        self.assertEqual(self.out["run"]["risk_scale"], scale)
+
+    def test_empty_selection_windows_do_not_dilute_the_volatility(self):
+        idx = pd.bdate_range("2020-01-01", periods=200)
+        r = pd.Series(np.where(np.arange(200) % 2, 0.01, -0.01), index=idx)
+        r.iloc[:100] = 0.0
+        nested = dict(portfolio_returns=r, selections=[
+            dict(period_start=idx[0], selected=[]), dict(period_start=idx[100], selected=["x"])])
+        scale, vol = ED._risk_scale(nested, 0.0)
+        self.assertEqual(scale, 1.0)
+        self.assertAlmostEqual(vol, float(r.iloc[100:].std() * np.sqrt(252)), places=9)
+
+    def test_sizes_are_linear_in_the_risk_scale(self):
+        d = self._copy()
+        one = ED.main(SIGNALS + [d, "--risk-scale", "1", "--max-gross", "100", "--no-refit"])
+        two = ED.main(SIGNALS + [d, "--risk-scale", "2", "--max-gross", "100", "--no-refit"])
+        for a, b in zip(one["states"], two["states"]):
+            self.assertAlmostEqual(b["shares"], 2 * a["shares"], places=6)
+            self.assertAlmostEqual(b["equity_slot"], 2 * a["equity_slot"], places=6)
+
+    def test_a_spec_without_a_risk_scale_is_sized_unscaled(self):
+        d = tempfile.mkdtemp(prefix="etfdash-noscale-")
+        try:
+            spec = {k: v for k, v in self.spec.items() if k != "risk_scale"}
+            with open(os.path.join(d, "portfolio.json"), "w") as f:
+                json.dump(spec, f, default=str)
+            self.assertEqual(ED.main(SIGNALS + [d])["run"]["risk_scale"], 1.0)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_the_futures_book_is_written_and_shown(self):
+        fut = self.out["run"]["futures"]
+        for name in ("futures_orders.csv", "futures_levels.csv"):
+            self.assertTrue(os.path.exists(os.path.join(self.dir, name)), f"{name} missing")
+        html = open(os.path.join(self.dir, "dashboard.html"), encoding="utf-8").read()
+        self.assertIn("Futures orders", html)
+        self.assertTrue(set(fut["book"]["root"]) <= {"MES", "ZN"})
+        for a, r in fut["book"].iterrows():
+            want = self.out["targets"]["by_asset"]["notional"].get(a, 0.0) * r["hedge_ratio"] / r["contract_value"]
+            self.assertAlmostEqual(r["raw"], want, places=6)
+            self.assertLessEqual(abs(r["target"] - r["raw"]), 0.5 + 1e-9)
+        with open(os.path.join(self.dir, "live_state.json")) as f:
+            self.assertIn("last_futures_targets", json.load(f))
+
+    def test_without_the_flag_the_page_has_no_futures_section(self):
+        d = self._copy()
+        out = ED.main(SIGNALS + [d, "--no-refit"])
+        self.assertIsNone(out["run"]["futures"])
+        self.assertNotIn("Futures orders", open(os.path.join(d, "dashboard.html"), encoding="utf-8").read())
+
+
 class VerdictTests(unittest.TestCase):
     BASE = dict(nested_sharpe=1.2, nested_max_drawdown=-0.1, pbo_trials=0.1,
                 reality_check_p=0.01, dsr_best=0.99, n_eff=5, n_slots=40,

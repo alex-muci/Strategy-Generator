@@ -33,11 +33,11 @@ python main.py                                # synthetic data, 72 templates, ~1
 ```bash
 python main.py --help
 python main.py --family quick                       # 72 templates (Donchian, ER filter)
-python main.py --family default                     # ~770 templates, all switches sampled
-python main.py --family online                      # ~290 templates on the online-learned channel (no lookback to fit)
+python main.py --family default                     # 778 templates, all switches sampled
+python main.py --family online                      # 288 templates on the online-learned channel (no lookback to fit)
 python main.py --real SPY --start 2005-01-01 --family default --jobs 8
 python main.py --real SPY --start 2005-01-01 --family quick --sides long_only   # one-sided family (an asset with a drift)
-python main.py --real SPY --start 2005-01-01 --family quick --vol-target 0.1  # use vol-target rather than ATR
+python main.py --real SPY --start 2005-01-01 --family quick --vol-target 0.1  # use vol-target rather than ATR-stop (see Position sizing section section)
 python main.py --real QQQ --start 2010-01-01 --train 500 --test 125   # rolling window (default): each window re-optimizes on the last 500 bars only
 python main.py --real GC=F --train 750 --test 250 --anchored --selection best   # anchored: training (window expands from bar 0)
 python main.py --trend-prob 0.8 --trend-drift 0.002  # synthetic data with a KNOWN trend edge
@@ -127,6 +127,53 @@ dashboard published, at the price that order type implies.
 
 Nothing in this repository places an order. It tells you what to place.
 
+### Trading it with futures
+
+The signals stay on ETFs and the orders go to micro (or small) futures:
+
+```bash
+python etf_dashboard.py research \
+    --assets SPY QQQ IWM IEF TLT GLD SLV USO UNG FXE FXY FXB FXA --start 2007-05-01 \
+    --family online --vol-target 0.15 --max-leverage 6 --portfolio-vol 0.15 \
+    --sides-map SPY=long_only QQQ=long_only IWM=long_only --max-strategies 10
+python etf_dashboard.py signals --account-equity 200000 --max-gross 5 --futures
+```
+
+- **Why ETFs for the signals.** Long dividend-adjusted histories that all close
+  with the New York cash session (one forming-bar rule, one shared bar index),
+  and for USO or UNG the *rolled* return a futures trader earns. Yahoo's `=F`
+  series are unadjusted splices with a gap at every roll; `futures_map.py` uses
+  them only as the price that turns dollars into contracts. Every asset added to
+  `--assets` shortens the shared history to its own, so a young ETF costs years.
+- **`--sides-map`** sets the sides per asset. Whether a market drifts is a fact
+  about the market, decided before the run; the others keep `--sides`.
+- **`--portfolio-vol`** is the book's volatility target. `--vol-target` gives
+  every *slot* the same risk while it is in a trade, but slots are flat much of
+  the time and diversify each other, so the book runs far below it. Research
+  measures the realized volatility of the nested walk-forward curve and stores
+  `risk_scale = target / realized` in `portfolio.json`; the signals phase sizes
+  every slot on `account equity x risk_scale`. That is exact as long as
+  `--max-leverage` does not bind, which is why it is raised here, and drawdowns
+  scale with it. It is frozen by research, never re-estimated in the morning.
+- **`--futures`** restates the book in whole contracts: ETF notional x hedge
+  ratio / contract value, rounded to nearest. The hedge ratio is ETF volatility
+  over futures volatility (120 bars, tails winsorized so a roll gap does not move
+  it): 1 for SPY and MES, about 1.5 for TLT and the T-bond future. A held count
+  is kept while the target stays within 0.6 of a contract, so a target drifting
+  around 2.5 does not trade every morning. Stops and entry levels are restated
+  as futures prices, and the page reports what the rounding left untracked. Put
+  your real positions in `state/holdings_futures.json` (`{"MES": 2, "ZN": -1}`).
+  `--max-gross` is a notional cap: FX and rates legs are large notionals with
+  small risk, so a futures book needs it well above 1.
+- Judge a contract by the dollars it moves in a year, not by its notional: a
+  10-year note future is $105k of notional and about the risk of one micro S&P.
+  The contract table is in `futures_map.CONTRACTS`. **Check multipliers and ticks
+  against the exchange before trading**; a quote that would make a contract worth
+  an implausible amount is refused rather than sized on.
+- The research traded the ETF in the cash session. A futures stop that fills
+  overnight is a fill the backtest never had; a price-conditional order on the
+  ETF is the faithful implementation.
+
 ## Architecture
 
 ```
@@ -177,6 +224,8 @@ live.py         The live layer: current position and stop levels read out of
                 forming bar, and per-asset target positions / trade list.
 etf_dashboard.py  `research` (multi-asset pipeline -> portfolio.json + verdict)
                 and `signals` (apply it -> dashboard.html + CSVs).
+futures_map.py  ETF -> futures contract table, volatility hedge ratio, whole-
+                contract rounding with a no-trade buffer, levels on the future.
 dashboard_html.py  Renders that into one self-contained HTML page: no CDN,
                 no font file, inline SVG charts, light and dark.
 

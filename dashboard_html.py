@@ -541,6 +541,55 @@ def _trades_section(trades: pd.DataFrame, run: dict) -> str:
                          rows, left_cols=(0, 1), empty="the book already matches the target")
 
 
+def _futures_section(fut: dict) -> str:
+    """The same book in whole contracts, and every working level on the future."""
+    rows = []
+    for asset, r in fut["book"].iterrows():
+        act = str(r["action"])
+        rows.append([
+            f'<b>{_e(r["root"])}</b> <span class="muted">{_e(asset)} &middot; {_e(r["exchange"])}</span>',
+            ('<span class="tag hold">HOLD</span>' if act == "hold"
+             else _side_tag(1 if act == "BUY" else -1)),
+            f'<span class="num">{int(r["held"]):+d}</span>',
+            f'<span class="num">{int(r["target"]):+d}</span>',
+            f'<span class="num">{"–" if act == "hold" else int(r["order_contracts"])}</span>',
+            f'<span class="num">{_n(r["raw"])}</span>',
+            f'<span class="num">{_n(r["fut_price"], 4)}</span>',
+            f'<span class="num">{_n(r["hedge_ratio"])}</span>',
+            f'<span class="num">{_money(r["fut_notional"])}</span>',
+        ])
+    head = (f'<p class="ink2">The ETF book above in whole contracts. "Wanted" is the unrounded '
+            f'count: ETF notional &times; hedge ratio (ETF vol over futures vol) &divide; contract '
+            f'value. A held count is kept while the target stays within 0.6 of a contract of it. '
+            f'Rounding leaves <b>{_money(fut["rounding_error"])}</b> '
+            f'({_pct(fut["rounding_error_pct"])} of the ETF book) untracked. "Held" comes from '
+            f'<b>{_e(fut["holdings_source"])}</b>.</p>')
+    book = _table(["contract", "action", "held", "target", "order", "wanted", "price", "hedge ratio",
+                   "notional"], rows, left_cols=(0, 1), empty="flat – no contract to hold")
+    lv = []
+    for r in fut["orders"].itertuples():
+        level = "at the open" if r.fut_level is None or pd.isna(r.fut_level) else _n(r.fut_level, 4)
+        if r.fut_limit is not None and not pd.isna(r.fut_limit):
+            level += f" → {_n(r.fut_limit, 4)}"
+        lv.append([
+            f'<b>{_e(r.root)}</b> <span class="muted">{_e(r.slot)}</span>',
+            _e(r.what), _side_tag(r.side),
+            f'<span class="mono">{_e(str(r.kind).replace("_", " "))}</span>',
+            f'<span class="num">{level}</span>',
+            f'<span class="num">{"–" if r.etf_level is None or pd.isna(r.etf_level) else _n(r.etf_level)}</span>',
+            f'<span class="num">{r.contracts} <span class="muted">({_n(r.contracts_raw)})</span></span>',
+        ])
+    levels = _table(["contract", "", "side", "order type", "futures level", "ETF level", "contracts"],
+                    lv, left_cols=(0, 1, 2, 3), empty="no level to work")
+    note = ('<p class="muted" style="margin-top:10px">Futures levels are the ETF level\'s percentage '
+            'distance, divided by the hedge ratio, from the last futures price. The research traded '
+            'the ETF in the cash session: a level that the future crosses overnight is a fill the '
+            'backtest never had. A price-conditional order on the ETF is the faithful version.</p>')
+    return (f'<div class="card"><h2>Futures orders</h2>{head}{book}'
+            f'<details open><summary>{len(lv)} working level(s) on the futures</summary>{levels}{note}'
+            f'</details></div>')
+
+
 def _slots_section(states: list) -> str:
     rows = []
     for st in states:
@@ -642,8 +691,12 @@ def render_dashboard(spec, states, targets, trades, run, path=None,
         stale = (f' <span class="neg">⚠ the newest closed bar is {age.days} days old '
                  f'– check the data feed</span>')
 
+    scale = float(run.get("risk_scale", 1.0))
+    fut = run.get("futures")
     tiles = [
-        ("account equity", _money(run["account_equity"]), "what the book is sized on"),
+        ("account equity", _money(run["account_equity"]),
+         "what the book is sized on" if scale == 1 else
+         f"slots sized on {_money(run['account_equity'] * scale)} (risk scale {_n(scale)})"),
         ("gross exposure", _pct(targets["gross_exposure"]),
          (f'scaled to {_n(targets["scale_applied"])} for the '
           f'{_pct(run["max_gross"])} cap' if targets["scale_applied"] < 1
@@ -686,6 +739,8 @@ def render_dashboard(spec, states, targets, trades, run, path=None,
     <h2>Trades to send</h2>
     {_trades_section(trades, run)}
   </div>
+
+  {_futures_section(fut) if fut else ""}
 
   <div class="card">
     <h2>Orders to work on the next bar</h2>
