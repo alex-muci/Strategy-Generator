@@ -266,11 +266,84 @@ class FuturesBookTests(unittest.TestCase):
         with open(os.path.join(self.dir, "live_state.json")) as f:
             self.assertIn("last_futures_targets", json.load(f))
 
+    def test_a_hand_priced_euro_contract_goes_through_the_quotes_file(self):
+        # the same spec on a Bund ETF and VIXY: FGBL has no feed even live, so
+        # its price must come from futures_quotes.json and its ratio from the
+        # contract default; VXM has a (synthetic) feed
+        d = self._copy()
+        for name in ("portfolio.json", "live_state.json"):
+            path = os.path.join(d, name)
+            if os.path.exists(path):
+                txt = open(path, encoding="utf-8").read().replace('"SPY', '"EXHD.DE').replace('"IEF', '"VIXY')
+                open(path, "w", encoding="utf-8").write(txt)
+        out = ED.main(SIGNALS + [d, "--futures", "--max-gross", "100"])
+        fut = out["run"]["futures"]
+        self.assertTrue(any("FGBL" in n and "futures_quotes.json" in n for n in fut["notes"]))
+        self.assertNotIn("EXHD.DE", fut["book"].index)
+        with open(os.path.join(d, "futures_quotes.json"), "w") as f:
+            json.dump({"FGBL": 130.0}, f)
+        out = ED.main(SIGNALS + [d, "--futures", "--max-gross", "100", "--no-refit"])
+        fut = out["run"]["futures"]
+        b = fut["book"]
+        if "EXHD.DE" in b.index:
+            self.assertEqual(b.loc["EXHD.DE", "price_source"], "futures_quotes.json")
+            self.assertEqual(b.loc["EXHD.DE", "currency"], "EUR")
+            self.assertEqual(b.loc["EXHD.DE", "hedge_ratio"], 0.9)
+            self.assertAlmostEqual(b.loc["EXHD.DE", "contract_value"], 130_000.0)   # synthetic FX is 1
+        if "VIXY" in b.index:
+            self.assertEqual(b.loc["VIXY", "root"], "VXM")
+        self.assertFalse(any("stale" in n for n in fut["notes"]))
+        os.utime(os.path.join(d, "futures_quotes.json"), (0, 0))
+        fut = ED.main(SIGNALS + [d, "--futures", "--max-gross", "100", "--no-refit"])["run"]["futures"]
+        self.assertTrue(any("days old" in n for n in fut["notes"]))
+        html = open(os.path.join(d, "dashboard.html"), encoding="utf-8").read()
+        self.assertIn("futures_quotes.json", html)
+
     def test_without_the_flag_the_page_has_no_futures_section(self):
         d = self._copy()
         out = ED.main(SIGNALS + [d, "--no-refit"])
         self.assertIsNone(out["run"]["futures"])
         self.assertNotIn("Futures orders", open(os.path.join(d, "dashboard.html"), encoding="utf-8").read())
+
+
+class FxRateTests(unittest.TestCase):
+    """The euro rate comes through the same loader as every other series, and
+    that loader refuses a history shorter than 200 bars."""
+
+    def setUp(self):
+        self.orig = ED.load_real
+        ED._FX_CACHE.clear()
+        self.seen = []
+
+        def fake(ticker, start, interval="1d", now=None, session_close=None):
+            self.seen.append(dict(ticker=ticker, start=start, interval=interval))
+            idx = pd.bdate_range(start, ED.utcnow().normalize())
+            if len(idx) < 200:   # what data.load_yfinance(min_bars=200) does
+                raise ValueError(f"{ticker!r}: only {len(idx)} usable bars, need at least 200")
+            return pd.DataFrame({c: np.linspace(1.05, 1.10, len(idx)) for c in ("Open", "High", "Low", "Close")},
+                                index=idx)
+
+        ED.load_real = fake
+
+    def tearDown(self):
+        ED.load_real = self.orig
+        ED._FX_CACHE.clear()
+
+    def test_the_rate_window_clears_the_loaders_floor(self):
+        rate = ED.fx_rate("EUR")
+        self.assertAlmostEqual(rate, 1.10)
+        self.assertEqual(self.seen[0]["ticker"], "EURUSD=X")
+
+    def test_the_rate_is_fetched_once_per_run(self):
+        ED.fx_rate("EUR")
+        ED.fx_rate("EUR")
+        self.assertEqual(len(self.seen), 1)
+        self.assertEqual(ED.fx_rate("USD"), 1.0)
+        self.assertEqual(len(self.seen), 1)
+
+    def test_an_unmapped_currency_is_an_error(self):
+        with self.assertRaises(ValueError):
+            ED.fx_rate("BRL")
 
 
 class VerdictTests(unittest.TestCase):

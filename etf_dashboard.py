@@ -42,6 +42,13 @@ Outputs land in `--state-dir` (default ./state):
                         contracts and every working level as a futures price
                         (futures_map.py); held contracts come from
                         holdings_futures.json, {"MES": 2, "ZN": -1}
+    futures_quotes.json YOU maintain this too, only for contracts Yahoo has no
+                        series for (the Eurex Bund and BTP): {"FGBL": 129.55,
+                        "FBTP": {"price": 118.2, "hedge_ratio": 0.85}}
+
+ETFs listed in euros (EXHD.DE, IITB.MI) are loaded in euros and restated in
+dollars at today's rate: the returns are the local ones the future pays, the
+notional is in dollars. See futures_map.LISTINGS.
 
 Nothing here places an order. It tells you what to place.
 """
@@ -72,7 +79,10 @@ from strategy import (
     StrategyTemplate, annualized_sharpe, max_drawdown, set_periods_per_year, periods_per_year,
     periods_per_year_for_interval, SIDES, BARS_PER_YEAR,
 )
-from futures_map import CONTRACTS, HEDGE_RATIO_BARS, to_contracts, translate_orders
+from futures_map import (
+    CONTRACTS, LISTINGS, FX_SYMBOLS, HEDGE_RATIO_BARS, QUOTES_STALE_DAYS,
+    to_contracts, translate_orders, parse_quotes,
+)
 from dashboard_html import render_dashboard
 
 SPEC_VERSION = 2
@@ -174,13 +184,22 @@ def load_assets(assets, *, interval, start, synthetic, bars, now=None, quiet=Fal
     """
     raw = {}
     for i, a in enumerate(assets):
+        listing = LISTINGS.get(a)
         if synthetic:
             # a different seed per asset, so the assets are not the same series
             raw[a] = synthetic_ohlc(n_bars=bars, seed=100 + 7 * i, trend_prob=0.45 + 0.05 * i)
         else:
-            raw[a] = load_real(a, start=start, interval=interval, now=now)
+            raw[a] = load_real(a, start=start, interval=interval, now=now,
+                               session_close=None if listing is None else listing.session_close)
         if not quiet:
             print(f"  {a}: {len(raw[a])} bars, {raw[a].index[0].date()} to {raw[a].index[-1].date()}")
+        if listing is not None and not synthetic and listing.currency != "USD":
+            # a euro ETF in today's dollars: local returns, dollar notional (what
+            # a hedged share class shows; the future's P&L accrues in euros too)
+            rate = fx_rate(listing.currency, interval=interval, now=now)
+            raw[a] = raw[a].assign(**{c: raw[a][c] * rate for c in ("Open", "High", "Low", "Close")})
+            if not quiet:
+                print(f"  {a}: {listing.currency} listing restated in USD at {rate:.4f}")
 
     common = None
     for a in assets:
@@ -191,6 +210,27 @@ def load_assets(assets, *, interval, start, synthetic, bars, now=None, quiet=Fal
     if not quiet and any(dropped.values()):
         print(f"  aligned on {len(common)} shared bars (dropped {dropped})")
     return {a: raw[a].loc[common] for a in assets}
+
+
+_FX_CACHE: dict = {}
+
+
+def fx_rate(currency: str, *, interval: str = "1d", now=None) -> float:
+    """Dollars per one unit of `currency`, from the last closed bar of the
+    Yahoo cross; fetched once per run. A currency without a symbol, or with no
+    data, is an error: sizing a euro book on a guessed rate is a silent 10%."""
+    if currency == "USD":
+        return 1.0
+    if currency not in _FX_CACHE:
+        sym = FX_SYMBOLS.get(currency)
+        if sym is None:
+            raise ValueError(f"no Yahoo symbol for {currency}/USD; add it to futures_map.FX_SYMBOLS")
+        # only the last close is used, but load_yfinance refuses fewer than
+        # 200 bars: ask for the window the futures prices use, not a rate-sized one
+        df = load_real(sym, start=_start_for_bars(HEDGE_RATIO_BARS + 100, interval),
+                       interval=interval, now=now)
+        _FX_CACHE[currency] = float(df["Close"].iloc[-1])
+    return _FX_CACHE[currency]
 
 
 def _history_bars_needed(spec: dict) -> int:
@@ -614,23 +654,40 @@ def signals(args) -> dict:
 
 def _futures_book(args, spec, data, states, targets, live, interval, now) -> dict:
     """The ETF book restated in whole contracts, against the contracts held."""
-    fut, notes = {}, []
+    fut, series, fx, notes = {}, {}, {}, []
+    quotes, quote_notes = _load_futures_quotes(args.state_dir)
+    notes.extend(quote_notes)
+    since = _start_for_bars(HEDGE_RATIO_BARS + 100, interval)
     for a in spec["assets"]:
         c = CONTRACTS.get(a)
         if c is None:
             continue
         if args.synthetic:
             # no feed: the ETF stands in for its own future, rescaled to a
-            # price at which one contract is worth a plausible amount
-            lo, hi = c.notional_range
-            k = np.sqrt(lo * hi) / c.value(data[a]["Close"].iloc[-1] * c.yahoo_scale)
-            fut[a] = data[a][["Open", "High", "Low", "Close"]] * k
+            # price at which one contract is worth a plausible amount. A
+            # contract Yahoo has no series for takes the same path as live:
+            # its price comes from futures_quotes.json or it is left out.
+            fx.setdefault(c.currency, 1.0)
+            if c.yahoo is not None:
+                lo, hi = c.notional_range
+                k = np.sqrt(lo * hi) / c.value(data[a]["Close"].iloc[-1] * c.yahoo_scale)
+                fut[a] = data[a][["Open", "High", "Low", "Close"]] * k
             continue
-        try:
-            fut[a] = load_real(c.yahoo, start=_start_for_bars(HEDGE_RATIO_BARS + 100, interval),
-                               interval=interval, now=now)
-        except ValueError as e:
-            notes.append(f"{a}: {e}")
+        if c.currency != "USD":
+            try:
+                fx[c.currency] = fx_rate(c.currency, interval=interval, now=now)
+            except ValueError as e:
+                notes.append(f"{a}: {e}")
+        if c.yahoo is not None:
+            try:
+                fut[a] = load_real(c.yahoo, start=since, interval=interval, now=now)
+            except ValueError as e:
+                notes.append(f"{a}: {e}")
+        if c.series is not None and c.series != c.yahoo:
+            try:
+                series[a] = load_real(c.series, start=since, interval=interval, now=now)
+            except ValueError as e:
+                notes.append(f"{a}: hedge-ratio series {c.series}: {e}")
     p = os.path.join(args.state_dir, "holdings_futures.json")
     given = os.path.exists(p)
     if given:
@@ -638,12 +695,29 @@ def _futures_book(args, spec, data, states, targets, live, interval, now) -> dic
             held = {str(k): float(v) for k, v in json.load(f).items()}
     else:
         held = {k: float(v) for k, v in live.get("last_futures_targets", {}).items()}
-    out = to_contracts(targets["by_asset"], data, fut, held)
+    out = to_contracts(targets["by_asset"], data, fut, held, fx=fx, quotes=quotes, series=series)
     out["orders"] = translate_orders(states, out["conversions"])
     out["notes"] = notes + out["notes"]
     out["holdings_source"] = "holdings_futures.json" if given else "previous run's targets"
+    out["fx"] = fx
     del out["conversions"]      # holds dataclasses; everything downstream reads the frames
     return out
+
+
+def _load_futures_quotes(state_dir) -> tuple[dict, list]:
+    """Hand-kept prices for contracts Yahoo has no series for, and a note when
+    the file is old enough that the price probably is too."""
+    p = os.path.join(state_dir, "futures_quotes.json")
+    if not os.path.exists(p):
+        return {}, []
+    with open(p) as f:
+        quotes = parse_quotes(json.load(f))
+    age = (time.time() - os.path.getmtime(p)) / 86400
+    notes = []
+    if age > QUOTES_STALE_DAYS:
+        notes.append(f"futures_quotes.json is {age:.0f} days old: {', '.join(sorted(quotes))} "
+                     f"are sized on a stale price")
+    return quotes, notes
 
 
 def _slot_signal(slot: dict, df: pd.DataFrame, cfg: dict, live: dict, args,
@@ -765,8 +839,10 @@ def _print_signals(spec, states, targets, trades, run, out_html, secs):
             print("  flat -- nothing to hold")
         for a, r in fut["book"].iterrows():
             todo = "hold" if r["action"] == "hold" else f"{r['action']} {r['order_contracts']:g}"
-            print(f"  {r['root']:<4} ({a:<4}) target {r['target']:>+4d}  held {r['held']:>+4d}  "
-                  f"{todo:<8} wanted {r['raw']:>+6.2f} @ {r['fut_price']:g}  hedge ratio {r['hedge_ratio']:.2f}")
+            ccy = "" if r["currency"] == "USD" else f" {r['currency']}"
+            print(f"  {r['root']:<4} ({a:<7}) target {r['target']:>+4d}  held {r['held']:>+4d}  "
+                  f"{todo:<8} wanted {r['raw']:>+6.2f} @ {r['fut_price']:g}{ccy} ({r['price_source']})  "
+                  f"hedge ratio {r['hedge_ratio']:.2f} ({r['ratio_source']})")
     for n in run["notes"]:
         print(f"  note: {n}")
     print(f"\nDashboard: {out_html}  ({secs:.1f}s)")

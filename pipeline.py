@@ -51,10 +51,13 @@ def resolve_interval(interval: str, synthetic: bool) -> str:
     return SYNTHETIC_INTERVAL if synthetic else interval
 
 
-def load_real(ticker: str, start: str, interval: str = "1d", now=None) -> pd.DataFrame:
+def load_real(ticker: str, start: str, interval: str = "1d", now=None,
+              session_close: tuple[str, str] | None = None) -> pd.DataFrame:
     """yfinance history WITHOUT the bar that is still forming. Research on a
-    half-finished last bar is research on a price nobody could have traded."""
-    return drop_forming_bar(load_yfinance(ticker, start=start, interval=interval), interval, now=now)
+    half-finished last bar is research on a price nobody could have traded.
+    `session_close` is the listing exchange's (HH:MM, zone); default New York."""
+    kw = {} if session_close is None else dict(session_close=session_close)
+    return drop_forming_bar(load_yfinance(ticker, start=start, interval=interval), interval, now=now, **kw)
 
 
 def cscv_partitions_for(T: int) -> int:
