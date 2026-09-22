@@ -38,6 +38,10 @@ Outputs land in `--state-dir` (default ./state):
                         positions, so the trade list is against reality rather
                         than against yesterday's target
     research_report.md  the full diagnostics write-up
+    futures_orders.csv, futures_levels.csv   with `signals --futures`: the book in whole
+                        contracts and every working level as a futures price
+                        (futures_map.py); held contracts come from
+                        holdings_futures.json, {"MES": 2, "ZN": -1}
 
 Nothing here places an order. It tells you what to place.
 """
@@ -65,9 +69,10 @@ from pipeline import (
 )
 from portfolio import returns_frame
 from strategy import (
-    StrategyTemplate, annualized_sharpe, max_drawdown, set_periods_per_year,
+    StrategyTemplate, annualized_sharpe, max_drawdown, set_periods_per_year, periods_per_year,
     periods_per_year_for_interval, SIDES, BARS_PER_YEAR,
 )
+from futures_map import CONTRACTS, HEDGE_RATIO_BARS, to_contracts, translate_orders
 from dashboard_html import render_dashboard
 
 SPEC_VERSION = 2
@@ -101,6 +106,13 @@ def parse_args(argv=None):
     r.add_argument("--max-templates", type=int, default=None)
     r.add_argument("--sides", nargs="+", default=None, choices=SIDES,
                    help="restrict every template to these sides (default: the family's own list)")
+    r.add_argument("--sides-map", nargs="+", default=None, metavar="ASSET=SIDE",
+                   help="sides per asset, e.g. SPY=long_only QQQ=long_only; the others keep --sides. "
+                        "Whether an asset drifts is a fact about the asset: decide it BEFORE the run")
+    r.add_argument("--portfolio-vol", type=float, default=0.0,
+                   help="annualized volatility the whole book is scaled to (e.g. 0.15), from the "
+                        "realized vol of the nested walk-forward curve; 0 = no scaling. Frozen in "
+                        "portfolio.json, never re-estimated by the signals phase")
     r.add_argument("--train", type=int, default=500, help="training window (bars)")
     r.add_argument("--test", type=int, default=125, help="test window (bars)")
     r.add_argument("--anchored", action="store_true", help="expanding training window")
@@ -132,6 +144,13 @@ def parse_args(argv=None):
                    help="cap on gross exposure as a multiple of account equity; the "
                         "whole book is scaled down proportionally if it is exceeded")
     s.add_argument("--lot", type=float, default=1.0, help="round order sizes to this")
+    s.add_argument("--risk-scale", type=float, default=None,
+                   help="multiply the equity every slot is sized on (default: the research's "
+                        "--portfolio-vol scale, 1 if there was none)")
+    s.add_argument("--futures", action="store_true",
+                   help="also restate the book in whole futures contracts (futures_map.py): "
+                        "futures_orders.csv and a section on the page. Held contracts come from "
+                        "holdings_futures.json, e.g. {\"MES\": 2, \"ZN\": -1}")
     s.add_argument("--no-refit", action="store_true",
                    help="never re-optimize, even when a test window has elapsed")
     s.add_argument("--now", default=None,
@@ -193,6 +212,7 @@ def _start_for_bars(n_bars: int, interval: str) -> str:
 
 def research(args) -> dict:
     t0 = time.time()
+    sides_map = _parse_sides_map(args.sides_map, args.assets)
     os.makedirs(args.state_dir, exist_ok=True)
     interval = resolve_interval(args.interval, args.synthetic)
     if interval != args.interval:
@@ -209,15 +229,24 @@ def research(args) -> dict:
             f"only {n_bars} shared bars: too few for train={args.train} + test={args.test}. "
             f"Use an earlier --start, a coarser --interval, or smaller windows.")
 
-    overrides = {"sides": args.sides} if args.sides else {}
-    templates = generate_templates(args.family, max_templates=args.max_templates, **overrides)
+    by_sides = {}
+
+    def templates_for(asset):
+        sides = sides_map.get(asset, args.sides)
+        key = tuple(sides) if sides else None
+        if key not in by_sides:
+            overrides = {"sides": list(sides)} if sides else {}
+            by_sides[key] = generate_templates(args.family, max_templates=args.max_templates, **overrides)
+        return by_sides[key]
+
     cfg = eval_config(args, args.interval) | dict(
         start=args.start, family=args.family, sides=args.sides,
+        sides_map={a: list(s) for a, s in sides_map.items()}, portfolio_vol=args.portfolio_vol,
         min_sharpe=args.min_sharpe, corr_ceiling=args.corr_ceiling,
         weighting=args.weighting, select_method=args.select_method,
     )
-    jobs = [(f"{a}|{t.name}", a, t) for a in args.assets for t in templates]
-    print(f"{len(templates)} templates x {len(args.assets)} assets = {len(jobs)} slots; "
+    jobs = [(f"{a}|{t.name}", a, t) for a in args.assets for t in templates_for(a)]
+    print(f"{len(templates_for(args.assets[0]))} templates x {len(args.assets)} assets = {len(jobs)} slots; "
           f"walk-forward train={args.train} test={args.test} "
           f"{'anchored' if args.anchored else 'rolling'}, {args.cost_bps} bps/side")
 
@@ -243,6 +272,45 @@ def research(args) -> dict:
     for r in spec["verdict"]["reasons"]:
         print(f"  - {r}")
     return spec
+
+
+def _parse_sides_map(items, assets) -> dict:
+    """{'SPY': ['long_only']} from ['SPY=long_only']; an unknown asset or side is
+    an error, not a slot that silently trades both ways."""
+    out = {}
+    for item in items or []:
+        asset, _, side = item.partition("=")
+        if asset not in assets:
+            raise SystemExit(f"--sides-map {item}: {asset!r} is not in --assets")
+        if side not in SIDES:
+            raise SystemExit(f"--sides-map {item}: side must be one of {SIDES}")
+        out.setdefault(asset, [])
+        if side not in out[asset]:
+            out[asset].append(side)
+    return out
+
+
+RISK_SCALE_BOUNDS = (0.5, 10.0)
+
+
+def _risk_scale(nested: dict, target: float) -> tuple[float, float]:
+    """(scale, realized vol of the nested curve). Slot sizes are linear in the
+    equity they are sized on (until --max-leverage binds), so the book reaches
+    `target` when that equity is multiplied by target / realized. Windows where
+    the selection step picked nothing are left out: they are a flat line, and
+    counting them would read a book that is sometimes empty as a calm one."""
+    r = nested["portfolio_returns"]
+    sels = sorted(nested["selections"], key=lambda s: s["period_start"])
+    keep = np.ones(len(r), dtype=bool)
+    for s, nxt in zip(sels, sels[1:] + [None]):
+        if not s["selected"]:
+            keep &= ~((r.index >= pd.Timestamp(s["period_start"]))
+                      & (True if nxt is None else r.index < pd.Timestamp(nxt["period_start"])))
+    r = r[keep]
+    vol = float(r.std() * np.sqrt(periods_per_year())) if len(r) > 2 else 0.0
+    if target <= 0 or vol <= 0:
+        return 1.0, vol
+    return float(np.clip(target / vol, *RISK_SCALE_BOUNDS)), vol
 
 
 def _assemble_spec(data, results, args, cfg) -> dict:
@@ -286,10 +354,17 @@ def _assemble_spec(data, results, args, cfg) -> dict:
             ),
         ))
 
+    scale, nested_vol = _risk_scale(nested, args.portfolio_vol)
+    diag["nested_vol"] = nested_vol
+    print(f"  nested curve realized vol {nested_vol:.1%}"
+          + (f" -> risk scale {scale:.2f} for a {args.portfolio_vol:.0%} book" if args.portfolio_vol > 0 else ""))
+    if args.portfolio_vol > 0 and scale in RISK_SCALE_BOUNDS:
+        print(f"  NOTE: the risk scale hit its bound {scale:g}; the book will not reach the target")
+
     return dict(
         version=SPEC_VERSION,
         created=utcnow().isoformat(timespec="seconds"),
-        assets=list(args.assets), config=cfg, slots=slots,
+        assets=list(args.assets), config=cfg, slots=slots, risk_scale=scale,
         diagnostics=diag, verdict=_verdict(diag, slots),
         curves=_curves(data, rets, nested, port),
         universe=_ranking_table(results, rets, selected),
@@ -490,13 +565,18 @@ def signals(args) -> dict:
     if have < need:
         print(f"  WARNING: {have} shared bars, wanted {need}; refits use what is there")
 
+    # a spec written before --portfolio-vol existed was researched unscaled
+    risk_scale = float(spec.get("risk_scale", 1.0) if args.risk_scale is None else args.risk_scale)
+    sizing_equity = args.account_equity * risk_scale
+
     live = _load_live_state(args.state_dir)
     states, notes = [], []
     for slot in spec["slots"]:
-        st, note = _slot_signal(slot, data[slot["asset"]], cfg, live, args)
+        st, note = _slot_signal(slot, data[slot["asset"]], cfg, live, args, sizing_equity)
         states.append(st)
         notes.extend(note)
 
+    # exposure and the gross cap stay against the REAL account
     weights = {s["slot"]: s["weight"] for s in spec["slots"]}
     targets = portfolio_targets(states, weights, args.account_equity, max_gross=args.max_gross)
     holdings, holdings_given = _load_holdings(args.state_dir)
@@ -504,18 +584,26 @@ def signals(args) -> dict:
         holdings = {k: float(v) for k, v in live.get("last_targets", {}).items()}
     trades = trade_list(targets["by_asset"], holdings, lot=args.lot)
 
+    futures = _futures_book(args, spec, data, states, targets, live, interval, now) if args.futures else None
+    if futures:
+        notes.extend(futures["notes"])
+
     run = dict(
         as_of=max((pd.Timestamp(s["as_of"]) for s in states), default=utcnow()),
         generated=utcnow(),
-        account_equity=args.account_equity, max_gross=args.max_gross,
+        account_equity=args.account_equity, max_gross=args.max_gross, risk_scale=risk_scale,
         holdings_source="holdings.json" if holdings_given else "previous run's targets",
-        notes=notes, bars_available=have,
+        notes=notes, bars_available=have, futures=futures,
     )
     out_html = os.path.join(args.state_dir, "dashboard.html")
     render_dashboard(spec, states, targets, trades, run, out_html)
     _write_signal_csvs(args.state_dir, spec, states, targets, trades, run)
 
     live["last_targets"] = {a: float(v) for a, v in targets["by_asset"]["shares"].items()}
+    if futures:
+        futures["book"].to_csv(os.path.join(args.state_dir, "futures_orders.csv"))
+        futures["orders"].to_csv(os.path.join(args.state_dir, "futures_levels.csv"), index=False)
+        live["last_futures_targets"] = {r["root"]: int(r["target"]) for _, r in futures["book"].iterrows()}
     live["runs"] = live.get("runs", 0) + 1
     live["last_run"] = run["generated"].isoformat(timespec="seconds")
     _save_live_state(args.state_dir, live)
@@ -524,8 +612,45 @@ def signals(args) -> dict:
     return dict(spec=spec, states=states, targets=targets, trades=trades, run=run)
 
 
-def _slot_signal(slot: dict, df: pd.DataFrame, cfg: dict, live: dict, args) -> tuple[dict, list]:
-    """Current state of one slot, re-optimizing only if a test window has passed."""
+def _futures_book(args, spec, data, states, targets, live, interval, now) -> dict:
+    """The ETF book restated in whole contracts, against the contracts held."""
+    fut, notes = {}, []
+    for a in spec["assets"]:
+        c = CONTRACTS.get(a)
+        if c is None:
+            continue
+        if args.synthetic:
+            # no feed: the ETF stands in for its own future, rescaled to a
+            # price at which one contract is worth a plausible amount
+            lo, hi = c.notional_range
+            k = np.sqrt(lo * hi) / c.value(data[a]["Close"].iloc[-1] * c.yahoo_scale)
+            fut[a] = data[a][["Open", "High", "Low", "Close"]] * k
+            continue
+        try:
+            fut[a] = load_real(c.yahoo, start=_start_for_bars(HEDGE_RATIO_BARS + 100, interval),
+                               interval=interval, now=now)
+        except ValueError as e:
+            notes.append(f"{a}: {e}")
+    p = os.path.join(args.state_dir, "holdings_futures.json")
+    given = os.path.exists(p)
+    if given:
+        with open(p) as f:
+            held = {str(k): float(v) for k, v in json.load(f).items()}
+    else:
+        held = {k: float(v) for k, v in live.get("last_futures_targets", {}).items()}
+    out = to_contracts(targets["by_asset"], data, fut, held)
+    out["orders"] = translate_orders(states, out["conversions"])
+    out["notes"] = notes + out["notes"]
+    out["holdings_source"] = "holdings_futures.json" if given else "previous run's targets"
+    del out["conversions"]      # holds dataclasses; everything downstream reads the frames
+    return out
+
+
+def _slot_signal(slot: dict, df: pd.DataFrame, cfg: dict, live: dict, args,
+                 sizing_equity: float | None = None) -> tuple[dict, list]:
+    """Current state of one slot, re-optimizing only if a test window has passed.
+    `sizing_equity` is the account equity times the research's risk scale."""
+    equity = (args.account_equity if sizing_equity is None else sizing_equity) * slot["weight"]
     notes = []
     key = slot["slot"]
     base = StrategyTemplate(**slot["template"])
@@ -553,7 +678,7 @@ def _slot_signal(slot: dict, df: pd.DataFrame, cfg: dict, live: dict, args) -> t
     if mem["params"] is None:
         st = dict(slot=key, asset=slot["asset"], template=slot["template_name"],
                   as_of=df.index[-1], last_close=float(df["Close"].iloc[-1]), atr=np.nan,
-                  equity_slot=args.account_equity * slot["weight"], position=None, shares=0.0,
+                  equity_slot=equity, position=None, shares=0.0,
                   entry_price=None, entry_date=None, bars_held=0, unrealized=0.0,
                   n_trades_in_window=0, exit_orders=[], entry_orders=[],
                   blocked_by=["no parameter set could be fitted"], params={},
@@ -562,7 +687,7 @@ def _slot_signal(slot: dict, df: pd.DataFrame, cfg: dict, live: dict, args) -> t
         return st, notes
 
     tpl = base.with_params(**mem["params"])
-    st = strategy_state(df, tpl, equity=args.account_equity * slot["weight"])
+    st = strategy_state(df, tpl, equity=equity)
     st.update(slot=key, asset=slot["asset"], template=slot["template_name"],
               params=mem["params"], fitted_on=mem["fitted_on"], weight=slot["weight"],
               research=slot["research"],
@@ -604,6 +729,9 @@ def _print_signals(spec, states, targets, trades, run, out_html, secs):
     print(f"\nAs of {run['as_of']}  |  account ${run['account_equity']:,.0f}  |  "
           f"gross {targets['gross_exposure']:.0%}  net {targets['net_exposure']:+.0%}  |  "
           f"risk if every stop hits {targets['open_risk_pct']:.1%}")
+    if run["risk_scale"] != 1:
+        print(f"  (slots sized on ${run['account_equity'] * run['risk_scale']:,.0f}: "
+              f"risk scale {run['risk_scale']:.2f})")
     if targets["scale_applied"] < 1:
         print(f"  (book scaled to {targets['scale_applied']:.2f} to respect "
               f"--max-gross {run['max_gross']:g})")
@@ -629,6 +757,16 @@ def _print_signals(spec, states, targets, trades, run, out_html, secs):
         for a, r in todo.iterrows():
             print(f"  {r['action']:<4} {r['order_shares']:>9.1f} {a:<5} "
                   f"~${r['order_notional']:>11,.0f}  (held {r['held']:g} -> target {r['target']:g})")
+    fut = run.get("futures")
+    if fut:
+        print(f"\nFutures book (vs {fut['holdings_source']}), rounding error "
+              f"${fut['rounding_error']:,.0f} = {fut['rounding_error_pct']:.0%} of the ETF book:")
+        if fut["book"].empty:
+            print("  flat -- nothing to hold")
+        for a, r in fut["book"].iterrows():
+            todo = "hold" if r["action"] == "hold" else f"{r['action']} {r['order_contracts']:g}"
+            print(f"  {r['root']:<4} ({a:<4}) target {r['target']:>+4d}  held {r['held']:>+4d}  "
+                  f"{todo:<8} wanted {r['raw']:>+6.2f} @ {r['fut_price']:g}  hedge ratio {r['hedge_ratio']:.2f}")
     for n in run["notes"]:
         print(f"  note: {n}")
     print(f"\nDashboard: {out_html}  ({secs:.1f}s)")
@@ -669,7 +807,11 @@ def _write_research_report(spec, path):
     L.append(f"- Portfolio Sharpe: {d['static_sharpe']:.2f} with the selection fitted on all "
              f"history (biased), **{d['nested_sharpe']:.2f}** with the selection walked forward "
              f"over {d['n_reselections']} re-selections (honest), max drawdown "
-             f"{d['nested_max_drawdown']:.1%}\n\n")
+             f"{d['nested_max_drawdown']:.1%}\n")
+    L.append(f"- Realized volatility of the nested curve: {d['nested_vol']:.1%} a year"
+             + (f"; slots are sized on equity x **{spec['risk_scale']:.2f}** to run the book at "
+                f"{c['portfolio_vol']:.0%} (drawdowns scale with it)" if c.get("portfolio_vol") else "")
+             + "\n\n")
     L.append("## Selected slots\n\n")
     L.append("| slot | weight | OOS Sharpe | WFE | prof. windows | Pardo | CPCV mean+/-sd | "
              "P(CPCV<0) | boot p | DSR |\n|---|---|---|---|---|---|---|---|---|---|\n")

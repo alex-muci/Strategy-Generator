@@ -167,3 +167,4 @@ cython_debug/
 /outputs_*
 # dashboard state (your portfolio spec, positions and generated pages)
 state/
+/state_*/
