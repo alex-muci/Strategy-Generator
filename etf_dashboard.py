@@ -225,7 +225,10 @@ def fx_rate(currency: str, *, interval: str = "1d", now=None) -> float:
         sym = FX_SYMBOLS.get(currency)
         if sym is None:
             raise ValueError(f"no Yahoo symbol for {currency}/USD; add it to futures_map.FX_SYMBOLS")
-        df = load_real(sym, start=_start_for_bars(40, interval), interval=interval, now=now)
+        # only the last close is used, but load_yfinance refuses fewer than
+        # 200 bars: ask for the window the futures prices use, not a rate-sized one
+        df = load_real(sym, start=_start_for_bars(HEDGE_RATIO_BARS + 100, interval),
+                       interval=interval, now=now)
         _FX_CACHE[currency] = float(df["Close"].iloc[-1])
     return _FX_CACHE[currency]
 

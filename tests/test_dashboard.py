@@ -306,6 +306,46 @@ class FuturesBookTests(unittest.TestCase):
         self.assertNotIn("Futures orders", open(os.path.join(d, "dashboard.html"), encoding="utf-8").read())
 
 
+class FxRateTests(unittest.TestCase):
+    """The euro rate comes through the same loader as every other series, and
+    that loader refuses a history shorter than 200 bars."""
+
+    def setUp(self):
+        self.orig = ED.load_real
+        ED._FX_CACHE.clear()
+        self.seen = []
+
+        def fake(ticker, start, interval="1d", now=None, session_close=None):
+            self.seen.append(dict(ticker=ticker, start=start, interval=interval))
+            idx = pd.bdate_range(start, ED.utcnow().normalize())
+            if len(idx) < 200:   # what data.load_yfinance(min_bars=200) does
+                raise ValueError(f"{ticker!r}: only {len(idx)} usable bars, need at least 200")
+            return pd.DataFrame({c: np.linspace(1.05, 1.10, len(idx)) for c in ("Open", "High", "Low", "Close")},
+                                index=idx)
+
+        ED.load_real = fake
+
+    def tearDown(self):
+        ED.load_real = self.orig
+        ED._FX_CACHE.clear()
+
+    def test_the_rate_window_clears_the_loaders_floor(self):
+        rate = ED.fx_rate("EUR")
+        self.assertAlmostEqual(rate, 1.10)
+        self.assertEqual(self.seen[0]["ticker"], "EURUSD=X")
+
+    def test_the_rate_is_fetched_once_per_run(self):
+        ED.fx_rate("EUR")
+        ED.fx_rate("EUR")
+        self.assertEqual(len(self.seen), 1)
+        self.assertEqual(ED.fx_rate("USD"), 1.0)
+        self.assertEqual(len(self.seen), 1)
+
+    def test_an_unmapped_currency_is_an_error(self):
+        with self.assertRaises(ValueError):
+            ED.fx_rate("BRL")
+
+
 class VerdictTests(unittest.TestCase):
     BASE = dict(nested_sharpe=1.2, nested_max_drawdown=-0.1, pbo_trials=0.1,
                 reality_check_p=0.01, dsr_best=0.99, n_eff=5, n_slots=40,
