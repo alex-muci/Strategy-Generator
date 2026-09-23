@@ -35,7 +35,7 @@ import pandas as pd
 
 from strategy import (
     backtest, annualized_sharpe, max_drawdown, periods_per_year, performance_stats, REGIME_INDICATORS,
-    hedge_warmup,
+    hedge_buffer,
 )
 
 
@@ -75,8 +75,9 @@ def warmup_bars(tpl) -> int:
     if tpl.channel_type == "hedge" or tpl.direction_logic == "learned":
         # the online learner scores a fixed number of past bars, each of
         # which needs formed experts and a formed ATR (a rolling window: exact
-        # once it is full)
-        need.append(hedge_warmup(tpl.atr_n))
+        # once it is full, discounted or not), and each expert's stance needs
+        # a breakout seen inside the buffer
+        need.append(hedge_buffer(tpl.atr_n, tpl.hedge_learner))
     if tpl.exit_style == "channel":
         need.append(tpl.n_exit)
         if tpl.channel_type == "keltner":

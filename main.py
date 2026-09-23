@@ -43,7 +43,7 @@ from pipeline import (
     family_diagnostics, build_portfolios, finalist_stats, benchmark_stats,
 )
 from portfolio import returns_frame
-from strategy import annualized_sharpe, max_drawdown, periods_per_year, BARS_PER_YEAR, SIDES
+from strategy import annualized_sharpe, max_drawdown, periods_per_year, BARS_PER_YEAR, SIDES, HEDGE_LEARNERS
 
 
 def parse_args(argv=None):
@@ -75,6 +75,8 @@ def parse_args(argv=None):
                    help="annualized volatility each entry is sized to (e.g. 0.15); 0 = risk --risk-pct on the ATR stop. "
                         "Set it near the asset's own vol to put the strategies on the buy & hold scale")
     p.add_argument("--vol-target-n", type=int, default=60, help="bars of close-to-close returns in the realized-vol estimate")
+    p.add_argument("--hedge-learner", default="window", choices=list(HEDGE_LEARNERS),
+                   help="memory of the online learner (hedge channel, learned direction): 'discounted' fades old bars with a half-life, 'floored' adds a weight floor to it, 'window' is the original hard 250-bar window")
     p.add_argument("--min-sharpe", type=float, default=0.3)
     p.add_argument("--max-strategies", type=int, default=8)
     p.add_argument("--corr-ceiling", type=float, default=0.6)

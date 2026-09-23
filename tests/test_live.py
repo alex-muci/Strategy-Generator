@@ -28,7 +28,7 @@ from live import (  # noqa: E402
     portfolio_targets, trade_list,
 )
 
-LOOKBACK = 450
+LOOKBACK = 660         # > the longest warm-up a template can have (a discounted hedge one: 635 bars)
 SWEEP_STRIDE = 137      # prime, so it does not alias with the generator's switch cycles
 
 
@@ -66,7 +66,7 @@ class LiveOrderTests(unittest.TestCase):
             if k % 4 == 0:
                 sample.append(tpl.with_params(vol_target=0.15))
         for tpl in sample:
-            for t in range(LOOKBACK + 20, len(self.df), 17):
+            for t in range(LOOKBACK + 20, len(self.df), 13):   # ~55 bars per template, as before the lookback grew
                 w0 = t - LOOKBACK
                 tail, tail1 = self.df.iloc[w0:t], self.df.iloc[w0:t + 1]
                 st = strategy_state(self.df.iloc[:t], tpl, equity=100_000.0,
@@ -146,7 +146,7 @@ class LiveOrderTests(unittest.TestCase):
 
     def test_state_reports_the_position_the_engine_holds(self):
         for tpl in generate_templates("full")[::61]:
-            for t in (600, 900, 1200):
+            for t in (700, 900, 1200):
                 st = strategy_state(self.df.iloc[:t], tpl, equity=250_000.0,
                                     lookback_bars=LOOKBACK)
                 res = backtest(self.df.iloc[t - LOOKBACK:t], tpl, initial_equity=250_000.0)

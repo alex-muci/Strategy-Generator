@@ -20,10 +20,12 @@ from strategy import (  # noqa: E402
     _compute_indicators, annualized_sharpe,
     hedge_weights, hedge_channel, hedge_warmup, hedge_direction, hedge_experts, donchian,
     HEDGE_LADDER, HEDGE_MEMORY, _adahedge_loop,
+    hedge_learner_params, hedge_buffer, HEDGE_LEARNERS, HEDGE_FLOOR, _IND_CACHE,
 )
+import strategy as S  # noqa: E402
 from generator import generate_templates, param_grid_for  # noqa: E402
 from walkforward import (  # noqa: E402
-    walk_forward, grid_combos, smooth_scores, warmup_bars, summarize_walk_forward,
+    walk_forward, grid_combos, smooth_scores, warmup_bars, summarize_walk_forward, window_backtest,
 )
 from robustness import (  # noqa: E402
     trial_returns, cpcv, cpcv_paths, cscv_pbo, deflated_sharpe_ratio, probabilistic_sharpe_ratio,
@@ -444,6 +446,137 @@ class HedgeChannelTests(unittest.TestCase):
         reasons = {t["reason"] for t in learned["trades"]}
         self.assertTrue({"channel", "midline"} & reasons)
 
+
+
+class DiscountedHedgeTests(unittest.TestCase):
+    """The learner's memory: an exponentially discounted one by default, the
+    optional weight floor on top, and the original hard window kept as an
+    option. All three keep the learner a function of a fixed number of past
+    bars, which the walk-forward's warm-up buffer relies on."""
+
+    def setUp(self):
+        self.df = synthetic_ohlc(1600, seed=7)
+
+    def test_the_settings(self):
+        self.assertEqual(StrategyTemplate("t").hedge_learner, "window")
+        self.assertEqual(hedge_learner_params("window"), (HEDGE_MEMORY, 1.0, 0.0))
+        mem, gamma, floor = hedge_learner_params("discounted")
+        self.assertAlmostEqual(gamma ** S.HEDGE_HALF_LIFE, 0.5)          # a half-life, in bars
+        self.assertAlmostEqual(gamma ** mem, 2.0 ** -S.HEDGE_HORIZON)    # the memory cut-off weighs 1/16
+        self.assertEqual(floor, 0.0)
+        self.assertEqual(hedge_learner_params("floored"), (mem, gamma, HEDGE_FLOOR))
+        with self.assertRaises(ValueError):
+            hedge_learner_params("forever")
+        with self.assertRaises(AssertionError):
+            StrategyTemplate("t", hedge_learner="forever").validate()
+        for learner in HEDGE_LEARNERS:
+            self.assertGreater(hedge_buffer(20, learner), hedge_warmup(20, learner))
+            t = StrategyTemplate("t", channel_type="hedge", hedge_learner=learner)
+            self.assertGreaterEqual(warmup_bars(t), hedge_buffer(20, learner))
+
+    def test_the_undiscounted_unfloored_run_is_plain_adahedge(self):
+        rng = np.random.default_rng(3)
+        loss = rng.uniform(0, 1, (600, 4))
+        W0, e0 = _adahedge_loop(loss, HEDGE_MEMORY)
+        W1, e1 = _adahedge_loop(loss, *hedge_learner_params("window"))
+        np.testing.assert_array_equal(W0, W1)
+        np.testing.assert_array_equal(e0, e1)
+
+    def test_an_old_bar_fades_instead_of_dropping_off_a_cliff(self):
+        """Tip one round towards expert 0 and follow the change it makes to the
+        weights as the round ages. Under the hard window its influence is as
+        large as ever the day before it leaves the memory (larger: the rest of
+        the window has been re-dealt around it), then 0 the next day. Under
+        discounting it has faded to a small fraction by then."""
+        rng = np.random.default_rng(0)
+        base = rng.uniform(0, 1, (1400, 4))
+        effect = {}
+        for learner in ("window", "discounted"):
+            mem, gamma, floor = hedge_learner_params(learner)
+            Wb, _ = _adahedge_loop(base, mem, gamma, floor)
+            runs = []
+            for s in range(200, 260, 5):
+                tipped = base.copy()
+                tipped[s] = [0.0, 1.0, 1.0, 1.0]
+                Wt, _ = _adahedge_loop(tipped, mem, gamma, floor)
+                runs.append(np.abs(Wt - Wb).sum(axis=1)[s:s + mem + 1])
+            e = np.mean(runs, axis=0)
+            self.assertEqual(e[mem], 0.0)                     # a fixed number of past bars, either way
+            effect[learner] = (e[:10].mean(), e[mem - 10:mem].mean())
+        young, old = effect["window"]
+        self.assertGreater(old, young)                        # the cliff: full weight to the last day
+        young, old = effect["discounted"]
+        self.assertLess(old, 0.25 * young)                    # faded long before the cut-off
+        self.assertLess(old, 0.25 * effect["window"][1])
+
+    def test_discounting_tracks_a_change_of_leader_sooner(self):
+        rng = np.random.default_rng(1)
+        loss = rng.uniform(0, 1, (2000, 4))
+        loss[:1000, 0] -= 0.1                  # expert 0 leads for 1000 noisy rounds...
+        loss[1000:, 3] -= 0.1                  # ...then expert 3 does
+        loss = np.clip(loss, 0, 1)
+        took = {}
+        for learner in HEDGE_LEARNERS:
+            W, _ = _adahedge_loop(loss, *hedge_learner_params(learner))
+            self.assertGreater(W[999, 0], 0.9, learner)
+            took[learner] = int(np.argmax(W[1000:, 3] > 0.5))
+            self.assertGreater(W[-200:, 3].mean(), 0.5, learner)   # and settled on it
+        self.assertLess(took["discounted"], took["window"])
+        self.assertLess(took["floored"], took["discounted"])  # a written-off expert is never far behind
+
+    def test_the_floor_keeps_every_expert_in_play(self):
+        rng = np.random.default_rng(2)
+        loss = rng.uniform(0, 1, (1500, 4))
+        loss[:, 0] -= 0.2                      # a clear leader: the others would sink towards 0
+        loss = np.clip(loss, 0, 1)
+        Wd, _ = _adahedge_loop(loss, *hedge_learner_params("discounted"))
+        Wf, eta = _adahedge_loop(loss, *hedge_learner_params("floored"))
+        np.testing.assert_allclose(Wf.sum(axis=1), 1.0)
+        finite = np.isfinite(eta)              # follow-the-leader rounds have no scale to floor on
+        self.assertGreater(finite[100:].mean(), 0.99)
+        ratio = Wf.min(axis=1) / Wf.max(axis=1)
+        self.assertTrue((ratio[finite] >= HEDGE_FLOOR * (1 - 1e-9)).all())
+        self.assertLess((Wd.min(axis=1) / Wd.max(axis=1))[500:].min(), HEDGE_FLOOR / 100)
+        self.assertEqual(int(np.argmax(Wf[-1])), 0)
+
+    def test_state_is_a_function_of_the_last_memory_rounds(self):
+        rng = np.random.default_rng(4)
+        loss = rng.uniform(0, 1, (1500, 4))
+        for learner in HEDGE_LEARNERS:
+            mem, gamma, floor = hedge_learner_params(learner)
+            W, _ = _adahedge_loop(loss, mem, gamma, floor)
+            W2, _ = _adahedge_loop(loss[400:], mem, gamma, floor)
+            np.testing.assert_allclose(W[400 + mem:], W2[mem:], err_msg=learner)
+
+    def test_a_warm_window_matches_a_full_history_run_with_every_learner(self):
+        k, n = 1000, len(self.df)
+        for learner in HEDGE_LEARNERS:
+            for tpl in (StrategyTemplate("t", channel_type="hedge", hedge_learner=learner),
+                        StrategyTemplate("t", direction_logic="learned", exit_style="atr_trail",
+                                         hedge_learner=learner)):
+                full = backtest(self.df, tpl, first_trade_bar=k)
+                win = window_backtest(self.df, tpl, k, n)
+                np.testing.assert_allclose(win["equity"].to_numpy(), full["equity"].to_numpy()[k:],
+                                           rtol=1e-9, err_msg=f"{learner} {tpl.direction_logic}")
+                self.assertEqual(len(win["trades"]), len(full["trades"]))
+
+    def test_the_learner_is_in_the_indicator_cache_key(self):
+        tpl = StrategyTemplate("t", direction_logic="learned", channel_type="hedge", cost_bps=0.0)
+        runs = {}
+        for learner in ("window", "discounted", "window"):
+            runs.setdefault(learner, []).append(backtest(self.df, tpl.with_params(hedge_learner=learner))["equity"])
+        pd.testing.assert_series_equal(runs["window"][0], runs["window"][1])
+        self.assertFalse(runs["window"][0].equals(runs["discounted"][0]))
+        # and so are its settings, which an experiment may change between runs
+        before = runs["discounted"][0]
+        half_life = S.HEDGE_HALF_LIFE
+        try:
+            S.HEDGE_HALF_LIFE = 40
+            after = backtest(self.df, tpl.with_params(hedge_learner="discounted"))["equity"]
+        finally:
+            S.HEDGE_HALF_LIFE = half_life
+            _IND_CACHE.clear()
+        self.assertFalse(before.equals(after))
 
 class WalkForwardTests(unittest.TestCase):
     def setUp(self):

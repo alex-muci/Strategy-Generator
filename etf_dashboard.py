@@ -66,6 +66,7 @@ import pandas as pd
 
 from data import synthetic_ohlc
 from generator import generate_templates, param_grid_for, FAMILIES
+from walkforward import warmup_bars
 from live import (
     refit_params, due_for_refit, strategy_state,
     portfolio_targets, trade_list, utcnow,
@@ -77,7 +78,7 @@ from pipeline import (
 from portfolio import returns_frame
 from strategy import (
     StrategyTemplate, annualized_sharpe, max_drawdown, set_periods_per_year, periods_per_year,
-    periods_per_year_for_interval, SIDES, BARS_PER_YEAR,
+    periods_per_year_for_interval, SIDES, BARS_PER_YEAR, HEDGE_LEARNERS,
 )
 from futures_map import (
     CONTRACTS, LISTINGS, FX_SYMBOLS, HEDGE_RATIO_BARS, QUOTES_STALE_DAYS,
@@ -136,6 +137,8 @@ def parse_args(argv=None):
                    help="annualized volatility each entry is sized to, per slot (e.g. 0.15); "
                         "0 = risk --risk-pct on the ATR stop. The same target gives every asset the same risk")
     r.add_argument("--vol-target-n", type=int, default=60, help="bars of close-to-close returns in the realized-vol estimate")
+    r.add_argument("--hedge-learner", default="window", choices=list(HEDGE_LEARNERS),
+                   help="memory of the online learner (hedge channel, learned direction): 'discounted' fades old bars with a half-life, 'floored' adds a weight floor to it, 'window' is the original hard 250-bar window")
     r.add_argument("--min-sharpe", type=float, default=0.3)
     r.add_argument("--max-strategies", type=int, default=8)
     r.add_argument("--corr-ceiling", type=float, default=0.6)
@@ -233,10 +236,17 @@ def fx_rate(currency: str, *, interval: str = "1d", now=None) -> float:
     return _FX_CACHE[currency]
 
 
+def _slot_template(slot: dict) -> StrategyTemplate:
+    """The StrategyTemplate a spec slot was researched with. A spec written
+    before hedge_learner existed was researched with the window learner."""
+    return StrategyTemplate(**{"hedge_learner": "window", **slot["template"]})
+
+
 def _history_bars_needed(spec: dict) -> int:
     """Bars of history the signals phase needs: one training window, plus the
-    longest warm-up any template could ask for, plus slack."""
-    return int(spec["config"]["train_bars"] * 1.25) + 400
+    longest warm-up any of the spec's templates asks for, plus slack."""
+    warm = max((warmup_bars(_slot_template(s)) for s in spec.get("slots", [])), default=0)
+    return int(spec["config"]["train_bars"] * 1.25) + max(400, warm + 100)
 
 
 def _start_for_bars(n_bars: int, interval: str) -> str:
@@ -727,7 +737,7 @@ def _slot_signal(slot: dict, df: pd.DataFrame, cfg: dict, live: dict, args,
     equity = (args.account_equity if sizing_equity is None else sizing_equity) * slot["weight"]
     notes = []
     key = slot["slot"]
-    base = StrategyTemplate(**slot["template"])
+    base = _slot_template(slot)
     mem = live["slots"].setdefault(key, dict(params=None, fitted_on=None))
 
     train = min(cfg["train_bars"], len(df))

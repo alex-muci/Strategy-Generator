@@ -74,6 +74,7 @@ def eval_config(args, interval: str) -> dict:
         metric=args.metric, selection=args.selection, wide_grid=args.wide_grid,
         cost_bps=args.cost_bps, risk_pct=args.risk_pct, max_leverage=args.max_leverage,
         vol_target=args.vol_target, vol_target_n=args.vol_target_n,
+        hedge_learner=getattr(args, "hedge_learner", "window"),
         cpcv_groups=args.cpcv_groups, cpcv_k=args.cpcv_k,
     )
 
@@ -104,7 +105,8 @@ def init_worker(data: dict, cfg: dict) -> None:
 
 def _costed(tpl, c: dict):
     return tpl.with_params(cost_bps=c["cost_bps"], risk_pct=c["risk_pct"], max_leverage=c["max_leverage"],
-                           vol_target=c["vol_target"], vol_target_n=c["vol_target_n"])
+                           vol_target=c["vol_target"], vol_target_n=c["vol_target_n"],
+                           hedge_learner=c.get("hedge_learner", "window"))
 
 
 def _wfa_kwargs(c: dict) -> dict:

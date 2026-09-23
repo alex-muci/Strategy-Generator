@@ -324,9 +324,11 @@ class ParseArgsTests(unittest.TestCase):
         self.assertEqual((a.cost_bps, a.risk_pct, a.max_leverage), (tpl.cost_bps, tpl.risk_pct, tpl.max_leverage))
         self.assertEqual((a.vol_target, a.vol_target_n), (tpl.vol_target, tpl.vol_target_n))
         self.assertEqual(a.vol_target, 0.0, "the vol target is opt-in")
+        self.assertEqual(a.hedge_learner, tpl.hedge_learner)
 
     def test_bad_choices_are_rejected(self):
-        for argv in (["--family", "nope"], ["--interval", "2h"], ["--metric", "sortino"], ["--sides", "up"]):
+        for argv in (["--family", "nope"], ["--interval", "2h"], ["--metric", "sortino"], ["--sides", "up"],
+                     ["--hedge-learner", "forever"]):
             with self.assertRaises(SystemExit):
                 M.parse_args(argv)
 
@@ -335,6 +337,7 @@ class ParseArgsTests(unittest.TestCase):
         tpl = P._costed(generate_templates("quick", max_templates=1, sides=["long_only"])[0], cfg)
         self.assertEqual((tpl.risk_pct, tpl.max_leverage, tpl.cost_bps, tpl.sides), (0.02, 1.0, 9.0, "long_only"))
         self.assertEqual((tpl.vol_target, tpl.vol_target_n), (0.12, 40))
+        self.assertEqual(P._costed(tpl, _cfg(hedge_learner="window")).hedge_learner, "window")
 
     def test_sizing_text_describes_the_rule_in_force(self):
         self.assertIn("1.0% of equity", P.sizing_text(dict(risk_pct=0.01)))              # a pre-feature spec

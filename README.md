@@ -21,7 +21,7 @@ conda create -p ./env python=3.12 pandas scikit-learn scipy matplotlib yfinance 
 conda activate ./env
 # or, with pip:  pip install -r requirements.txt   (the versions the suite was last run against)
 
-python -m unittest discover -s tests -v      # 195 tests (engine, templates, hedge learner, walk-forward, robustness, selection, data, live signals, both entry points)
+python -m unittest discover -s tests -v      # 243 tests (engine, templates, hedge learner, walk-forward, robustness, selection, data, live signals, both entry points)
 # faster (about 1:35 min instead of 4.5): pip install -r requirements-dev.txt, then, with ./env active,
 python -m pytest -n auto --dist loadscope   # same tests in parallel; loadscope keeps a class (and its one-off setup) on one worker
 
@@ -349,13 +349,11 @@ algorithm from the prediction-with-expert-advice literature:
   JMLR 2014), exponential weights whose learning rate is set from the
   accumulated mixability gap. It starts as plain **follow-the-leader**
   and only becomes more conservative when the data forces it to. No
-  learning rate, no threshold. It scores the last `HEDGE_MEMORY` (250)
-  bars: plain AdaHedge finds the best expert *in hindsight* over all
-  history, so after a long trend a fade expert would have to pay back
-  the whole history before it could win; the bounded memory is what
-  lets the learner *track* a change of regime, and it is also what
-  makes the learner state reproducible from the walk-forward's warm-up
-  buffer (see `walkforward.window_backtest`).
+  learning rate, no threshold. Plain AdaHedge finds the best expert *in
+  hindsight* over all history, so after a long trend a fade expert would
+  have to pay back the whole history before it could win; a bounded
+  memory is what lets the learner *track* a change of regime (see
+  "The learner's memory" below).
 - **Channel**: the weight-averaged expert channel, i.e. an adaptive
   channel whose effective period is learned causally bar by bar. The
   exit channel uses the same weights over the ladder scaled by
@@ -382,10 +380,75 @@ Why this and not the other online-learning candidates:
   the sign flip that makes the countertrend learner score the fade.
 - **Plain Hedge / exponentiated gradient** needs a learning rate, and
   **fixed-share** needs a switching rate: parameters again. AdaHedge is
-  the parameter-free variant with the same regret guarantee.
+  the parameter-free variant with the same regret guarantee. (The
+  memory is the one setting left: a window length or a half-life.)
 - **Follow-the-leader** on its own is unstable on noisy losses (it flips
   between near-tied experts); AdaHedge *is* FTL until the losses show
   the flipping costs something, then smooths.
+
+#### The learner's memory (`--hedge-learner`)
+
+| setting | what the learner remembers |
+|---|---|
+| `window` (default) | the last `HEDGE_MEMORY` (250) bars in full, nothing older |
+| `discounted` | every bar the cumulative losses **and** the mixability gap are multiplied by 2^(-1/`HEDGE_HALF_LIFE`): a bar's evidence counts half after 90 bars, a quarter after 180. Scored over 4 half-lives (360 bars); older bars would weigh under 1/16 |
+| `floored` | `discounted`, plus no expert's weight may fall below `HEDGE_FLOOR` (1 %) of the leader's: its deficit is capped at ln(100)/eta, so a written-off expert is never far from a comeback |
+
+The case against the hard window: a bar's influence on the weights does
+not fade with age, it *grows* (the rest of the window is re-dealt around
+it) right up to the day it leaves the memory, then drops to zero on a bar
+that says nothing new. Tipping one round towards one expert of four and
+following the effect: under the window it moves 0.15 of weight the week
+before it drops out against 0.06 when fresh; discounted, 0.09 fresh and
+0.015 by the cut-off. Discounting also switches sooner after a change of
+leader (86 rounds instead of 124 on the noisy test in
+`DiscountedHedgeTests`), the floor sooner still (23). On the alternating
+trend / mean-reversion test series the floor also flips on pullbacks
+inside a trend: the learned direction followed 80-85 % of trend bars,
+against 100 % without it.
+
+The half-life was fixed *before* any out-of-sample run, so that the
+discounted evidence has the same mean age (~130 bars) as the window's
+(125): the two differ in the shape of the memory, not its length.
+
+**Out of sample it did not help, so the window stays the default.**
+Walk-forward (train 500, test 125, rolling, 5 bps a side) of every 4th
+`online` template (72: 24 trend, 24 countertrend, 24 learned), each
+learner on the same bars, OOS Sharpe per template on the span every
+learner can trade (bar 800 on):
+
+| data | window: median Sharpe | discounted - window | floored - window |
+|---|---|---|---|
+| S&P 500, daily 1999-2018 | -0.09 | -0.03 (42 % of templates better, p = 0.04) | -0.04 (38 %, p = 0.01) |
+| Nasdaq Composite, daily 1999-2018 | -0.22 | -0.05 (39 %, p = 0.002) | -0.06 (39 %, p = 0.008) |
+| GOOG, daily 2004-2013 | +0.34 | +0.04 (53 %, p = 0.25) | -0.05 (38 %, p = 0.12) |
+| the three pooled | -0.12 | -0.02 (44 %, p = 0.05) | -0.05 (38 %, p < 0.001) |
+| synthetic regime-switching, 2 seeds | -0.16 | +0.04 (62 %, p = 0.02) | +0.05 (61 %, p = 0.02) |
+
+(mean paired difference, Wilcoxon signed-rank p.) Discounting helps a
+little on the synthetic series, which switch regime by construction, and
+hurts a little on the real ones, mostly through the trend templates
+(-0.05, 31 % better, p < 0.001); the floor hurts the learned direction
+most (-0.13, 22 % better), as the test series predicted. A longer
+half-life (173 bars, the window's total weight) was no better (-0.05
+pooled, p = 0.001). An hourly EUR/USD series (5,000 bars) was also run
+but every learner lost ~4 Sharpe to costs, so it says nothing about the
+memory. The data are the samples bundled with the `arch` and
+`backtesting` packages (Yahoo was out of reach), which end in 2018.
+
+Every setting keeps the learner a function of a fixed number of past
+bars (it is re-run from a cold start over them), so a walk-forward
+window warmed on `walkforward.warmup_bars` of history matches a full-
+history run exactly. That buffer also allows `2 x max(HEDGE_LADDER)`
+bars for each expert to break out once: an expert holds the stance of
+its last breakout however old, and a run started later has no stance
+for it until the next break (on synthetic data the wait was at most 132
+bars; this affected the window learner too, and the exactness test only
+passed on its seed by luck).
+
+A spec written by `etf_dashboard.py research` records the setting in
+each slot's template; a spec from before it existed is read back with
+the `window` learner it was researched with.
 
 What it does and does not buy you. On a synthetic "long bull market
 with occasional sharp reversals" series the hedge family has a higher

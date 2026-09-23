@@ -66,6 +66,12 @@ class PipelineTests(unittest.TestCase):
             # which is exactly the rule that spec was researched with
             old = {k: v for k, v in slot["template"].items() if not k.startswith("vol_target")}
             self.assertEqual((StrategyTemplate(**old).vol_target, StrategyTemplate(**old).vol_target_n), (0.0, 60))
+            # the online learner the research used travels with the slot, and a spec from
+            # before the setting existed is read back with the window learner it was run with
+            self.assertEqual(tpl.hedge_learner, s["config"]["hedge_learner"])
+            self.assertEqual(ED._slot_template(slot).hedge_learner, s["config"]["hedge_learner"])
+            old = {k: v for k, v in slot["template"].items() if k != "hedge_learner"}
+            self.assertEqual(ED._slot_template(dict(slot, template=old)).hedge_learner, "window")
         self.assertAlmostEqual(sum(x["weight"] for x in s["slots"]), 1.0, places=6)
         for k in ("pbo_trials", "reality_check_p", "nested_sharpe", "dsr_best", "n_eff"):
             self.assertIn(k, s["diagnostics"])
