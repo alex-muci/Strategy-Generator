@@ -32,7 +32,7 @@ from robustness import (
 )
 from strategy import (
     annualized_sharpe, max_drawdown, periods_per_year, set_periods_per_year,
-    periods_per_year_for_interval,
+    periods_per_year_for_interval, SESSIONS,
 )
 from walkforward import matrix_cells, matrix_row, matrix_frame
 
@@ -49,6 +49,51 @@ def resolve_interval(interval: str, synthetic: bool) -> str:
     whatever --interval says; annualizing it at an intraday factor would
     inflate every Sharpe by the square root of the bars-per-day."""
     return SYNTHETIC_INTERVAL if synthetic else interval
+
+
+def resolve_bar_clock(args, synthetic: bool) -> list[str]:
+    """Pin args.interval and args.bars_per_year to the data the run will
+    actually load (see resolve_interval); returns a NOTE line per flag that
+    had to be ignored."""
+    notes = []
+    interval = resolve_interval(args.interval, synthetic)
+    if interval != args.interval:
+        notes.append(f"--interval {args.interval} ignored, the synthetic series is {interval} bars")
+        args.interval = interval
+    if synthetic and args.bars_per_year:
+        notes.append(f"--bars-per-year {args.bars_per_year} ignored, the synthetic series is {interval} bars")
+        args.bars_per_year = None
+    return notes
+
+
+def session_close(session: str) -> tuple[str, str]:
+    """(HH:MM, zone) at which a daily bar of `session` is final."""
+    return SESSIONS[session].close
+
+
+def observed_bars_per_year(index: pd.Index) -> float | None:
+    """Bars a year the data actually has, or None when it spans less than
+    four weeks (too short to tell a holiday from a missing session)."""
+    if len(index) < 2:
+        return None
+    days = (index[-1] - index[0]) / pd.Timedelta(days=1)
+    if days < 28:
+        return None
+    return (len(index) - 1) * 365.25 / days
+
+
+def bars_per_year_warning(index: pd.Index, ppy: int, tolerance: float = 0.25) -> str | None:
+    """A warning when the data's own bar rate and the annualization factor
+    disagree by more than `tolerance` either way -- hourly Brent (22-23 bars
+    a day) annualized as US cash hours (7), or a market that shares only
+    some of its bars with the others in a multi-asset run. Every annualized
+    Sharpe is then off by sqrt(ppy / observed)."""
+    seen = observed_bars_per_year(index)
+    if seen is None or abs(np.log(seen / ppy)) <= np.log(1 + tolerance):
+        return None
+    return (f"the data has about {seen:.0f} bars a year but is annualized at {ppy}, which scales "
+            f"every Sharpe by {np.sqrt(ppy / seen):.2f}x. Pick the market's --session "
+            f"({', '.join(SESSIONS)}) or set --bars-per-year.")
 
 
 def load_real(ticker: str, start: str, interval: str = "1d", now=None,
@@ -68,8 +113,9 @@ def cscv_partitions_for(T: int) -> int:
 def eval_config(args, interval: str) -> dict:
     """The evaluation settings of a research run, as a plain (picklable,
     JSON-able) dict read off an argparse namespace."""
+    ppy = args.bars_per_year or periods_per_year_for_interval(interval, args.session)
     return dict(
-        interval=interval, periods_per_year=periods_per_year_for_interval(interval),
+        interval=interval, session=args.session, periods_per_year=int(ppy),
         train_bars=args.train, test_bars=args.test, anchored=args.anchored,
         metric=args.metric, selection=args.selection, wide_grid=args.wide_grid,
         cost_bps=args.cost_bps, risk_pct=args.risk_pct, max_leverage=args.max_leverage,

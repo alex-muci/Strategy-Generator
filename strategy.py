@@ -115,15 +115,6 @@ import pandas as pd
 # Read it through periods_per_year() instead.
 PERIODS_PER_YEAR = 252
 
-# Regular-session bars per year for the intervals yfinance serves. US equity
-# ETFs trade 6.5h a day, which Yahoo cuts into seven '1h' bars (the last one is
-# a 30-minute stub), thirteen '30m' bars, and so on.
-BARS_PER_YEAR = {
-    "1mo": 12, "1wk": 52, "1d": 252,
-    "1h": 252 * 7, "60m": 252 * 7, "90m": 252 * 5,
-    "30m": 252 * 13, "15m": 252 * 26, "5m": 252 * 78, "1m": 252 * 390,
-}
-
 
 def periods_per_year() -> int:
     """Bars per year currently used for annualization."""
@@ -144,14 +135,59 @@ def set_periods_per_year(n: int) -> None:
     PERIODS_PER_YEAR = n
 
 
-def periods_per_year_for_interval(interval: str) -> int:
-    """Bars per year for a yfinance interval string ('1d', '1h', '30m', ...)."""
+@dataclass(frozen=True)
+class Session:
+    """When a market trades, as far as counting its bars goes.
+
+    `days_per_year` sessions of `hours_per_day` each; `close` is when the
+    session's daily bar is final (HH:MM, IANA zone). An intraday interval gets
+    ceil(session minutes / bar minutes) bars a day: Yahoo cuts the US cash
+    session's 6.5 hours into seven '1h' bars, the last a 30-minute stub."""
+    days_per_year: int
+    hours_per_day: float
+    close: tuple[str, str]
+
+
+# Counting ICE Brent's 22 hourly bars a day as the US cash session's seven
+# understates every Sharpe by sqrt(7/22) (about 0.56x), spreads every CAGR over
+# three times the years it took, and -- worst, since it is real money -- sizes
+# every vol-targeted entry sqrt(22/7) (about 1.8x) too big. Pick the session
+# of the market the bars come from; for anything else, --bars-per-year sets
+# the factor directly.
+SESSIONS = {
+    # NYSE/Nasdaq regular hours, 09:30-16:00 New York
+    "us_cash": Session(252, 6.5, ("16:00", "America/New_York")),
+    # CME Globex (WTI, equity index, treasury futures): 17:00-16:00 Chicago
+    "cme_globex": Session(252, 23.0, ("16:00", "America/Chicago")),
+    # ICE Futures Europe (Brent, gasoil): 01:00-23:00 London
+    "ice_europe": Session(252, 22.0, ("23:00", "Europe/London")),
+}
+DEFAULT_SESSION = "us_cash"
+
+INTERVAL_MINUTES = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "60m": 60, "1h": 60, "90m": 90}
+CALENDAR_BARS_PER_YEAR = {"1wk": 52, "1mo": 12}   # the same whatever the session
+INTERVALS = ("1mo", "1wk", "1d", "1h", "60m", "90m", "30m", "15m", "5m", "1m")
+
+
+def periods_per_year_for_interval(interval: str, session: str = DEFAULT_SESSION) -> int:
+    """Bars per year for a yfinance interval string ('1d', '1h', '30m', ...)
+    in one of the SESSIONS (default: the US cash session)."""
     try:
-        return BARS_PER_YEAR[interval]
+        s = SESSIONS[session]
     except KeyError:
-        raise ValueError(
-            f"unknown interval {interval!r}; known: {', '.join(BARS_PER_YEAR)}"
-        ) from None
+        raise ValueError(f"unknown session {session!r}; known: {', '.join(SESSIONS)}") from None
+    if interval == "1d":
+        return s.days_per_year
+    if interval in CALENDAR_BARS_PER_YEAR:
+        return CALENDAR_BARS_PER_YEAR[interval]
+    if interval not in INTERVAL_MINUTES:
+        raise ValueError(f"unknown interval {interval!r}; known: {', '.join(INTERVALS)}")
+    session_minutes = round(s.hours_per_day * 60)
+    return s.days_per_year * -(-session_minutes // INTERVAL_MINUTES[interval])
+
+
+# The US cash session's table, kept for callers that read it directly.
+BARS_PER_YEAR = {i: periods_per_year_for_interval(i) for i in INTERVALS}
 
 
 # --------------------------------------------------------------------------

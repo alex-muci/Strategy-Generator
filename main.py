@@ -39,11 +39,11 @@ import matplotlib.pyplot as plt
 from data import synthetic_ohlc
 from generator import generate_templates, FAMILIES
 from pipeline import (
-    resolve_interval, load_real, eval_config, worker_pool, evaluate_slots, walk_forward_matrices,
-    family_diagnostics, build_portfolios, finalist_stats, benchmark_stats,
+    resolve_bar_clock, load_real, eval_config, session_close, bars_per_year_warning,
+    worker_pool, evaluate_slots, walk_forward_matrices, family_diagnostics, build_portfolios, finalist_stats, benchmark_stats,
 )
 from portfolio import returns_frame
-from strategy import annualized_sharpe, max_drawdown, periods_per_year, BARS_PER_YEAR, SIDES
+from strategy import annualized_sharpe, max_drawdown, periods_per_year, INTERVALS, SESSIONS, DEFAULT_SESSION, SIDES
 
 
 def parse_args(argv=None):
@@ -55,9 +55,15 @@ def parse_args(argv=None):
                         "'both' for quick and default). On an asset with a drift, e.g. --sides long_only")
     p.add_argument("--real", metavar="TICKER", default=None, help="use yfinance data for TICKER instead of synthetic")
     p.add_argument("--start", default="2005-01-01")
-    p.add_argument("--interval", default="1d", choices=sorted(BARS_PER_YEAR),
-                   help="bar interval for --real; also sets the annualization factor "
+    p.add_argument("--interval", default="1d", choices=sorted(INTERVALS),
+                   help="bar interval for --real; with --session, sets the annualization factor "
                         "(ignored without --real: the synthetic series is daily)")
+    p.add_argument("--session", default=DEFAULT_SESSION, choices=list(SESSIONS),
+                   help="trading hours of the --real market, for bars per year and the daily close: "
+                        "us_cash (6.5h, ETFs), cme_globex (23h, e.g. CL=F, BZ=F), ice_europe (22h, ICE Brent)")
+    p.add_argument("--bars-per-year", type=int, default=None,
+                   help="annualization factor for --real data, overriding --interval/--session "
+                        "(e.g. a spread built from your own feed)")
     p.add_argument("--bars", type=int, default=3000, help="synthetic bars")
     p.add_argument("--seed", type=int, default=7)
     p.add_argument("--trend-prob", type=float, default=0.45, help="synthetic: probability a regime is trending")
@@ -97,20 +103,23 @@ def main(argv=None) -> dict:
     t0 = time.time()
     os.makedirs(args.out, exist_ok=True)
 
-    interval = resolve_interval(args.interval, synthetic=not args.real)
-    if interval != args.interval:
-        print(f"NOTE: --interval {args.interval} ignored, the synthetic series is {interval} bars")
-    args.interval = interval
+    for note in resolve_bar_clock(args, synthetic=not args.real):
+        print(f"NOTE: {note}")
+    interval = args.interval
     cfg = eval_config(args, interval)
 
     if args.real:
         print(f"Loading {args.real} ({interval} bars) from yfinance...")
-        df = load_real(args.real, start=args.start, interval=interval)
+        df = load_real(args.real, start=args.start, interval=interval,
+                       session_close=session_close(args.session))
     else:
         print(f"Loading synthetic regime-switching data (trend_prob={args.trend_prob}, trend_drift={args.trend_drift})...")
         df = synthetic_ohlc(n_bars=args.bars, seed=args.seed, trend_prob=args.trend_prob, trend_drift=args.trend_drift)
     print(f"Data: {len(df)} bars, {df.index[0].date()} to {df.index[-1].date()}, "
           f"annualizing at {cfg['periods_per_year']} bars/year")
+    warning = bars_per_year_warning(df.index, cfg["periods_per_year"])
+    if warning:
+        print(f"WARNING: {warning}")
 
     overrides = {"sides": args.sides} if args.sides else {}
     templates = generate_templates(args.family, max_templates=args.max_templates, **overrides)
@@ -379,9 +388,12 @@ def _report(df, results, port, nested, fam, finalists, bench, args):
     # ---- written summary ----
     L = []
     L.append("# Ranger-style strategy generator -- run report\n\n")
-    L.append(f"Data: {len(df)} bars, {df.index[0].date()} to {df.index[-1].date()}"
-             f" ({'yfinance ' + args.real + ' ' + args.interval if args.real else 'synthetic'}),"
+    source = f"yfinance {args.real} {args.interval}, {args.session} session" if args.real else "synthetic"
+    L.append(f"Data: {len(df)} bars, {df.index[0].date()} to {df.index[-1].date()} ({source}),"
              f" annualized at {periods_per_year()} bars/year\n\n")
+    warning = bars_per_year_warning(df.index, periods_per_year())
+    if warning:
+        L.append(f"**Warning:** {warning}\n\n")
     L.append(f"Walk-forward: train={args.train} test={args.test} bars, {'anchored' if args.anchored else 'rolling'}, "
              f"parameter selection = {args.selection}, objective = {args.metric}, costs = {args.cost_bps} bps/side\n\n")
     L.append(f"Templates generated: {len(results)} (family '{args.family}'); parameter trials: {fam['n_trials']}\n\n")

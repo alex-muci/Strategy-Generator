@@ -57,6 +57,38 @@ Outputs land in `./outputs/` (or `--out DIR`):
 | `report.md` | written summary with all the numbers, including the **buy & hold benchmark**: Sharpe, CAGR and drawdown of simply holding the asset over the same OOS bars, the nested portfolio's beta and correlation to it and its information ratio (what is left after the asset's own drift is removed), and how many templates beat holding at all |
 
 
+## Intraday bars and other markets
+
+Every annualized number (Sharpe, CAGR, Walk-Forward Efficiency, DSR, MinBTL,
+the vol-target sizing) needs to know how many bars make a year, and for
+intraday bars that depends on how long the market trades each day. `--session`
+says which market the bars come from (`strategy.SESSIONS`):
+
+| `--session` | hours a day | `1h` bars a year | daily bar final at |
+|---|---|---|---|
+| `us_cash` (default) | 6.5 (Yahoo: 7 hourly bars, the last a stub) | 1,764 | 16:00 New York |
+| `cme_globex` | 23 | 5,796 | 16:00 Chicago |
+| `ice_europe` | 22 | 5,544 | 23:00 London |
+
+```bash
+python main.py --real BZ=F --interval 1h --session cme_globex --start 2025-01-01   # Yahoo's BZ=F is NYMEX Brent, on Globex
+python main.py --real CL=F --interval 1h --session cme_globex --start 2025-01-01
+python main.py --real MY_SPREAD --interval 1h --bars-per-year 5600               # anything else: set the factor directly
+```
+
+Getting it wrong is not cosmetic. Hourly Brent counted as US cash hours reports
+every Sharpe at 0.56x, spreads every CAGR over three times the years it took,
+and sizes every `--vol-target` entry about 1.8x too big. So each run also counts
+the bars a year the data actually has, and prints (and puts in `report.md`) a
+warning when that is more than 25% away from the factor in use: a wrong
+`--session`, or a multi-asset run whose markets only share some of their hours.
+Daily and longer bars annualize the same in every session (252, 52, 12); the
+session then only decides when today's daily bar counts as closed.
+
+Yahoo keeps about 730 days of `1h` history and 60 days of finer bars, so
+window lengths are in bars, not days: `--train 500` on hourly Brent is about
+23 trading days.
+
 ## Trading it: the ETF dashboard
 
 `main.py` answers "would this have worked?". `etf_dashboard.py` answers "what do
@@ -91,7 +123,8 @@ daily bar counts as closed 15 minutes after the 16:00 New York bell
 bars, so the European morning works as well.
 
 Add `--interval 1h` to both phases for hourly bars; every annualized statistic
-follows the bar frequency (`strategy.BARS_PER_YEAR`).
+follows the bar frequency and the research's `--session` (see *Intraday bars
+and other markets*), which `portfolio.json` keeps for the signals phase.
 
 What the dashboard shows, in the order you need it:
 
@@ -234,6 +267,8 @@ strategy.py     Indicators (ATR, Donchian, Keltner, Bollinger, the AdaHedge
                 close-of-bar mark-to-market). The
                 bar loop is Numba-compiled (pure-Python fallback if numba
                 is missing) and indicator arrays are cached per slice.
+                Also the annualization factor: bars a year per interval
+                and market session (SESSIONS).
 
 generator.py    Builds families of templates (quick / default / full)
                 and the lattice parameter grid for each one.
@@ -256,8 +291,9 @@ portfolio.py    Candidate filter (Sharpe / windows / Pardo), greedy or
 pipeline.py     The research orchestration main.py and etf_dashboard.py share:
                 the pool workers (slot evaluation, walk-forward matrix cells),
                 family diagnostics, static + nested portfolios, finalist
-                statistics, the buy-and-hold benchmark, and loading real data
-                without its forming bar. Every number both entry points
+                statistics, the buy-and-hold benchmark, loading real data
+                without its forming bar, and checking the data's own bar rate
+                against the annualization factor. Every number both entry points
                 report is computed here, once.
 
 main.py         Single-asset research run: everything in a process pool,

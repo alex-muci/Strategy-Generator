@@ -71,13 +71,13 @@ from live import (
     portfolio_targets, trade_list, utcnow,
 )
 from pipeline import (
-    resolve_interval, load_real, eval_config, worker_pool, evaluate_slots,
-    family_diagnostics, build_portfolios, finalist_stats, sizing_text,
+    resolve_bar_clock, load_real, eval_config, session_close, bars_per_year_warning,
+    worker_pool, evaluate_slots, family_diagnostics, build_portfolios, finalist_stats, sizing_text,
 )
 from portfolio import returns_frame
 from strategy import (
     StrategyTemplate, annualized_sharpe, max_drawdown, set_periods_per_year, periods_per_year,
-    periods_per_year_for_interval, SIDES, BARS_PER_YEAR,
+    periods_per_year_for_interval, SIDES, INTERVALS, SESSIONS, DEFAULT_SESSION,
 )
 from futures_map import (
     CONTRACTS, LISTINGS, FX_SYMBOLS, HEDGE_RATIO_BARS, QUOTES_STALE_DAYS,
@@ -102,8 +102,8 @@ def parse_args(argv=None):
 
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--state-dir", default="state", help="where portfolio.json etc. live")
-    common.add_argument("--interval", default="1d", choices=sorted(BARS_PER_YEAR),
-                        help="bar interval; also sets the annualization factor")
+    common.add_argument("--interval", default="1d", choices=sorted(INTERVALS),
+                        help="bar interval; with the research's --session, sets the annualization factor")
     common.add_argument("--synthetic", action="store_true",
                         help="use synthetic data instead of yfinance (for trying the "
                              "wiring out without a data feed)")
@@ -112,6 +112,12 @@ def parse_args(argv=None):
     r = sub.add_parser("research", parents=[common], help="decide what to trade (slow)")
     r.add_argument("--assets", nargs="+", default=["SPY", "TLT", "GLD", "QQQ"])
     r.add_argument("--start", default="2010-01-01")
+    r.add_argument("--session", default=DEFAULT_SESSION, choices=list(SESSIONS),
+                   help="trading hours of the assets, for bars per year and the daily close: us_cash "
+                        "(6.5h, ETFs), cme_globex (23h, e.g. CL=F, BZ=F), ice_europe (22h, ICE Brent). "
+                        "Frozen in portfolio.json for the signals phase")
+    r.add_argument("--bars-per-year", type=int, default=None,
+                   help="annualization factor, overriding --interval/--session")
     r.add_argument("--family", default="quick", choices=list(FAMILIES))
     r.add_argument("--max-templates", type=int, default=None)
     r.add_argument("--sides", nargs="+", default=None, choices=SIDES,
@@ -173,7 +179,8 @@ def parse_args(argv=None):
 # data
 # ==========================================================================
 
-def load_assets(assets, *, interval, start, synthetic, bars, now=None, quiet=False) -> dict:
+def load_assets(assets, *, interval, start, synthetic, bars, now=None, quiet=False,
+                default_close=None) -> dict:
     """Load every asset and put them on ONE shared bar index.
 
     The nested walk-forward portfolio needs a single list of window boundaries,
@@ -181,6 +188,9 @@ def load_assets(assets, *, interval, start, synthetic, bars, now=None, quiet=Fal
     about which days exist, their windows would not line up and the selection
     step would be comparing misaligned segments. Intersecting the indices up
     front costs a few holidays and makes every slot directly comparable.
+
+    `default_close` is the (HH:MM, zone) a daily bar is final at for an asset
+    with no LISTINGS entry (default: the New York close).
     """
     raw = {}
     for i, a in enumerate(assets):
@@ -190,7 +200,7 @@ def load_assets(assets, *, interval, start, synthetic, bars, now=None, quiet=Fal
             raw[a] = synthetic_ohlc(n_bars=bars, seed=100 + 7 * i, trend_prob=0.45 + 0.05 * i)
         else:
             raw[a] = load_real(a, start=start, interval=interval, now=now,
-                               session_close=None if listing is None else listing.session_close)
+                               session_close=default_close if listing is None else listing.session_close)
         if not quiet:
             print(f"  {a}: {len(raw[a])} bars, {raw[a].index[0].date()} to {raw[a].index[-1].date()}")
         if listing is not None and not synthetic and listing.currency != "USD":
@@ -239,11 +249,20 @@ def _history_bars_needed(spec: dict) -> int:
     return int(spec["config"]["train_bars"] * 1.25) + 400
 
 
-def _start_for_bars(n_bars: int, interval: str) -> str:
-    """A start date comfortably older than `n_bars` bars ago."""
-    per_year = periods_per_year_for_interval(interval)
-    years = n_bars / per_year * 1.6 + 0.5
-    return (utcnow() - pd.Timedelta(days=365.25 * years)).strftime("%Y-%m-%d")
+# Yahoo serves intraday history this many days back; an older start is an
+# error (no data at all), not a shorter answer.
+YAHOO_INTRADAY_DAYS = {"1m": 7, "5m": 60, "15m": 60, "30m": 60, "90m": 60, "60m": 730, "1h": 730}
+
+
+def _start_for_bars(n_bars: int, interval: str, per_year: int | None = None) -> str:
+    """A start date comfortably older than `n_bars` bars ago, at `per_year`
+    bars a year (default: the US cash session's, the fewest a day, so the
+    earliest start), but never older than Yahoo keeps for the interval."""
+    per_year = periods_per_year_for_interval(interval) if per_year is None else per_year
+    days = 365.25 * (n_bars / per_year * 1.6 + 0.5)
+    if interval in YAHOO_INTRADAY_DAYS:
+        days = min(days, YAHOO_INTRADAY_DAYS[interval] - 1)
+    return (utcnow() - pd.Timedelta(days=days)).strftime("%Y-%m-%d")
 
 
 # ==========================================================================
@@ -254,15 +273,14 @@ def research(args) -> dict:
     t0 = time.time()
     sides_map = _parse_sides_map(args.sides_map, args.assets)
     os.makedirs(args.state_dir, exist_ok=True)
-    interval = resolve_interval(args.interval, args.synthetic)
-    if interval != args.interval:
-        print(f"NOTE: --interval {args.interval} ignored, the synthetic series is {interval} bars")
-    args.interval = interval
+    for note in resolve_bar_clock(args, args.synthetic):
+        print(f"NOTE: {note}")
 
     print(f"Loading {len(args.assets)} assets ({args.interval} bars)"
           f"{' [synthetic]' if args.synthetic else ''}...")
     data = load_assets(args.assets, interval=args.interval, start=args.start,
-                       synthetic=args.synthetic, bars=args.bars)
+                       synthetic=args.synthetic, bars=args.bars,
+                       default_close=session_close(args.session))
     n_bars = len(next(iter(data.values())))
     if n_bars < args.train + 2 * args.test:
         raise SystemExit(
@@ -285,6 +303,9 @@ def research(args) -> dict:
         min_sharpe=args.min_sharpe, corr_ceiling=args.corr_ceiling,
         weighting=args.weighting, select_method=args.select_method,
     )
+    warning = bars_per_year_warning(next(iter(data.values())).index, cfg["periods_per_year"])
+    if warning:
+        print(f"WARNING: {warning}")
     jobs = [(f"{a}|{t.name}", a, t) for a in args.assets for t in templates_for(a)]
     print(f"{len(templates_for(args.assets[0]))} templates x {len(args.assets)} assets = {len(jobs)} slots; "
           f"walk-forward train={args.train} test={args.test} "
@@ -598,9 +619,11 @@ def signals(args) -> dict:
     need = _history_bars_needed(spec)
     print(f"Loading {len(spec['assets'])} assets, {need}+ bars of {interval} history"
           f"{' [synthetic]' if args.synthetic else ''}...")
+    # a spec written before --session existed was researched on US cash hours
     data = load_assets(spec["assets"], interval=interval,
-                       start=_start_for_bars(need, interval), synthetic=args.synthetic,
-                       bars=max(args.bars, need + 200), now=now)
+                       start=_start_for_bars(need, interval, cfg["periods_per_year"]),
+                       synthetic=args.synthetic, bars=max(args.bars, need + 200), now=now,
+                       default_close=session_close(cfg.get("session", DEFAULT_SESSION)))
     have = len(next(iter(data.values())))
     if have < need:
         print(f"  WARNING: {have} shared bars, wanted {need}; refits use what is there")

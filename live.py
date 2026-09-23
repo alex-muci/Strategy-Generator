@@ -33,7 +33,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from strategy import StrategyTemplate, backtest, periods_per_year
+from strategy import StrategyTemplate, backtest, periods_per_year, SESSIONS, DEFAULT_SESSION
 from walkforward import grid_combos, optimize_window, warmup_bars
 
 
@@ -46,7 +46,7 @@ def utcnow() -> pd.Timestamp:
     return pd.Timestamp.now("UTC").tz_convert(None)
 
 
-SESSION_CLOSE = ("16:00", "America/New_York")   # regular close of the US cash session
+SESSION_CLOSE = SESSIONS[DEFAULT_SESSION].close   # 16:00 New York, the regular close of the US cash session
 SESSION_CLOSE_GRACE = pd.Timedelta(minutes=15)  # Yahoo's last print is delayed and settles after the auction
 
 

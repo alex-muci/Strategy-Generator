@@ -648,7 +648,8 @@ def _diagnostics_section(spec: dict) -> str:
     rows = [[_e(k), f'<span class="num">{v}</span>', f'<span class="muted">{n}</span>']
             for k, v, n in items]
     cfg = (f'Research run {_e(spec["created"])} on {_e(", ".join(spec["assets"]))}, '
-           f'{_e(c["interval"])} bars from {_e(c["start"])}, family '
+           f'{_e(c["interval"])} bars ({_e(c.get("session", "us_cash"))} session) '
+           f'from {_e(c["start"])}, family '
            f'<b>{_e(c["family"])}</b>. Walk-forward train={c["train_bars"]} test='
            f'{c["test_bars"]} {"anchored" if c["anchored"] else "rolling"}, '
            f'{_e(c["selection"])} parameter selection, {_n(c["cost_bps"], 1)} bps/side costs, '
