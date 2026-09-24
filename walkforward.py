@@ -22,7 +22,8 @@ What is here beyond the textbook loop:
   set surrounded by good neighbours is far more likely to survive OOS.
 * Pardo's Walk-Forward Efficiency (annualized OOS return / annualized
   IS return) and his acceptance criteria: WFE >= 50 %, a majority of
-  profitable OOS windows, OOS profitable overall.
+  profitable OOS windows (a skipped, flat window counts as not
+  profitable), OOS profitable overall.
 * a walk-forward MATRIX (Pardo) / "WFO profile" (financial-hacker):
   the same template re-run over a grid of train/test lengths -- a robust
   template is profitable across most cells, not only at one setting.
@@ -395,8 +396,11 @@ def summarize_walk_forward(windows: list, oos_returns: pd.Series) -> dict:
     # the ratio meaningless either way.
     wfe = float(np.clip(oos_ann_mean / is_ann_mean, -10, 10)) if is_ann_mean > 0 else np.nan
 
+    # share of ALL OOS windows that made money: a skipped window (the optimizer
+    # found no tradeable fit, so the book sat flat) did not, and counting only
+    # the live ones would let 3 lucky windows out of 11 read as "100 %"
     profitable = np.array([w["oos_stats"]["total_return"] > 0 for w in live])
-    pct_profitable = float(profitable.mean())
+    pct_profitable = float(profitable.sum() / n_win)
     changes = [w["params_changed"] for w in live[1:]]
     param_change_rate = float(np.mean(changes)) if changes else 0.0
     is_mean = float(is_sharpes.mean())

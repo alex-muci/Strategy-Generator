@@ -30,12 +30,13 @@ from walkforward import (  # noqa: E402
 )
 from robustness import (  # noqa: E402
     evaluate_template, trial_returns, cscv_block_stats, merge_block_stats, cscv_pbo,
-    expected_max_sharpe, min_backtest_length,
+    expected_max_sharpe, min_backtest_length, cpcv, cpcv_embargo,
 )
 from portfolio import (  # noqa: E402
     select_portfolio, select_subset, portfolio_weights, walk_forward_portfolio, candidate_table,
-    returns_frame,
+    returns_frame, trade_count_proxy,
 )
+from strategy import StrategyTemplate, HEDGE_LADDER  # noqa: E402
 
 
 class EvaluateTemplateTests(unittest.TestCase):
@@ -312,6 +313,145 @@ class NestedSelectionTests(unittest.TestCase):
     def test_too_little_history_is_an_empty_portfolio(self):
         out = walk_forward_portfolio(self.rets, self.bounds[:3], min_sharpe=-10)
         self.assertEqual((len(out["portfolio_returns"]), len(out["portfolio_equity"]), out["sharpe"]), (0, 0, 0.0))
+
+
+
+class CpcvSelectionRuleTests(unittest.TestCase):
+    """CPCV must stress the walk-forward's OWN selection rule."""
+
+    @staticmethod
+    def _two_trials(T=1200):
+        rng = np.random.default_rng(0)
+        R = np.column_stack([rng.normal(0.001, 0.005, T),      # the better Sharpe
+                             rng.normal(0.0005, 0.01, T)])     # the better profit factor
+        E = np.zeros((T, 2), dtype=np.int8)
+        P = np.zeros((T, 2))
+        for t in range(0, T, 20):
+            E[t, :] = 1
+            P[t + 10, 0] = 100.0 if (t // 20) % 2 else -100.0   # PF 1
+            P[t + 10, 1] = 500.0 if (t // 20) % 4 else -50.0    # PF 30
+        return R, E, P
+
+    def test_the_metric_picks_the_trial(self):
+        R, E, P = self._two_trials()
+        kw = dict(n_groups=6, k_test=2, embargo_bars=10, selection="best")
+        self.assertTrue((cpcv(R, E, **kw)["chosen_trials"] == 0).all())
+        self.assertTrue((cpcv(R, E, metric="profit_factor", P=P, **kw)["chosen_trials"] == 1).all())
+        with self.assertRaises(ValueError):
+            cpcv(R, E, metric="profit_factor", **kw)
+
+    def test_evaluate_template_passes_metric_and_min_trades(self):
+        df = synthetic_ohlc(900, seed=13)
+        tpl = generate_templates("quick", max_templates=1)[0]
+        grid = param_grid_for(tpl)
+        combos, idx = grid_combos(grid)
+        R, E, P = trial_returns(df, tpl, combos, with_pnl=True)
+        for metric, mt in (("profit_factor", 5), ("return_over_dd", 8)):
+            res = evaluate_template(df, tpl, grid, train_bars=300, test_bars=100, cpcv_groups=6, cpcv_k=2,
+                                    cscv_partitions_n=8, metric=metric, min_trades=mt)
+            ref = cpcv(R, E, idx, n_groups=6, k_test=2, embargo_bars=cpcv_embargo(tpl, combos),
+                       metric=metric, min_trades=mt, P=P)
+            np.testing.assert_allclose(res["cpcv"]["path_sharpes"], ref["path_sharpes"])
+
+    def test_nothing_trades_enough_stays_flat(self):
+        """walk_forward sits flat when no parameter set has min_trades in
+        training; CPCV used to trade the best raw Sharpe anyway."""
+        T = 600
+        R = np.zeros((T, 3))
+        R[:, 1] = np.random.default_rng(0).normal(0.002, 0.01, T)
+        E = np.zeros((T, 3), dtype=np.int8)
+        E[[10, 400], 1] = 1                                       # 2 trades in the whole history
+        out = cpcv(R, E, n_groups=6, k_test=2, min_trades=5, selection="best")
+        self.assertTrue((out["chosen_trials"] == -1).all())
+        self.assertTrue((out["path_returns"] == 0.0).all())
+        self.assertEqual(out["sharpe_mean"], 0.0)
+
+    def test_embargo_follows_the_grid_not_the_default(self):
+        tpl = StrategyTemplate("t", n_entry=20, n_exit=10)
+        combos, _ = grid_combos({"n_entry": [20, 40, 60], "n_exit": [10, 20]})
+        self.assertEqual(cpcv_embargo(tpl, combos), 120)
+        combos, _ = grid_combos({"n_entry": [10], "n_exit": [30]})
+        self.assertEqual(cpcv_embargo(tpl, combos), 60)             # channel exit longer than entry
+        self.assertEqual(cpcv_embargo(tpl.with_params(exit_style="atr_trail"), combos), 20)
+        ladder = 2 * max(HEDGE_LADDER)
+        self.assertEqual(cpcv_embargo(StrategyTemplate("h", channel_type="hedge", n_entry=500), [{}]), ladder)
+        self.assertEqual(cpcv_embargo(StrategyTemplate("l", direction_logic="learned", n_entry=10), [{}]), ladder)
+
+
+class FilterEvidenceTests(unittest.TestCase):
+    def test_min_windows_counts_live_windows(self):
+        """Every template on the same bars has the same n_windows, so a filter
+        on it let templates that never found a tradeable fit through."""
+        res = _fake_results({"live": (0.002, dict(n_live_windows=8)),
+                             "dead": (0.002, dict(n_live_windows=1))})
+        q = select_portfolio(res, min_sharpe=0.0, min_windows=3)["qualifying"]
+        self.assertEqual(q, ["live"])
+
+    def test_trade_count_proxy(self):
+        r = pd.DataFrame({"a": [0, .01, -.01, 0, 0, .02, 0, .01], "b": [0.0] * 8, "c": [.01] * 8})
+        self.assertEqual(trade_count_proxy(r).to_dict(), {"a": 3, "b": 0, "c": 1})
+
+    def test_min_trades_proxy_is_applied(self):
+        rng = np.random.default_rng(3)
+        idx = pd.bdate_range("2015-01-01", periods=1000)
+        busy = rng.normal(0.001, 0.01, 1000) * (np.arange(1000) % 10 < 5)   # 100 holding runs
+        lazy = np.zeros(1000); lazy[20:] = rng.normal(0.003, 0.01, 980)      # one long run
+        rets = pd.DataFrame({"busy": busy, "lazy": lazy}, index=idx)
+        bounds = list(idx[::100])
+        free = walk_forward_portfolio(rets, bounds, min_sharpe=0.0)
+        self.assertIn("lazy", {c for s in free["selections"] for c in s["selected"]})
+        strict = walk_forward_portfolio(rets, bounds, min_sharpe=0.0, min_trades_proxy=10)
+        self.assertNotIn("lazy", {c for s in strict["selections"] for c in s["selected"]})
+
+
+class NestedCausalFilterTests(unittest.TestCase):
+    """The nested selection applies the static filter, with its evidence taken
+    only from walk-forward windows whose OOS period ended before the block."""
+
+    def setUp(self):
+        rng = np.random.default_rng(5)
+        self.idx = pd.bdate_range("2015-01-01", periods=1000)
+        self.bounds = list(self.idx[::100])
+        self.rets = pd.DataFrame(rng.normal(0.001, 0.01, (1000, 2)), columns=["a", "b"], index=self.idx)
+
+    def _windows(self, trades, profitable=True, is_ret=0.05):
+        """One window per boundary; trades[k] OOS trades in window k (0 -> skipped)."""
+        out = []
+        for k, b in enumerate(self.bounds):
+            end = self.idx[min(self.idx.get_loc(b) + 99, len(self.idx) - 1)]
+            if trades[k] == 0:
+                out.append(dict(skipped=True, test_start=b, test_end=end))
+                continue
+            out.append(dict(skipped=False, test_start=b, test_end=end, params_changed=False,
+                            is_stats=dict(total_return=is_ret, sharpe=1.0, n_bars=300),
+                            oos_stats=dict(total_return=0.02 if profitable else -0.02, n_trades=trades[k],
+                                           n_bars=100)))
+        return out
+
+    def _picks(self, windows, **kw):
+        out = walk_forward_portfolio(self.rets, self.bounds, min_sharpe=-10, windows=windows,
+                                     min_trades=10, min_windows=3, **kw)
+        return {s["period_start"]: set(s["selected"]) for s in out["selections"]}
+
+    def test_evidence_accumulates_only_from_ended_windows(self):
+        late = [0] * 6 + [5] * 4                    # trades only from window 6 on
+        picks = self._picks({"a": self._windows([5] * 10), "b": self._windows(late)})
+        for k in range(4, 10):
+            # b needs 3 live windows and 10 trades that ENDED before bounds[k]:
+            # windows 6, 7, 8 -> first eligible at bounds[9]
+            self.assertEqual("b" in picks[self.bounds[k]], k >= 9, k)
+            self.assertIn("a", picks[self.bounds[k]])
+
+    def test_require_pardo_uses_past_windows(self):
+        w = {"a": self._windows([5] * 10), "b": self._windows([5] * 10, profitable=False)}
+        picks = self._picks(w, require_pardo=True)
+        self.assertTrue(all("b" not in p for p in picks.values()))
+        self.assertTrue(all("a" in p for p in picks.values()))
+        # a future window's numbers must not matter: make b's last windows great
+        w["b"] = self._windows([5] * 10, profitable=False)[:6] + self._windows([5] * 10)[6:]
+        picks2 = self._picks(w, require_pardo=True)
+        for k in range(4, 7):
+            self.assertEqual(picks[self.bounds[k]], picks2[self.bounds[k]])
 
 
 if __name__ == "__main__":

@@ -18,10 +18,11 @@ this module:
 The catch -- and the reason for `walk_forward_portfolio` -- is that
 step 1-3 look at the WHOLE out-of-sample history. Selecting the best of
 hundreds of "OOS" curves makes the resulting portfolio curve in-sample
-again. The nested walk-forward re-runs the selection at every window
-boundary using only the OOS history available up to then and applies
-it to the next window: a "doubly out-of-sample" curve, which is the
-honest number to quote.
+again. The nested walk-forward re-runs the selection -- the same
+candidate filter, recomputed from the walk-forward windows that had
+ended by then -- at every window boundary using only the OOS history
+available up to then and applies it to the next window: a "doubly
+out-of-sample" curve, which is the honest number to quote.
 """
 
 from __future__ import annotations
@@ -32,6 +33,12 @@ from scipy.spatial.distance import squareform
 
 from strategy import annualized_sharpe
 from robustness import hrp_weights
+from walkforward import summarize_walk_forward
+
+# the static filter's evidence thresholds, shared with the nested selection
+# (pipeline.build_portfolios passes them to both)
+MIN_TRADES = 10
+MIN_WINDOWS = 3
 
 
 def returns_frame(wfa_results: dict) -> pd.DataFrame:
@@ -52,7 +59,11 @@ def candidate_table(wfa_results: dict, rets: pd.DataFrame) -> pd.DataFrame:
             oos_sharpe=annualized_sharpe(rets[name]) if name in rets.columns else 0.0,
             oos_cagr=s["oos_cagr"], oos_max_dd=s["oos_max_drawdown"],
             wfe=s["wfe"], pct_profitable_windows=s["pct_profitable_windows"],
-            n_windows=s["n_windows"], n_trades_oos=s["n_trades_oos"],
+            n_windows=s["n_windows"],
+            # windows the optimizer found a tradeable fit in; `n_windows` is the
+            # same for every template on the same bars, so it filters nothing
+            n_live_windows=s.get("n_live_windows", s["n_windows"]),
+            n_trades_oos=s["n_trades_oos"],
             param_change_rate=s["param_change_rate"], pardo_pass=s["pardo_pass"],
             oos_exposure=s.get("oos_exposure", np.nan),
             oos_notional=s.get("oos_notional", np.nan),
@@ -63,7 +74,8 @@ def candidate_table(wfa_results: dict, rets: pd.DataFrame) -> pd.DataFrame:
 
 def _qualifying(table: pd.DataFrame, min_sharpe, min_windows, require_pardo, min_wfe, min_trades,
                 available=None):
-    q = (table["oos_sharpe"] >= min_sharpe) & (table["n_windows"] >= min_windows) & (table["n_trades_oos"] >= min_trades)
+    q = ((table["oos_sharpe"] >= min_sharpe) & (table["n_live_windows"] >= min_windows)
+         & (table["n_trades_oos"] >= min_trades))
     if require_pardo:
         q &= table["pardo_pass"]
     if min_wfe is not None:
@@ -132,8 +144,8 @@ def portfolio_weights(rets: pd.DataFrame, weighting: str = "equal") -> pd.Series
 def select_portfolio(
     wfa_results: dict,
     min_sharpe: float = 0.2,
-    min_windows: int = 3,
-    min_trades: int = 10,
+    min_windows: int = MIN_WINDOWS,
+    min_trades: int = MIN_TRADES,
     max_strategies: int = 8,
     corr_ceiling: float = 0.6,
     require_pardo: bool = False,
@@ -170,6 +182,34 @@ def select_portfolio(
     )
 
 
+def trade_count_proxy(rets: pd.DataFrame) -> pd.Series:
+    """Trades per column estimated from returns alone: the number of runs of
+    non-zero returns. A strategy that is flat earns exactly 0 on the bar, so
+    each holding period shows up as one run (a held bar on which the price
+    did not move splits a run, and back-to-back trades merge: an estimate)."""
+    active = rets.fillna(0.0).ne(0.0)
+    return (active & ~active.shift(1, fill_value=False)).sum()
+
+
+def _causal_filter(cands: list, hist: pd.DataFrame, windows: dict, start, min_trades: int,
+                   min_windows: int, require_pardo: bool, min_wfe) -> list:
+    """The static filter (trades, live windows, Pardo, WFE) with every number
+    recomputed from the walk-forward windows whose OOS period ENDED before
+    `start`, and the OOS returns up to then."""
+    keep = []
+    for c in cands:
+        past = [w for w in windows.get(c, []) if w.get("test_end") is not None and w["test_end"] < start]
+        s = summarize_walk_forward(past, hist[c])
+        if s["n_trades_oos"] < min_trades or s["n_live_windows"] < min_windows:
+            continue
+        if require_pardo and not s["pardo_pass"]:
+            continue
+        if min_wfe is not None and not (np.isfinite(s["wfe"]) and s["wfe"] >= min_wfe):
+            continue
+        keep.append(c)
+    return keep
+
+
 def walk_forward_portfolio(
     rets: pd.DataFrame,
     boundaries: list,
@@ -181,6 +221,12 @@ def walk_forward_portfolio(
     method: str = "greedy",
     weighting: str = "equal",
     initial_equity: float = 100_000.0,
+    *,
+    windows: dict | None = None,
+    min_trades: int = 0,
+    min_windows: int = 0,
+    require_pardo: bool = False,
+    min_wfe: float | None = None,
 ) -> dict:
     """Nested walk-forward of the PORTFOLIO SELECTION itself.
 
@@ -190,6 +236,19 @@ def walk_forward_portfolio(
     the next window. Nothing about the future enters the choice, so the
     resulting curve is out-of-sample with respect to both the parameter
     optimization and the template selection.
+
+    The candidate filter:
+      min_sharpe        OOS Sharpe of the history so far
+      min_trades_proxy  trades so far as estimated from the returns alone
+                        (`trade_count_proxy`: runs of non-zero returns); for
+                        callers that have no walk-forward windows
+      windows           {name: walk_forward()["windows"]}; when given, the
+                        static filter's evidence is recomputed from the
+                        windows whose OOS period ended before the block:
+                        `min_trades` OOS trades and `min_windows` live windows
+                        SO FAR, and optionally Pardo's criteria / a min WFE
+                        (see select_portfolio). Counts accumulate, so early
+                        blocks face a stricter bar than the full-history filter.
     """
     boundaries = sorted(set(boundaries))
     parts, log = [], []
@@ -200,7 +259,12 @@ def walk_forward_portfolio(
         if len(hist) < 60:
             continue
         sharpes = hist.apply(annualized_sharpe)
-        cands = list(sharpes.index[sharpes >= min_sharpe])
+        ok = sharpes >= min_sharpe
+        if min_trades_proxy > 0:
+            ok &= trade_count_proxy(hist) >= min_trades_proxy
+        cands = list(sharpes.index[ok])
+        if windows is not None:
+            cands = _causal_filter(cands, hist, windows, start, min_trades, min_windows, require_pardo, min_wfe)
         sel = select_subset(hist, cands, method, max_strategies, corr_ceiling)
         block = rets.loc[start:end] if end is None else rets.loc[start: end - pd.Timedelta(nanoseconds=1)]
         if not sel or block.empty:

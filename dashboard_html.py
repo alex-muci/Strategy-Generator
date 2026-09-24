@@ -253,9 +253,17 @@ def _signed_cls(v) -> str:
     return "pos" if v > 0 else ("neg" if v < 0 else "")
 
 
-def _ts(x) -> str:
+def _utc_naive(x) -> pd.Timestamp:
+    """The project's clock (`data._naive_index`): naive UTC. An aware stamp is
+    converted, so a feed or a state file that kept its zone cannot break the
+    arithmetic against `utcnow()`."""
     t = pd.Timestamp(x)
-    return t.strftime("%Y-%m-%d %H:%M") if (t.hour or t.minute) else t.strftime("%Y-%m-%d")
+    return t.tz_convert("UTC").tz_localize(None) if t.tz is not None else t
+
+
+def _ts(x) -> str:
+    t = _utc_naive(x)
+    return t.strftime("%Y-%m-%d %H:%M UTC") if (t.hour or t.minute) else t.strftime("%Y-%m-%d")
 
 
 def _table(headers, rows, left_cols=(0,), empty="nothing to show") -> str:
@@ -694,7 +702,7 @@ def render_dashboard(spec, states, targets, trades, run, path=None,
     n_orders = sum(len(s["entry_orders"]) for s in states)
     n_trades = int((trades["action"] != "hold").sum()) if len(trades) else 0
     stale = ""
-    age = utcnow() - pd.Timestamp(run["as_of"])
+    age = utcnow() - _utc_naive(run["as_of"])
     if age > pd.Timedelta(days=4):
         stale = (f' <span class="neg">⚠ the newest closed bar is {age.days} days old '
                  f'– check the data feed</span>')
@@ -794,7 +802,7 @@ def render_dashboard(spec, states, targets, trades, run, path=None,
   </footer>
 </div>
 """
-    title = f"ETF dashboard – {pd.Timestamp(run['as_of']).strftime('%Y-%m-%d')}"
+    title = f"ETF dashboard – {_utc_naive(run['as_of']).strftime('%Y-%m-%d')}"
     inner = f"<title>{_e(title)}</title>\n<style>{STYLE}</style>\n{body}"
     out = inner if not full_document else (
         "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n"

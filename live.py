@@ -155,6 +155,26 @@ def refit_params(
     )
 
 
+def as_index_time(ts, index: pd.Index) -> pd.Timestamp:
+    """`ts` on the clock of `index`: a stamp persisted by an older run can be
+    tz-aware while the index is naive UTC (see `data._naive_index`), or the
+    other way round; comparing the two would raise."""
+    ts = pd.Timestamp(ts)
+    tz = getattr(index, "tz", None)
+    if tz is None and ts.tz is not None:
+        return ts.tz_convert("UTC").tz_localize(None)
+    if tz is not None and ts.tz is None:
+        return ts.tz_localize("UTC").tz_convert(tz)
+    return ts
+
+
+def bars_since(df: pd.DataFrame, fitted_on) -> int:
+    """Bars in `df` after `fitted_on` (all of them when it is None)."""
+    if fitted_on is None:
+        return len(df)
+    return int((df.index > as_index_time(fitted_on, df.index)).sum())
+
+
 def due_for_refit(df: pd.DataFrame, fitted_on, test_bars: int) -> bool:
     """True when `test_bars` bars have passed since the last refit.
 
@@ -164,9 +184,7 @@ def due_for_refit(df: pd.DataFrame, fitted_on, test_bars: int) -> bool:
     """
     if fitted_on is None:
         return True
-    fitted_on = pd.Timestamp(fitted_on)
-    after = df.index[df.index > fitted_on]
-    return len(after) >= test_bars
+    return bars_since(df, fitted_on) >= test_bars
 
 
 # --------------------------------------------------------------------------
@@ -179,22 +197,41 @@ def strategy_state(
     *,
     equity: float = 100_000.0,
     lookback_bars: int | None = None,
+    fitted_on=None,
 ) -> dict:
     """Current position, live stop levels and the orders for the next bar.
 
     `tpl` must already carry the params chosen by `refit_params`. `equity` is
     the capital allocated to THIS strategy slot, so the share counts come out
-    in tradeable units. `lookback_bars` limits how much history the state is
-    rebuilt from (default: the training window's worth, plus warm-up).
-    """
-    need = warmup_bars(tpl) + 10
-    if lookback_bars is None:
-        lookback_bars = max(need, 400)
-    tail = df.iloc[-max(lookback_bars, need):]
-    if len(tail) < need:
-        raise ValueError(f"need at least {need} bars of history for {tpl.name}, have {len(tail)}")
+    in tradeable units.
 
-    res = backtest(tail, tpl, initial_equity=equity)
+    `fitted_on` is the last bar those params were fitted on. With it, the state
+    is the walk-forward's out-of-sample window reproduced exactly
+    (`walkforward.window_backtest`): indicators warmed up on the bars before,
+    flat on the first bar after `fitted_on`, and no position opened earlier --
+    a trade opened on the training bars by the params fitted on them is one
+    the walk-forward never had. Without it (`lookback_bars`, default 400 bars)
+    the state is rebuilt from a flat start that many bars back.
+    """
+    warm = warmup_bars(tpl)
+    need = warm + 10
+    first_trade = 0
+    if fitted_on is not None:
+        start = int(df.index.searchsorted(as_index_time(fitted_on, df.index), side="right"))
+        # exactly window_backtest's buffer, so the indicators are bit-identical
+        buf = max(0, min(start - warm, len(df) - 3))   # (the min only bites if warm-up is ~0)
+        tail = df.iloc[buf:]
+        first_trade = start - buf
+        have = len(df)
+    else:
+        if lookback_bars is None:
+            lookback_bars = max(need, 400)
+        tail = df.iloc[-max(lookback_bars, need):]
+        have = len(tail)
+    if have < need:
+        raise ValueError(f"need at least {need} bars of history for {tpl.name}, have {have}")
+
+    res = backtest(tail, tpl, initial_equity=equity, first_trade_bar=first_trade)
     ind = res["indicators"]
     n = len(tail)
     pos = res["open_position"]
@@ -469,6 +506,29 @@ def portfolio_targets(
         net_exposure=float(legs["notional"].sum()) / account_equity if len(legs) else 0.0,
         open_risk=risk, open_risk_pct=risk / account_equity if account_equity else 0.0,
     )
+
+
+def apply_gross_scale(states: list, scale: float) -> list:
+    """The per-slot states at the size the book is actually traded at.
+
+    `portfolio_targets` scales the target positions down when `--max-gross`
+    binds. Everything else that carries a share count -- the position a slot
+    reports, its unrealized P&L, and the entry orders for the next bar -- must
+    shrink by the same factor, or the orders you work would rebuild exactly
+    the exposure the cap removed. Returns copies; `shares_unscaled` keeps the
+    engine's own number."""
+    if scale >= 1.0:
+        return states
+    out = []
+    for st in states:
+        st = dict(st)
+        st["shares_unscaled"] = st.get("shares", 0.0)
+        st["shares"] = float(st.get("shares", 0.0)) * scale
+        st["unrealized"] = float(st.get("unrealized", 0.0)) * scale
+        st["entry_orders"] = [dict(o, shares=float(o["shares"]) * scale) for o in st.get("entry_orders", [])]
+        st["gross_scale"] = scale
+        out.append(st)
+    return out
 
 
 def trade_list(by_asset: pd.DataFrame, holdings: dict, lot: float = 1.0) -> pd.DataFrame:

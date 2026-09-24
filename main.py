@@ -19,7 +19,7 @@ End-to-end Ranger-style pipeline with Pardo + Lopez de Prado robustness:
 
 Usage:
   python main.py                       # synthetic data, 'quick' family (72 templates)
-  python main.py --family default      # ~300 templates
+  python main.py --family default      # 768 templates
   python main.py --real SPY --start 2005-01-01 --family default --jobs 8
   python main.py --help
 """
@@ -122,7 +122,7 @@ def main(argv=None) -> dict:
     asset = args.real or "synthetic"
     with worker_pool(args.jobs, {asset: df}, cfg) as pool:
         out = _run(df, asset, templates, pool, args)
-    print(f"\nTotal runtime {time.time() - t0:.1f}s. Outputs in ./{args.out}/")
+    print(f"\nTotal runtime {time.time() - t0:.1f}s. Outputs in {os.path.join(args.out, '')}")
     return out
 
 

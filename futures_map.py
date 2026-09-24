@@ -365,6 +365,33 @@ def to_contracts(by_asset: pd.DataFrame, etf_data: dict, fut_data: dict,
             # what the whole-contract book holds beyond the ETF book, in ETF dollars
             rounding_error=(tgt - raw) * value / ratio,
         ))
+    # held contracts the loop above never reached. A root whose ETF is not in
+    # this run's universe (a research re-run dropped it) is a live position
+    # nothing else would ever close: it gets a closing order, unpriced. A root
+    # that is no contract of the table at all is most likely a typo in the
+    # holdings file -- flagged, never guessed at.
+    by_root = {c.root: etf for etf, c in CONTRACTS.items()}
+    for root, h in held.items():
+        n_held = int(round(h))
+        if n_held == 0:
+            continue
+        etf = by_root.get(root)
+        if etf is None:
+            notes.append(f"held {root} {n_held:+d}: not a contract in futures_map.CONTRACTS -- "
+                         f"check holdings_futures.json; it is NOT in the book below")
+            continue
+        if etf in assets:
+            continue
+        c = CONTRACTS[etf]
+        notes.append(f"held {root} {n_held:+d}: {etf} is no longer in the portfolio -- "
+                     f"{'SELL' if n_held > 0 else 'BUY'} {abs(n_held)} {root} to close it")
+        rows.append(dict(
+            asset=etf, root=root, exchange=c.exchange, currency=c.currency, etf_notional=0.0,
+            hedge_ratio=np.nan, ratio_source="", fut_price=np.nan, price_source="not in the portfolio",
+            fx=np.nan, contract_value=np.nan, raw=0.0, held=n_held, target=0, delta=-n_held,
+            action="SELL" if n_held > 0 else "BUY", order_contracts=abs(n_held), fut_notional=0.0,
+            rounding_error=0.0,
+        ))
     cols = ["root", "exchange", "currency", "etf_notional", "hedge_ratio", "ratio_source", "fut_price",
             "price_source", "fx", "contract_value", "raw", "held", "target", "delta", "action",
             "order_contracts", "fut_notional", "rounding_error"]

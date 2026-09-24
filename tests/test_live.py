@@ -23,9 +23,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from data import synthetic_ohlc  # noqa: E402
 from strategy import StrategyTemplate, backtest  # noqa: E402
 from generator import generate_templates, param_grid_for  # noqa: E402
+from walkforward import window_backtest  # noqa: E402
 from live import (  # noqa: E402
     strategy_state, refit_params, due_for_refit, drop_forming_bar,
-    portfolio_targets, trade_list,
+    portfolio_targets, trade_list, apply_gross_scale, bars_since,
 )
 
 LOOKBACK = 450
@@ -283,9 +284,74 @@ class RefitCadenceTests(unittest.TestCase):
         self.assertTrue(due_for_refit(self.df, fitted, test_bars=125))
         self.assertTrue(due_for_refit(self.df, None, test_bars=125))
 
+    def test_a_persisted_stamp_in_another_zone_still_compares(self):
+        """live_state.json from a run whose feed kept its zone, read against the
+        naive-UTC index (and the other way round), must not raise."""
+        idx = pd.date_range("2026-03-02 14:30", periods=10, freq="h")
+        df = pd.DataFrame({"Close": range(10)}, index=idx)
+        aware = pd.Timestamp("2026-03-02 14:30", tz="UTC").tz_convert("America/New_York")
+        self.assertEqual(bars_since(df, str(aware)), 9)
+        self.assertFalse(due_for_refit(df, str(aware), test_bars=10))
+        df_aware = df.tz_localize("UTC")
+        self.assertEqual(bars_since(df_aware, "2026-03-02 14:30"), 9)
+
     def test_refit_refuses_a_short_history(self):
         with self.assertRaises(ValueError):
             refit_params(self.df.iloc[:100], self.tpl, self.grid, train_bars=400)
+
+
+class WindowStateTests(unittest.TestCase):
+    """After a refit the live state IS the walk-forward's out-of-sample window:
+    flat on the first bar after `fitted_on`, never a position opened on the
+    training bars by the params fitted on them."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.df = synthetic_ohlc(2000, seed=3, trend_prob=0.6)
+        cls.tpls = generate_templates("quick")[:12]
+        cls.bounds = (1000, 1250, 1500)
+
+    def _wf(self, tpl, b, t):
+        return window_backtest(self.df, tpl, b, t + 1, initial_equity=100_000.0)["open_position"]
+
+    def test_the_state_is_the_walk_forward_window(self):
+        checked = 0
+        for tpl in self.tpls:
+            for b in self.bounds:
+                fitted = self.df.index[b - 1]
+                for t in range(b - 1, b + 40, 4):
+                    st = strategy_state(self.df.iloc[:t + 1], tpl, equity=100_000.0, fitted_on=fitted)
+                    wf = self._wf(tpl, b, t) if t >= b else None
+                    msg = f"{tpl.name} window {b} bar {t}"
+                    self.assertEqual(st["position"], None if wf is None else wf["side"], msg)
+                    if wf is not None:
+                        self.assertAlmostEqual(st["shares"], wf["shares"], places=6, msg=msg)
+                        self.assertEqual(st["entry_date"], wf["entry_date"], msg)
+                    checked += 1
+        self.assertGreater(checked, 300)
+
+    def test_a_trade_opened_on_the_training_bars_is_not_carried(self):
+        """The fixture has windows where a 400-bar rebuild opens a position on
+        the bar the params were fitted on; the window state must not."""
+        carried = 0
+        for tpl in self.tpls:
+            for b in self.bounds:
+                old = strategy_state(self.df.iloc[:b + 1], tpl, equity=100_000.0)
+                if old["position"] is not None and old["entry_date"] < self.df.index[b]:
+                    carried += 1
+                    new = strategy_state(self.df.iloc[:b + 1], tpl, equity=100_000.0,
+                                         fitted_on=self.df.index[b - 1])
+                    wf = self._wf(tpl, b, b)
+                    self.assertEqual(new["position"], None if wf is None else wf["side"])
+                    self.assertTrue(new["entry_date"] is None or new["entry_date"] >= self.df.index[b])
+        self.assertGreater(carried, 0, "the fixture no longer exercises the carried-position case")
+
+    def test_right_after_the_refit_the_next_bar_orders_are_published(self):
+        tpl = self.tpls[0]
+        st = strategy_state(self.df.iloc[:1200], tpl, fitted_on=self.df.index[1199])
+        self.assertIsNone(st["position"])
+        self.assertEqual(st["n_trades_in_window"], 0)
+        self.assertIsInstance(st["entry_orders"], list)
 
 
 class StalePullbackOrderTests(unittest.TestCase):
@@ -443,6 +509,23 @@ class PortfolioTargetTests(unittest.TestCase):
         # an asset you hold but the book no longer wants must be closed
         self.assertEqual(tl.loc["GLD", "action"], "SELL")
         self.assertAlmostEqual(tl.loc["GLD", "order_shares"], 5.0)
+
+    def test_the_gross_cap_scales_the_entry_orders_too(self):
+        """A capped book must not publish entry orders that rebuild the exposure
+        the cap removed."""
+        held = self._state("SPY", "a", 1, 400.0, 500.0, 470.0)
+        held["entry_orders"] = []
+        flat = dict(slot="QQQ|b", asset="QQQ", template="b", position=None, shares=0.0,
+                    last_close=400.0, entry_price=None, entry_date=None, unrealized=0.0,
+                    exit_orders=[], entry_orders=[dict(kind="stop", side=1, level=410.0, shares=300.0)])
+        out = portfolio_targets([held, flat], {"SPY|a": .5, "QQQ|b": .5}, 100_000.0, max_gross=1.0)
+        self.assertAlmostEqual(out["scale_applied"], 0.5)
+        scaled = apply_gross_scale([held, flat], out["scale_applied"])
+        self.assertAlmostEqual(scaled[1]["entry_orders"][0]["shares"], 150.0)
+        self.assertAlmostEqual(scaled[0]["shares"], out["by_asset"].loc["SPY", "shares"])
+        self.assertAlmostEqual(scaled[0]["shares_unscaled"], 400.0)
+        self.assertEqual(flat["entry_orders"][0]["shares"], 300.0, "the input states are not mutated")
+        self.assertIs(apply_gross_scale([held], 1.0)[0], held)
 
     def test_sub_lot_drift_does_not_generate_a_trade(self):
         by_asset = pd.DataFrame({"shares": [103.4], "price": [500.0]},

@@ -25,7 +25,7 @@ import pandas as pd
 from data import load_yfinance
 from generator import param_grid_for
 from live import drop_forming_bar
-from portfolio import select_portfolio, walk_forward_portfolio
+from portfolio import select_portfolio, walk_forward_portfolio, MIN_TRADES, MIN_WINDOWS
 from robustness import (
     cscv_pbo, deflated_sharpe_ratio, min_backtest_length, bootstrap_sharpe_pvalue,
     reality_check, effective_n_trials, merge_block_stats, evaluate_template,
@@ -220,9 +220,12 @@ def family_diagnostics(results: dict, rets: pd.DataFrame, n_boot: int = 1000) ->
 
 
 def build_portfolios(results: dict, rets: pd.DataFrame, args) -> tuple[dict, dict]:
-    """(static selection on the full OOS history, nested walk-forward selection)."""
+    """(static selection on the full OOS history, nested walk-forward selection).
+    Both apply the same candidate filter; the nested one recomputes its trade,
+    window and Pardo evidence from the windows that had ended at each boundary."""
     port = select_portfolio(
-        results, min_sharpe=args.min_sharpe, max_strategies=args.max_strategies,
+        results, min_sharpe=args.min_sharpe, min_trades=MIN_TRADES, min_windows=MIN_WINDOWS,
+        max_strategies=args.max_strategies,
         corr_ceiling=args.corr_ceiling, require_pardo=args.require_pardo,
         method=args.select_method, weighting=args.weighting,
     )
@@ -230,6 +233,8 @@ def build_portfolios(results: dict, rets: pd.DataFrame, args) -> tuple[dict, dic
     nested = walk_forward_portfolio(
         rets, boundaries, min_sharpe=args.min_sharpe, max_strategies=args.max_strategies,
         corr_ceiling=args.corr_ceiling, method=args.select_method, weighting=args.weighting,
+        windows={n: r.get("windows", []) for n, r in results.items()},
+        min_trades=MIN_TRADES, min_windows=MIN_WINDOWS, require_pardo=args.require_pardo,
     )
     return port, nested
 

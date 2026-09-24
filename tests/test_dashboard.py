@@ -110,6 +110,26 @@ class PipelineTests(unittest.TestCase):
             else:
                 self.assertEqual(st["shares"], 0.0)
 
+    def test_the_gross_cap_reaches_positions_and_entry_orders(self):
+        """Whatever scale the cap applies to the targets, signals() applies to
+        every share count it publishes (page, CSV log, futures levels)."""
+        free = ED.main(SIGNALS + [self.dir, "--no-refit"])
+        real = ED.portfolio_targets
+        ED.portfolio_targets = lambda *a, **k: dict(real(*a, **k), scale_applied=0.5)
+        try:
+            capped = ED.main(SIGNALS + [self.dir, "--no-refit"])
+        finally:
+            ED.portfolio_targets = real
+        n = 0
+        for f, c in zip(free["states"], capped["states"]):
+            self.assertAlmostEqual(c["shares"], f["shares"] * 0.5, places=6)
+            self.assertEqual(len(f["entry_orders"]), len(c["entry_orders"]))
+            for of, oc in zip(f["entry_orders"], c["entry_orders"]):
+                self.assertAlmostEqual(oc["shares"], of["shares"] * 0.5, places=6)
+                n += 1
+        if not n and not any(f["position"] for f in free["states"]):
+            self.skipTest("the fixture has neither a position nor an entry order")
+
     def test_parameters_are_held_between_runs(self):
         """The whole point of due_for_refit: a second run on the same bars must
         reuse the fitted parameters, not re-optimize."""
@@ -171,6 +191,147 @@ class PipelineTests(unittest.TestCase):
             self.assertIn("research", str(cm.exception))
         finally:
             shutil.rmtree(d, ignore_errors=True)
+
+
+class _FakeHourlyYF:
+    """yfinance for 1h bars: stamps in the exchange's zone, as the real one does."""
+    def download(self, ticker, **kw):
+        from data import synthetic_ohlc
+        df = synthetic_ohlc(n_bars=1500, seed=sum(map(ord, ticker)))
+        df.index = pd.date_range("2025-01-02 09:30", periods=len(df), freq="h", tz="America/New_York")
+        return df
+
+
+class HourlySignalsTests(unittest.TestCase):
+    """The hourly workflow end to end, with tz-aware intraday stamps from the feed."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="etfdash-1h-")
+        ED.main(RESEARCH + [self.dir])
+        p = os.path.join(self.dir, "portfolio.json")
+        with open(p) as f:
+            spec = json.load(f)
+        spec["assets"] = ["SPY", "TLT"]
+        for s in spec["slots"]:
+            s["asset"] = {"AAA": "SPY", "BBB": "TLT"}[s["asset"]]
+            s["slot"] = s["asset"] + "|" + s["template_name"]
+        spec["config"].update(interval="1h", periods_per_year=1764)
+        with open(p, "w") as f:
+            json.dump(spec, f)
+        self.real = sys.modules.get("yfinance")
+        sys.modules["yfinance"] = _FakeHourlyYF()
+
+    def tearDown(self):
+        if self.real is None:
+            sys.modules.pop("yfinance", None)
+        else:
+            sys.modules["yfinance"] = self.real
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_hourly_signals_render_on_the_utc_clock(self):
+        out = ED.main(["signals", "--interval", "1h", "--jobs", "1", "--now", "2026-01-01",
+                       "--state-dir", self.dir])
+        self.assertIsNone(pd.Timestamp(out["run"]["as_of"]).tz)
+        with open(os.path.join(self.dir, "dashboard.html"), encoding="utf-8") as f:
+            doc = f.read()
+        self.assertIn(" UTC", doc)
+        # a second run reads its own persisted fitted_on back without a refit
+        out2 = ED.main(["signals", "--interval", "1h", "--jobs", "1", "--now", "2026-01-01",
+                        "--state-dir", self.dir])
+        self.assertFalse([n for n in out2["run"]["notes"] if "re-optimized" in n])
+
+
+class SignalsWiringTests(unittest.TestCase):
+    """Fixes to how `signals` feeds the live layer, without a research run."""
+
+    def test_an_anchored_spec_loads_from_the_research_start(self):
+        class Loaded(Exception):
+            pass
+        seen = {}
+
+        def fake_load_assets(assets, **kw):
+            seen.update(kw)
+            raise Loaded
+
+        d = tempfile.mkdtemp(prefix="etfdash-anch-")
+        real = ED.load_assets
+        try:
+            for anchored, want in ((True, "2005-01-01"), (False, None)):
+                spec = dict(version=ED.SPEC_VERSION, assets=["SPY"], slots=[],
+                            config=dict(interval="1d", periods_per_year=252, train_bars=500,
+                                        test_bars=125, anchored=anchored, start="2005-01-01"))
+                with open(os.path.join(d, "portfolio.json"), "w") as f:
+                    json.dump(spec, f)
+                ED.load_assets = fake_load_assets
+                with self.assertRaises(Loaded):
+                    ED.main(["signals", "--state-dir", d])
+                if want:
+                    self.assertEqual(seen["start"], want)
+                else:
+                    self.assertGreater(seen["start"], "2005-01-01")
+        finally:
+            ED.load_assets = real
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_an_anchored_hourly_spec_stays_inside_yahoos_history(self):
+        # Yahoo serves ~730 days of 1h bars; a request from an older anchored
+        # start would come back empty, so the load is clamped to what exists
+        class Loaded(Exception):
+            pass
+        seen = {}
+
+        def fake_load_assets(assets, **kw):
+            seen.update(kw)
+            raise Loaded
+
+        d = tempfile.mkdtemp(prefix="etfdash-anch1h-")
+        real = ED.load_assets
+        try:
+            spec = dict(version=ED.SPEC_VERSION, assets=["SPY"], slots=[],
+                        config=dict(interval="1h", periods_per_year=252 * 7, train_bars=500,
+                                    test_bars=125, anchored=True, start="2005-01-01"))
+            with open(os.path.join(d, "portfolio.json"), "w") as f:
+                json.dump(spec, f)
+            ED.load_assets = fake_load_assets
+            with self.assertRaises(Loaded):
+                ED.main(["signals", "--state-dir", d, "--interval", "1h",
+                         "--now", "2026-06-15 15:00"])
+            self.assertEqual(seen["start"], "2024-06-16")
+        finally:
+            ED.load_assets = real
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_a_slot_that_could_not_be_fitted_waits_for_its_window(self):
+        from dataclasses import asdict
+        from types import SimpleNamespace
+        from data import synthetic_ohlc
+        from generator import generate_templates
+        calls = []
+
+        def fake_refit(df, tpl, grid, **kw):
+            calls.append(df.index[-1])
+            return dict(params=None, is_stats=None, is_score=None, fitted_on=df.index[-1],
+                        train_bars=len(df))
+
+        tpl = generate_templates("quick")[0]
+        slot = dict(slot="SPY|x", asset="SPY", template_name=tpl.name, template=asdict(tpl),
+                    weight=1.0, research={})
+        cfg = dict(train_bars=500, test_bars=125, wide_grid=False, metric="sharpe",
+                   selection="plateau", anchored=False)
+        live = dict(slots={}, last_targets={}, runs=0)
+        args = SimpleNamespace(account_equity=1e5, no_refit=False)
+        df = synthetic_ohlc(1100, seed=1)
+        real = ED.refit_params
+        ED.refit_params = fake_refit
+        try:
+            for t in range(900, 905):                  # five runs inside one test window
+                st, _ = ED._slot_signal(slot, df.iloc[:t], cfg, live, args)
+                self.assertIsNone(st["position"])
+            self.assertEqual(len(calls), 1)
+            ED._slot_signal(slot, df.iloc[:900 + 125], cfg, live, args)   # a window later
+            self.assertEqual(len(calls), 2)
+        finally:
+            ED.refit_params = real
 
 
 class FuturesBookTests(unittest.TestCase):
@@ -442,6 +603,12 @@ class RenderTests(unittest.TestCase):
         self.assertNotIn("<img src=x", doc)
         self.assertNotIn("<script>alert(2)", doc)
         self.assertIn("&lt;img src=x", doc)
+
+    def test_an_aware_bar_stamp_does_not_break_the_page(self):
+        spec, states, targets, trades, run = self._fixture()
+        run["as_of"] = pd.Timestamp("2026-01-05 15:30", tz="America/New_York")
+        doc = render_dashboard(spec, states, targets, trades, run)
+        self.assertIn("2026-01-05 20:30 UTC", doc)
 
     def test_a_missing_curve_does_not_break_the_page(self):
         spec, states, targets, trades, run = self._fixture()

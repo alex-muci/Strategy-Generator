@@ -35,7 +35,9 @@ def load_yfinance(
     '1h', 60 days for finer bars).
 
     Returns a DataFrame indexed by timestamp with columns
-    Open, High, Low, Close, Volume.
+    Open, High, Low, Close, Volume: sorted, one row per stamp, and tz-naive
+    (intraday bars in UTC, daily and longer bars on their exchange-local date;
+    see `_naive_index`).
 
     Raises ValueError rather than returning an empty frame: a wrong ticker, a
     rate limit or no network all make yfinance return an empty DataFrame, and a
@@ -45,14 +47,14 @@ def load_yfinance(
 
     df = yf.download(ticker, start=start, end=end, interval=interval,
                      auto_adjust=True, progress=False)
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
     if df is None or df.empty:
         raise ValueError(
             f"yfinance returned no data for {ticker!r} (interval={interval}, start={start}, "
             f"end={end}). Check the symbol, the date range (intraday history is short), "
             f"your network, and whether you are being rate-limited."
         )
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
     missing = [c for c in ("Open", "High", "Low", "Close") if c not in df.columns]
     if missing:
         raise ValueError(f"{ticker!r}: yfinance response is missing columns {missing}")
@@ -60,6 +62,11 @@ def load_yfinance(
         df = df.assign(Volume=np.nan)
     df = df[["Open", "High", "Low", "Close", "Volume"]]
     df = df[df[["Open", "High", "Low", "Close"]].notna().all(axis=1)]
+    df = df.set_axis(_naive_index(df.index, interval))
+    # a repeated stamp (Yahoo sometimes serves the last bar twice) would be an
+    # extra bar to every indicator and survive `drop_forming_bar`; keep the
+    # latest print of each bar, in time order
+    df = df[~df.index.duplicated(keep="last")].sort_index()
     if len(df) < min_bars:
         raise ValueError(
             f"{ticker!r}: only {len(df)} usable bars (interval={interval}), need at least "
@@ -67,6 +74,46 @@ def load_yfinance(
         )
     df.index.name = "Date"
     return df
+
+
+# how far back Yahoo serves intraday bars (a request that starts earlier comes
+# back empty): about 730 days of '1h', 60 days of anything finer. One day of
+# margin each, since Yahoo counts from its own clock.
+YAHOO_INTRADAY_DAYS = {"1h": 729, "60m": 729}
+YAHOO_FINE_DAYS = 59
+
+
+def yahoo_earliest_start(interval: str, now: pd.Timestamp | None = None) -> pd.Timestamp | None:
+    """The earliest start date Yahoo still serves `interval` bars from, or None
+    for daily and longer bars (decades of history)."""
+    if not _is_intraday(interval):
+        return None
+    now = pd.Timestamp.now("UTC").tz_convert(None) if now is None else pd.Timestamp(now)
+    if now.tz is not None:
+        now = now.tz_convert("UTC").tz_localize(None)
+    days = YAHOO_INTRADAY_DAYS.get(interval, YAHOO_FINE_DAYS)
+    return (now - pd.Timedelta(days=days)).normalize()
+
+
+def _is_intraday(interval: str) -> bool:
+    return interval.endswith(("m", "h")) and not interval.endswith("mo")
+
+
+def _naive_index(index: pd.Index, interval: str) -> pd.Index:
+    """The project's one timestamp convention: every index is tz-NAIVE.
+
+    * intraday bars: naive UTC (yfinance stamps them in the exchange's zone).
+      `live.drop_forming_bar` and `live.utcnow` read naive stamps as UTC, and
+      bars from different exchanges line up on the same clock;
+    * daily and longer bars: the exchange-local DATE (Yahoo's own convention
+      for them), which `drop_forming_bar` resolves against the exchange's
+      closing time.
+    """
+    if not isinstance(index, pd.DatetimeIndex) or index.tz is None:
+        return index
+    if _is_intraday(interval):
+        return index.tz_convert("UTC").tz_localize(None)
+    return index.tz_localize(None)
 
 
 def synthetic_ohlc(

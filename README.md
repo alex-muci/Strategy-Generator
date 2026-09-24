@@ -21,7 +21,7 @@ conda create -p ./env python=3.12 pandas scikit-learn scipy matplotlib yfinance 
 conda activate ./env
 # or, with pip:  pip install -r requirements.txt   (the versions the suite was last run against)
 
-python -m unittest discover -s tests -v      # 242 tests (engine, templates, hedge learner, walk-forward, robustness, selection, data, live signals, both entry points)
+python -m unittest discover -s tests -v      # 271 tests (engine, templates, hedge learner, walk-forward, robustness, selection, data, live signals, both entry points)
 # faster (about 1:35 min instead of 4.5): pip install -r requirements-dev.txt, then, with ./env active,
 python -m pytest -n auto --dist loadscope   # same tests in parallel; loadscope keeps a class (and its one-off setup) on one worker
 
@@ -33,7 +33,7 @@ python main.py                                # synthetic data, 72 templates, ~1
 ```bash
 python main.py --help
 python main.py --family quick                       # 72 templates (Donchian, ER filter)
-python main.py --family default                     # 778 templates, all switches sampled
+python main.py --family default                     # 768 templates, all switches sampled
 python main.py --family online                      # 288 templates on the online-learned channel (no lookback to fit)
 python main.py --real SPY --start 2005-01-01 --family default --jobs 8
 python main.py --real SPY --start 2005-01-01 --family quick --sides long_only   # one-sided family (an asset with a drift)
@@ -98,7 +98,7 @@ What the dashboard shows, in the order you need it:
 | | |
 |---|---|
 | **verdict** | the research conclusion, restated every run, so a weak result cannot quietly become habit |
-| **exposure** | gross, net, and the money at risk if every stop fills at once; `--max-gross` scales the whole book down proportionally |
+| **exposure** | gross, net, and the money at risk if every stop fills at once; `--max-gross` scales the whole book down proportionally -- targets, positions and the next bar's entry orders alike |
 | **trades to send** | target minus held, per ETF. Put your real broker positions in `state/holdings.json` (`{"SPY": 120, "TLT": -50}`) or it assumes the last run's orders were filled |
 | **orders to work** | the level AND the order type for the next bar -- a breakout entry is a stop order, fading one is a limit order -- with share counts from the engine's own sizing rule |
 | **positions** | entry, current stop, and how much of the original stop distance is left |
@@ -110,12 +110,20 @@ Two rules keep the live path honest, both in `live.py`:
 
 - **Parameters only change at window boundaries.** Re-optimizing every run would
   be a different strategy from the one the walk-forward measured with
-  `test_bars`-long parameter holds. `due_for_refit` enforces the same cadence.
+  `test_bars`-long parameter holds. `due_for_refit` enforces the same cadence,
+  also for a slot whose last fit found nothing (it stays flat for the window,
+  as in the walk-forward). The state after a refit is the walk-forward's
+  out-of-sample window reproduced exactly: flat on the first bar after the
+  refit, so a position opened on the training bars is closed at the refit, as
+  the walk-forward does. With `--anchored` the signals phase loads the history
+  from the research's `--start`, so the refit sees the same expanding window.
 - **The forming bar is dropped.** A feed queried at 11:15 returns an 11:00 bar
   built from 15 minutes of trading; its high, low and close all still move, so
   acting on it is a decision you could not have taken. A daily bar is dropped
   until its session has closed, by the exchange's clock and not by the date
-  it is stamped with.
+  it is stamped with. Every index is tz-naive (`data.load_yfinance`): intraday
+  bars in UTC, so the page shows their times in UTC, and daily bars on their
+  exchange-local date.
 
 Everything the dashboard reports about the *current* position (side, size, stop,
 target, trailing anchor, resting order) is read out of the same
@@ -200,6 +208,8 @@ market and the contract that expresses it:
   around 2.5 does not trade every morning. Stops and entry levels are restated
   as futures prices, and the page reports what the rounding left untracked. Put
   your real positions in `state/holdings_futures.json` (`{"MES": 2, "ZN": -1}`).
+  A held contract whose ETF is no longer in the portfolio gets a closing order;
+  a root the table does not know is flagged in the notes.
   `--max-gross` is a notional cap: FX and rates legs are large notionals with
   small risk, so a futures book needs it well above 1.
 - Judge a contract by the dollars it moves in a year, not by its notional: a
@@ -291,7 +301,7 @@ A **template** is a fixed combination of categorical switches:
 |---|---|
 | `direction_logic` | `trend` (trade with the break) / `countertrend` (fade it) / `learned` (the online learner decides bar by bar, see below) |
 | `channel_type` | `donchian` / `keltner` (EMA +/- k ATR) / `bollinger` (SMA +/- k sd) / `hedge` (online-learned, see below) |
-| `entry_style` | `stop` (at the level) / `close_confirm` (close beyond, next open) / `pullback` (limit k ATR inside the level) |
+| `entry_style` | `stop` (at the level) / `close_confirm` (close beyond, next open) / `pullback` (after the break, a limit k ATR from the level: back inside the channel when following, deeper beyond it when fading) |
 | `exit_style` | `channel` (Turtle exit; midline target for countertrend) / `atr_trail` / `target_stop` / `time_stop` -- a hard ATR stop is always on |
 | `regime_indicator` | `er` Kaufman Efficiency Ratio / `adx` / `cti` Ehlers Correlation Trend / `chop` Choppiness / `vr` variance ratio |
 | `regime_filter` | `none` / `trend_only` / `range_only` (Ranger's "sideways" mode) |
@@ -349,7 +359,10 @@ algorithm from the prediction-with-expert-advice literature:
   scales; it is not a tuned parameter.
 - **Loss**: every bar each expert is scored on the ATR-normalised next
   move of the stance it implied (new n-bar high -> long, new n-bar
-  low -> short, hold otherwise), **net of the sides it traded** to get
+  low -> short, for up to n bars after that break, flat when there was
+  none -- bounded so the learner is an exact function of a fixed number
+  of past bars and a warmed-up walk-forward window matches a
+  full-history run), **net of the sides it traded** to get
   there, charged at the template's `cost_bps` in ATR units exactly as
   the engine charges them: a fast lookback that flips every week has to
   earn its turnover back before the learner trusts it. For a
@@ -455,13 +468,18 @@ of those.
   financial-hacker's "smooth heatmap" criterion).
 - **Pardo's Walk-Forward Efficiency** (annualized OOS return / annualized
   IS return) and his acceptance rule: WFE >= 0.5, majority of profitable
-  OOS windows, OOS profitable overall (`--require-pardo` to enforce).
+  OOS windows (a skipped window, flat because no parameter set traded
+  enough in-sample, counts as not profitable), OOS profitable overall
+  (`--require-pardo` to enforce).
 - **Walk-forward matrix**: the same template over 12 train/test-length
   combinations. Robust means profitable in most cells.
 - **Rolling or anchored** windows, optional **embargo** gap.
 - **Combinatorial Purged CV** (AFML ch. 12): the history is cut into
-  groups, every choice of test groups is a train/test split (with embargo
-  after each test group), and the results are stitched into
+  groups, every choice of test groups is a train/test split (with an
+  embargo after each test group of twice the longest channel lookback in
+  the grid, or of the hedge expert ladder), the trial is chosen by the same
+  `--metric`, `--selection` and min-trades rule as the walk-forward (a
+  split where nothing trades enough stays flat), and the results are stitched into
   C(N,k)·k/N complete backtest paths. You get a *distribution* of OOS
   Sharpe rather than one number. A template whose single walk-forward
   path is a star while its CPCV paths straddle zero was lucky.
@@ -494,7 +512,10 @@ of those.
   correlation cluster), equal weights or **Hierarchical Risk Parity**.
 - **Nested walk-forward selection**: at every window boundary the
   candidate filter, subset and weights are recomputed from the OOS
-  history realised *so far* and held for the next window. That curve is
+  history realised *so far* and held for the next window. The filter is
+  the static one (min Sharpe, at least 10 OOS trades and 3 live windows,
+  `--require-pardo`), with trades, windows and Pardo's criteria counted
+  only over the walk-forward windows that had ended by then. That curve is
   out-of-sample with respect to both the parameters and the selection,
   and it is the only portfolio number in the report worth quoting.
 

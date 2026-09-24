@@ -6,15 +6,15 @@ family of structurally distinct ones by combining switches, and let
 evaluation (walk-forward analysis + robustness tests + portfolio
 selection) decide which ones earn a place in the final portfolio.
 
-Three families are predefined:
+Four families are predefined:
 
-  quick    ~72 templates  (Donchian only, ER regime filter) -- smoke test
-  default  ~300 templates (two channel types, five regime indicators)
-  online   ~290 templates (the online-learned 'hedge' channel only, incl.
-                           the 'learned' follow-or-fade direction: no
-                           lookback or width in the grid, the walk-forward
-                           only re-fits exits / regime thresholds)
-  full     every combination of every switch (thousands; overnight run)
+  quick     72 templates  (Donchian only, ER regime filter) -- smoke test
+  default  768 templates  (two channel types, five regime indicators)
+  online   288 templates  (the online-learned 'hedge' channel only, incl.
+                            the 'learned' follow-or-fade direction: no
+                            lookback or width in the grid, the walk-forward
+                            only re-fits exits / regime thresholds)
+  full     every combination of every switch (19008; overnight run)
 
 The bigger the family, the more the *selection* step becomes a data
 mining exercise -- which is exactly why main.py reports the Probability
