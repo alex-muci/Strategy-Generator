@@ -346,12 +346,12 @@ class CpcvSelectionRuleTests(unittest.TestCase):
         tpl = generate_templates("quick", max_templates=1)[0]
         grid = param_grid_for(tpl)
         combos, idx = grid_combos(grid)
-        R, E, P = trial_returns(df, tpl, combos, with_pnl=True)
+        R, E, P, X = trial_returns(df, tpl, combos, with_trades=True)
         for metric, mt in (("profit_factor", 5), ("return_over_dd", 8)):
             res = evaluate_template(df, tpl, grid, train_bars=300, test_bars=100, cpcv_groups=6, cpcv_k=2,
                                     cscv_partitions_n=8, metric=metric, min_trades=mt)
             ref = cpcv(R, E, idx, n_groups=6, k_test=2, embargo_bars=cpcv_embargo(tpl, combos),
-                       metric=metric, min_trades=mt, P=P)
+                       metric=metric, min_trades=mt, P=P, X=X)
             np.testing.assert_allclose(res["cpcv"]["path_sharpes"], ref["path_sharpes"])
 
     def test_nothing_trades_enough_stays_flat(self):
@@ -383,6 +383,98 @@ class CpcvSelectionRuleTests(unittest.TestCase):
             self.assertGreaterEqual(cpcv_embargo(h, [{}]), hedge_warmup(h.atr_n))
         kel = StrategyTemplate("k", channel_type="keltner", n_entry=60)
         self.assertGreater(cpcv_embargo(kel, [{}]), 2 * 60)          # the EMA's settling, not its span
+
+    def test_embargo_covers_a_pullback_orders_lifetime(self):
+        tpl = StrategyTemplate("p", entry_style="pullback", pullback_valid_bars=7)
+        self.assertEqual(cpcv_embargo(tpl, [{}]), warmup_bars(tpl) + 7)
+
+    def test_the_embargo_runs_on_until_a_carried_trade_closes(self):
+        T = 100
+        bounds = np.array([0, 20, 40, 60, 80, 100])
+        E = np.zeros((T, 3), dtype=np.int8); X = np.zeros((T, 3), dtype=np.int8)
+        E[30, 0] = 1; X[70, 0] = 1        # opened in the test group, closes long after the embargo
+        E[45, 1] = 1; X[48, 1] = 1        # opened AND closed inside the embargo: nothing to extend
+        E[42, 2] = 1                      # opened in the embargo, still open at the end
+        E[60, 1] = 1; X[65, 1] = 1        # opened after the embargo: clean
+        M = robustness.train_masks(T, bounds, (1,), 5, 0, E, X)       # test 20..39, embargo 40..44
+        base = robustness.train_masks(T, bounds, (1,), 5)
+        self.assertEqual(base.shape, (T,))
+        self.assertFalse(base[20:45].any()); self.assertTrue(base[45:].all() and base[:20].all())
+        self.assertFalse(M[45:71, 0].any()); self.assertTrue(M[71:, 0].all())
+        self.assertTrue((M[:, 1] == base).all())
+        self.assertFalse(M[45:, 2].any())
+
+    def test_training_rows_do_not_see_test_prices(self):
+        """What the embargo exists for, on real backtests. After a test
+        group, a training row may neither (1) belong to a trade that was
+        already open when the fixed embargo ended -- that trade was opened or
+        steered by the test group's prices -- nor (2) belong to a trade whose
+        entry decision still read a test-group bar: change the prices inside
+        the test groups only, and a trade entered past the embargo in both
+        runs must earn exactly the same returns. (A different trade taken
+        because the book was busy for longer is no information about the test
+        period: its returns come from clean prices.) A stop or close-confirm
+        entry on a given bar is the same trade in both runs, so its entry bar
+        identifies it; two different resting pullback orders can fill on the
+        same bar, so a pullback trade is identified by its fill price too.
+        Both checks are shown to fail on a too-short embargo / without the
+        trade extension."""
+        from itertools import combinations
+        from strategy import backtest
+
+        def trades(res, df, by_price):
+            E = np.zeros((len(df), 1), dtype=np.int8); X = np.zeros_like(E); tid = np.full(len(df), -1.0)
+            E[:, 0] = res["entries"]; spans = []
+            for t in res["trades"]:
+                a, b = df.index.get_loc(t["entry_date"]), df.index.get_loc(t["exit_date"])
+                X[b, 0] = 1; spans.append((a, b))
+                tid[a:b + 1] = a * 1e7 + (round(t["entry_price"], 6) if by_price else 0)
+            if res["open_position"] is not None:
+                a = df.index.get_loc(res["open_position"]["entry_date"])
+                spans.append((a, len(df) - 1))
+                tid[a:] = a * 1e7 + (round(res["open_position"]["entry_price"], 6) if by_price else 0)
+            return E, X, tid, spans
+
+        df = synthetic_ohlc(1600, seed=7, trend_prob=0.6)
+        T = len(df); bounds = np.linspace(0, T, 7).astype(int)
+        tpls = [StrategyTemplate("tgt", entry_style="close_confirm", exit_style="target_stop"),
+                StrategyTemplate("chan", exit_style="channel"),
+                StrategyTemplate("pb", entry_style="pullback", exit_style="target_stop",
+                                 regime_indicator="cti", regime_filter="trend_only"),
+                StrategyTemplate("hdg", channel_type="hedge", exit_style="atr_trail")]
+        rng = np.random.default_rng(0)
+        carried_without_extension = short_embargo_leaks = 0
+        for tpl in tpls:
+            emb = cpcv_embargo(tpl, [{}])
+            pb = tpl.entry_style == "pullback"
+            r0 = backtest(df, tpl); E0, X0, t0, spans = trades(r0, df, pb)
+            for groups in list(combinations(range(6), 2))[::3]:
+                M0 = robustness.train_masks(T, bounds, groups, emb, 0, E0, X0)[:, 0]
+                fixed = robustness.train_masks(T, bounds, groups, emb)
+                # (1) no training row of a trade open when the fixed embargo ended
+                for g in groups:
+                    e0 = bounds[g + 1] + emb
+                    for a, b in spans:
+                        if a < e0 <= b:
+                            self.assertFalse(M0[e0:b + 1].any(), f"{tpl.name} {groups} trade {a}-{b}")
+                            carried_without_extension += int(fixed[e0:b + 1].any())
+                # (2) a trade entered past the embargo in both runs: same returns
+                rows = np.concatenate([np.arange(bounds[g], bounds[g + 1]) for g in groups])
+                d1 = df.copy()
+                f = np.exp(np.cumsum(rng.normal(0, 0.01, len(rows))))
+                for c in ("Open", "High", "Low", "Close"):
+                    d1.iloc[rows, d1.columns.get_loc(c)] *= f
+                r1 = backtest(d1, tpl); E1, X1, t1, _ = trades(r1, d1, pb)
+                same = t0 == t1
+                m = M0 & robustness.train_masks(T, bounds, groups, emb, 0, E1, X1)[:, 0] & same
+                self.assertGreater(m.sum(), T // 8)
+                d = np.abs(r1["returns"].to_numpy() - r0["returns"].to_numpy())
+                np.testing.assert_allclose(d[m], 0.0, rtol=0, atol=1e-12, err_msg=f"{tpl.name} {groups}")
+                short = (robustness.train_masks(T, bounds, groups, 2, 0, E0, X0)[:, 0]
+                         & robustness.train_masks(T, bounds, groups, 2, 0, E1, X1)[:, 0] & same)
+                short_embargo_leaks += int((d[short] > 1e-12).sum())
+        self.assertGreater(carried_without_extension, 0, "the fixture never carries a trade past the embargo")
+        self.assertGreater(short_embargo_leaks, 0, "the fixture cannot tell a too-short embargo")
 
     def test_profit_factor_ignores_trades_that_straddle_a_test_group(self):
         """A trade booked on its exit bar in training but held through a test

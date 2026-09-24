@@ -21,7 +21,7 @@ conda create -p ./env python=3.12 pandas scikit-learn scipy matplotlib yfinance 
 conda activate ./env
 # or, with pip:  pip install -r requirements.txt   (the versions the suite was last run against)
 
-python -m unittest discover -s tests -v      # 271 tests (engine, templates, hedge learner, walk-forward, robustness, selection, data, live signals, both entry points)
+python -m unittest discover -s tests -v      # 276 tests (engine, templates, hedge learner, walk-forward, robustness, selection, data, live signals, both entry points)
 # faster (about 1:35 min instead of 4.5): pip install -r requirements-dev.txt, then, with ./env active,
 python -m pytest -n auto --dist loadscope   # same tests in parallel; loadscope keeps a class (and its one-off setup) on one worker
 
@@ -476,9 +476,16 @@ of those.
 - **Rolling or anchored** windows, optional **embargo** gap.
 - **Combinatorial Purged CV** (AFML ch. 12): the history is cut into
   groups, every choice of test groups is a train/test split (with an
-  embargo after each test group as long as the longest warm-up any grid
-  point needs -- channels, EMA settling, filters, and the whole ~410-bar
-  memory of the online learner), the trial is chosen by the same
+  embargo after each test group in two parts: a fixed one as long as the
+  longest warm-up any grid point needs -- channels, EMA settling, filters,
+  the whole ~410-bar memory of the online learner, and a pullback order's
+  lifetime -- so no later entry decision reads a test-group bar; and, per
+  parameter set, on until the trade still open at its end has closed,
+  since that trade was opened or steered by the test group's prices and
+  can run for hundreds of bars. Tested directly: re-pricing only the test
+  groups leaves every training return unchanged, to 1e-12 (Keltner/ADX:
+  within the EMA settling tolerance, ~1e-6), apart from a different
+  clean trade taken because the book stayed busy longer), the trial is chosen by the same
   `--metric`, `--selection` and min-trades rule as the walk-forward (a
   profit factor counts only trades held entirely inside training; a split
   where nothing trades enough stays flat, and the share of such splits is
