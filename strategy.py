@@ -18,9 +18,11 @@ Switches (define a "template" -- a structurally distinct strategy):
                                       scores a FOLLOW and a FADE expert per
                                       lookback and the side with more weight
                                       decides, bar by bar, whether the
-                                      template follows or fades the break;
-                                      a trade keeps the logic it was opened
-                                      under. Works with any channel_type.
+                                      template follows or fades the break,
+                                      and by how much it leads, how big the
+                                      position is; a trade keeps the logic
+                                      it was opened under. Works with any
+                                      channel_type.
 
   channel_type    : 'donchian'  -> highest high / lowest low of n bars
                     'keltner'   -> EMA(n) +/- channel_k * ATR(atr_n)
@@ -100,7 +102,9 @@ Execution model (no look-ahead):
     lost at the `atr_mult_stop` ATR stop, or, when `vol_target` > 0, a
     notional of equity x (vol_target / sqrt(bars per year)) / realized
     per-bar vol (std of close-to-close returns over `vol_target_n` bars).
-    Either way capped at `max_leverage` x equity; the ATR stop is unchanged
+    A 'learned' direction scales either by the learner's conviction, its
+    net side weight in favour of the side taken (0..1). Either way capped
+    at `max_leverage` x equity; the ATR stop is unchanged
   * stops/limits are filled intrabar at the level, or at the open if the
     open gapped through the level
   * costs: `cost_bps` (commission + slippage) charged per side on notional
@@ -660,12 +664,15 @@ def hedge_diagnostics(df: pd.DataFrame, atr_n: int, mode: str = "trend", cost_bp
 
 
 def hedge_direction(df: pd.DataFrame, atr_n: int, cost_bps: float = 0.0) -> np.ndarray:
-    """Per-bar direction for direction_logic 'learned': +1 follow the
-    break, -1 fade it, from the net side weight of the learner over
-    follow and fade experts. NaN until the learner is formed."""
+    """Per-bar net side weight of the learner over follow and fade experts,
+    in [-1, 1], for direction_logic 'learned': its sign is the direction
+    (> 0 follow the break, else fade it) and its magnitude the learner's
+    conviction, which scales the position (see `_bar_loop`). +1 is every
+    expert on the follow side, 0 a dead heat. NaN until the learner is
+    formed."""
     W = hedge_weights(df, atr_n, "learned", cost_bps)
     _, sides = hedge_experts("learned")
-    d = np.where(W @ sides >= 0.0, 1.0, -1.0)
+    d = np.clip(W @ sides, -1.0, 1.0)      # the rows of W sum to 1 up to rounding
     d[:min(len(d), hedge_warmup(atr_n))] = np.nan
     return d
 
@@ -925,7 +932,9 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
 
     Sizing: `risk_pct` of cash lost at the ATR stop, or, when `vol_target_bar`
     > 0, a notional of cash * vol_target_bar / rvol[i-1] (both per-bar vols);
-    capped at `max_leverage` either way and fixed for the life of the trade.
+    scaled by the learner's conviction |direction[i-1]| when the direction is
+    learned (direction is a constant +/-1 otherwise); capped at `max_leverage`
+    either way and fixed for the life of the trade.
 
     Bars before `first_trade_bar` are indicator warm-up only: nothing is
     entered on them (and no order rests on them), so the walk-forward can
@@ -1165,6 +1174,12 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
                 qty = cash * (vol_target_bar / rvol[i - 1]) / fill_px
             else:
                 qty = cash * risk_pct / stop_dist
+            # scaled by the learner's conviction in the logic the trade is
+            # entered under: the net side weight in its favour on the bar
+            # before the fill (1 unless the direction is learned). A pullback
+            # limit placed under a logic the learner has since abandoned
+            # sizes to 0 and opens nothing, like a zero ATR size would.
+            qty *= max(direction[i - 1] * (1.0 if fill_trend else -1.0), 0.0)
             qty = min(qty, max_leverage * cash / fill_px)
             if qty > 0:
                 entry_cost = cost_rate * qty * fill_px

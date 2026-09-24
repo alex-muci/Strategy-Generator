@@ -220,7 +220,18 @@ class LiveOrderTests(unittest.TestCase):
         self._check_sizing(StrategyTemplate("t", entry_style="stop", exit_style="target_stop",
                                             vol_target=0.15, vol_target_n=60, max_leverage=2.0))
 
-    def _check_sizing(self, tpl):
+    def test_sizing_matches_the_engine_for_a_learned_direction(self):
+        """A learned direction scales the size by the learner's conviction on
+        the last closed bar; live.py must publish that scaled count, for a
+        stop entry and for a pullback limit that fills bars after it was
+        placed (sized on the fill bar, in the logic it was placed under)."""
+        self._check_sizing(StrategyTemplate("t", channel_type="hedge", direction_logic="learned",
+                                            entry_style="stop", exit_style="target_stop"))
+        self._check_sizing(StrategyTemplate("t", channel_type="hedge", direction_logic="learned",
+                                            entry_style="pullback", exit_style="target_stop",
+                                            pullback_atr_mult=0.25, pullback_valid_bars=5), min_hits=3)
+
+    def _check_sizing(self, tpl, min_hits=8):
         hits = 0
         for t in range(LOOKBACK + 20, len(self.df), 2):
             st = strategy_state(self.df.iloc[:t], tpl, equity=100_000.0, lookback_bars=LOOKBACK)
@@ -243,7 +254,7 @@ class LiveOrderTests(unittest.TestCase):
             self.assertAlmostEqual(o["shares"] / shares, 100_000.0 / after["equity"].iloc[-2],
                                    places=6, msg=f"bar {t}")
             hits += 1
-        self.assertGreater(hits, 8)
+        self.assertGreater(hits, min_hits)
 
 
 class RefitCadenceTests(unittest.TestCase):

@@ -507,6 +507,33 @@ class HedgeChannelTests(unittest.TestCase):
         self.assertGreater(fade["stats"]["total_return"], 0.0)
         self.assertLess(follow["stats"]["total_return"], fade["stats"]["total_return"])
 
+    def test_learned_direction_sizes_by_conviction(self):
+        """A learned direction is the learner's net side weight: its sign
+        picks follow or fade, its magnitude scales the position. A trade
+        entered from flat on bar i holds equity[i-1] * risk_pct /
+        (atr_mult_stop * ATR[i-1]) shares times the conviction on bar i-1;
+        a fixed direction is conviction 1."""
+        df = regime_series()
+        tpl = StrategyTemplate("t", channel_type="hedge", direction_logic="learned", cost_bps=0.0, max_leverage=1e9)
+        d = hedge_direction(df, tpl.atr_n, 0.0)
+        finite = d[~np.isnan(d)]
+        self.assertTrue((finite >= -1.0).all() and (finite <= 1.0).all())
+        convs = []
+        for direction, learned in (("learned", True), ("trend", False)):
+            res = backtest(df, tpl.with_params(direction_logic=direction))
+            eq = res["equity"].to_numpy(); a = res["indicators"]["atr"]
+            self.assertGreater(len(res["trades"]), 30)
+            for t in res["trades"]:
+                i = df.index.get_loc(t["entry_date"])
+                full = eq[i - 1] * tpl.risk_pct / (tpl.atr_mult_stop * a[i - 1])
+                conv = abs(d[i - 1]) if learned else 1.0
+                self.assertAlmostEqual(t["shares"] / full, conv, places=9, msg=f"{direction} {t['entry_date']}")
+                if learned:
+                    convs.append(conv)
+        self.assertTrue(all(0.0 < c <= 1.0 for c in convs))
+        self.assertGreater(sum(c < 0.9 for c in convs), 5)     # near-tied bars open small positions...
+        self.assertGreater(sum(c > 0.9 for c in convs), 5)     # ...one-sided ones full ones
+
     def test_learned_direction_follows_then_fades(self):
         df = regime_series()
         d = hedge_direction(df, 20)

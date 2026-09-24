@@ -21,7 +21,7 @@ conda create -p ./env python=3.12 pandas scikit-learn scipy matplotlib yfinance 
 conda activate ./env
 # or, with pip:  pip install -r requirements.txt   (the versions the suite was last run against)
 
-python -m unittest discover -s tests -v      # 240 tests (engine, templates, hedge learner, walk-forward, robustness, selection, data, live signals, both entry points)
+python -m unittest discover -s tests -v      # 242 tests (engine, templates, hedge learner, walk-forward, robustness, selection, data, live signals, both entry points)
 # faster (about 1:35 min instead of 4.5): pip install -r requirements-dev.txt, then, with ./env active,
 python -m pytest -n auto --dist loadscope   # same tests in parallel; loadscope keeps a class (and its one-off setup) on one worker
 
@@ -319,6 +319,13 @@ from the command line (never tuned by the walk-forward):
   the loss at the stop is now `atr_mult_stop x ATR x shares` rather than
   `risk_pct` of equity.
 
+For a `learned` direction either rule is then scaled by the learner's
+**conviction**: its net side weight in favour of the side the trade
+takes, 0 to 1. A bar on which the follow and fade experts are near-tied
+opens a small position, a one-sided book a full one, and a pullback
+limit placed under a logic the learner has abandoned by the time it
+fills opens nothing. The dashboard's share counts carry the same scale.
+
 Both are capped at `--max-leverage` x equity. Set the target near the
 asset's own volatility and the strategies trade at about 1x notional
 while in position, so `equity_curves.png` puts buy & hold on the same
@@ -393,8 +400,9 @@ algorithm from the prediction-with-expert-advice literature:
 - **Learned direction** (`direction_logic = "learned"`, any channel):
   the ladder doubles to a *follow* and a *fade* expert per lookback and
   the net side weight decides, bar by bar, whether the template follows
-  or fades the break. A trade keeps the exit logic of the side it was
-  opened under. On a series that alternates trend and mean-reversion
+  or fades the break, and by how much it leads, how large the position
+  is (see Position sizing). A trade keeps the exit logic of the side it
+  was opened under. On a series that alternates trend and mean-reversion
   regimes the direction flips to fade within the learner's memory of
   the range starting and back to follow in the next trend.
 
