@@ -476,10 +476,14 @@ of those.
 - **Rolling or anchored** windows, optional **embargo** gap.
 - **Combinatorial Purged CV** (AFML ch. 12): the history is cut into
   groups, every choice of test groups is a train/test split (with an
-  embargo after each test group of twice the longest channel lookback in
-  the grid, or of the hedge expert ladder), the trial is chosen by the same
+  embargo after each test group as long as the longest warm-up any grid
+  point needs -- channels, EMA settling, filters, and the whole ~410-bar
+  memory of the online learner), the trial is chosen by the same
   `--metric`, `--selection` and min-trades rule as the walk-forward (a
-  split where nothing trades enough stays flat), and the results are stitched into
+  profit factor counts only trades held entirely inside training; a split
+  where nothing trades enough stays flat, and the share of such splits is
+  printed next to P(CPCV<0) so an all-flat 0 % is not read as robust), and
+  the results are stitched into
   C(N,k)·k/N complete backtest paths. You get a *distribution* of OOS
   Sharpe rather than one number. A template whose single walk-forward
   path is a star while its CPCV paths straddle zero was lucky.

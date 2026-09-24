@@ -34,9 +34,8 @@ from scipy.stats import norm, skew as _skew, kurtosis as _kurtosis
 from scipy.cluster.hierarchy import linkage, leaves_list
 from scipy.spatial.distance import squareform
 
-import strategy as _strategy
 from strategy import backtest, periods_per_year
-from walkforward import smooth_scores, walk_forward, grid_combos, score_stats
+from walkforward import smooth_scores, walk_forward, grid_combos, score_stats, warmup_bars
 
 EULER_GAMMA = 0.5772156649015329
 
@@ -71,21 +70,14 @@ def trial_returns(df: pd.DataFrame, tpl, combos: list, initial_equity: float = 1
 
 
 def cpcv_embargo(tpl, combos: list) -> int:
-    """CPCV embargo after each test group: twice the longest channel lookback
-    any grid point of `tpl` uses -- the template's default `n_entry` can be
-    shorter than the grid's longest one. A template that trades off the
-    online-learned expert ladder (hedge channel or learned direction) looks
-    back over the ladder's longest Donchian channel whatever its grid."""
-    looks = []
-    for p in combos or [{}]:
-        t = tpl.with_params(**p)
-        if t.channel_type != "hedge":
-            looks.append(t.n_entry)
-            if t.exit_style == "channel":
-                looks.append(t.n_exit)
-        if t.channel_type == "hedge" or t.direction_logic == "learned":
-            looks.append(max(_strategy.HEDGE_LADDER))
-    return 2 * int(max(looks))
+    """CPCV embargo after each test group: the longest warm-up any grid point
+    of `tpl` needs (walkforward.warmup_bars), i.e. how far back its returns on
+    a bar can depend on earlier bars -- channels and exits, EMA settling, the
+    regime / volatility / bias filters, and the online learner's whole memory
+    (~410 bars) for a hedge channel or a learned direction. Training bars
+    closer than that after a test group still carry the test group's prices
+    in their indicators."""
+    return int(max(warmup_bars(tpl.with_params(**p)) for p in (combos or [{}])))
 
 
 def evaluate_template(
@@ -121,7 +113,8 @@ def evaluate_template(
               metric=metric, min_trades=wfa_kwargs.get("min_trades", 5), P=P)
     wfa["cpcv"] = {k: v for k, v in cp.items()
                    if k in ("path_sharpes", "path_max_dd", "n_paths", "sharpe_mean",
-                            "sharpe_std", "sharpe_min", "prob_sharpe_negative")}
+                            "sharpe_std", "sharpe_min", "prob_sharpe_negative",
+                            "frac_flat_splits")}
     wfa["trial_blocks"] = cscv_block_stats(R, cscv_partitions_n)
     wfa["n_trials"] = R.shape[1]
     return wfa
@@ -136,6 +129,25 @@ def _sharpe_cols(R: np.ndarray, mask: np.ndarray) -> np.ndarray:
     with np.errstate(invalid="ignore", divide="ignore"):
         sr = np.where(sd > 0, X.mean(axis=0) / sd * np.sqrt(periods_per_year()), 0.0)
     return sr
+
+
+def _trades_inside(E, P, mask: np.ndarray) -> np.ndarray:
+    """T x N: True on the exit row of each trade that lies ENTIRELY in the
+    rows `mask` selects. A trade that runs through a test group (or its
+    embargo) and exits in training must not bring the test period's P&L into
+    the training score. A trial holds one position at a time and never
+    re-enters on its exit bar, so a trade's entry is the latest entry flag in
+    E at or before its exit row. Without E only the exit row is checked."""
+    T = P.shape[0]
+    if E is None:
+        return np.repeat(mask[:, None], P.shape[1], axis=1)
+    rows = np.arange(T)[:, None]
+    entry = np.maximum.accumulate(np.where(E > 0, rows, -1), axis=0)     # T x N
+    outside = np.concatenate([[0], np.cumsum(~mask)])                     # rows not selected, up to t
+    ok = entry >= 0
+    e = np.where(ok, entry, 0)
+    gaps = outside[rows + 1] - outside[e]                                  # unselected rows in [entry, t]
+    return ok & (gaps == 0)
 
 
 def _score_cols(R: np.ndarray, E, P, mask: np.ndarray, metric: str, min_trades: int) -> np.ndarray:
@@ -156,7 +168,7 @@ def _score_cols(R: np.ndarray, E, P, mask: np.ndarray, metric: str, min_trades: 
     if metric == "profit_factor":
         if P is None:
             raise ValueError("cpcv(metric='profit_factor') needs P (trial_returns(..., with_pnl=True))")
-        pn = P[mask]
+        pn = np.where(_trades_inside(E, P, mask), P, 0.0)
         wins, losses = np.where(pn > 0, pn, 0).sum(axis=0), -np.where(pn < 0, pn, 0).sum(axis=0)
     out = np.empty(N)
     for j in range(N):
@@ -262,6 +274,10 @@ def cpcv(
         sharpe_std=float(sr.std(ddof=1)) if n_paths > 1 else 0.0,
         sharpe_min=float(sr.min()),
         prob_sharpe_negative=float((sr < 0).mean()),
+        # splits on which nothing traded enough in training (flat test
+        # groups): an all-flat CPCV has P(Sharpe < 0) = 0 for lack of
+        # evidence, not because the template is robust
+        frac_flat_splits=float((chosen < 0).mean()) if len(chosen) else 0.0,
         chosen_trials=chosen,
     )
 

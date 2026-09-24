@@ -159,12 +159,20 @@ def _run(df, asset, templates, pool, args) -> dict:
                 finalists=finalists, benchmark=bench)
 
 
+def _pneg(cp: dict) -> str:
+    """P(CPCV Sharpe < 0), with the share of splits that sat flat (nothing
+    traded enough in training): 0 % of nothing is no evidence of robustness."""
+    txt = f"{cp['prob_sharpe_negative']:.0%}"
+    flat = cp.get("frac_flat_splits", 0.0)
+    return txt + (f" ({flat:.0%} flat)" if flat > 0 else "")
+
+
 def _progress(i, total, name, res):
     s = res["summary"]
     cp = res["cpcv"]
     print(f"  [{i:>3}/{total}] {name:<40} oos_sharpe={s['oos_sharpe']:>6.2f} wfe={s['wfe']:>6.2f} "
           f"prof_win={s['pct_profitable_windows']:>4.0%} cpcv_mean={cp['sharpe_mean']:>6.2f} "
-          f"P(cpcv<0)={cp['prob_sharpe_negative']:>4.0%}")
+          f"P(cpcv<0)={_pneg(cp):>4}")
 
 
 def _print_family(fam: dict) -> None:
@@ -210,7 +218,7 @@ def finalist_diagnostics(results, port, fam, args, pool) -> dict:
         cp = res["cpcv"]
         print(f"  {name:<40} OOS SR {res['summary']['oos_sharpe']:>5.2f}  boot p={d['bootstrap_p']:.3f}  "
               f"DSR={d['dsr']:.2f}  CPCV {cp['sharpe_mean']:.2f}+/-{cp['sharpe_std']:.2f} "
-              f"P(<0)={cp['prob_sharpe_negative']:.0%}"
+              f"P(<0)={_pneg(cp)}"
               + (f"  WFA-matrix +cells={float((d['wfa_matrix']['oos_sharpe'] > 0).mean()):.0%}" if "wfa_matrix" in d else ""))
     return out
 
@@ -230,6 +238,7 @@ def _report(df, results, port, nested, fam, finalists, bench, args):
     table = port["candidate_stats"].copy()
     table["cpcv_sharpe_mean"] = [results[n]["cpcv"]["sharpe_mean"] for n in table.index]
     table["cpcv_prob_negative"] = [results[n]["cpcv"]["prob_sharpe_negative"] for n in table.index]
+    table["cpcv_frac_flat"] = [results[n]["cpcv"].get("frac_flat_splits", 0.0) for n in table.index]
     table["selected"] = table.index.isin(selected)
     table = table.sort_values("oos_sharpe", ascending=False)
     table.round(4).to_csv(f"{out}/template_ranking.csv")
@@ -409,7 +418,7 @@ def _report(df, results, port, nested, fam, finalists, bench, args):
         s = results[name]["summary"]; cp = results[name]["cpcv"]; f = finalists[name]
         L.append(f"| {name} | {s['oos_sharpe']:.2f} | {s['wfe']:.2f} | {s['pct_profitable_windows']:.0%} | "
                  f"{'yes' if s['pardo_pass'] else 'no'} | {cp['sharpe_mean']:.2f}+/-{cp['sharpe_std']:.2f} | "
-                 f"{cp['prob_sharpe_negative']:.0%} | {f['bootstrap_p']:.3f} | {f['dsr']:.2f} | "
+                 f"{_pneg(cp)} | {f['bootstrap_p']:.3f} | {f['dsr']:.2f} | "
                  f"{s['oos_exposure']:.0%} | {s['oos_notional']:.2f} | {s['oos_avg_net_exposure']:+.2f} | "
                  f"{port['weights'][name]:.2f} |\n")
     L.append("\nexposure = share of OOS bars with a position; notional = mean |position notional| / equity over all "

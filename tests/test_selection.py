@@ -26,7 +26,7 @@ from data import synthetic_ohlc  # noqa: E402
 from generator import generate_templates, param_grid_for  # noqa: E402
 from walkforward import (  # noqa: E402
     walk_forward, grid_combos, score_stats, select_params, matrix_cells, matrix_row, matrix_frame,
-    walk_forward_matrix,
+    walk_forward_matrix, warmup_bars,
 )
 from robustness import (  # noqa: E402
     evaluate_template, trial_returns, cscv_block_stats, merge_block_stats, cscv_pbo,
@@ -36,7 +36,8 @@ from portfolio import (  # noqa: E402
     select_portfolio, select_subset, portfolio_weights, walk_forward_portfolio, candidate_table,
     returns_frame, trade_count_proxy,
 )
-from strategy import StrategyTemplate, HEDGE_LADDER  # noqa: E402
+from strategy import StrategyTemplate, hedge_warmup  # noqa: E402
+import robustness  # noqa: E402
 
 
 class EvaluateTemplateTests(unittest.TestCase):
@@ -365,18 +366,41 @@ class CpcvSelectionRuleTests(unittest.TestCase):
         self.assertTrue((out["chosen_trials"] == -1).all())
         self.assertTrue((out["path_returns"] == 0.0).all())
         self.assertEqual(out["sharpe_mean"], 0.0)
+        self.assertEqual(out["frac_flat_splits"], 1.0)                # flagged: no evidence, not "robust"
 
-    def test_embargo_follows_the_grid_not_the_default(self):
+    def test_embargo_covers_every_grid_points_warm_up(self):
+        """The embargo is how far back a bar's return can depend on earlier
+        bars: the longest warm-up over the grid, which for the online
+        learner is its whole memory, not twice its longest channel."""
         tpl = StrategyTemplate("t", n_entry=20, n_exit=10)
         combos, _ = grid_combos({"n_entry": [20, 40, 60], "n_exit": [10, 20]})
-        self.assertEqual(cpcv_embargo(tpl, combos), 120)
-        combos, _ = grid_combos({"n_entry": [10], "n_exit": [30]})
-        self.assertEqual(cpcv_embargo(tpl, combos), 60)             # channel exit longer than entry
-        self.assertEqual(cpcv_embargo(tpl.with_params(exit_style="atr_trail"), combos), 20)
-        ladder = 2 * max(HEDGE_LADDER)
-        self.assertEqual(cpcv_embargo(StrategyTemplate("h", channel_type="hedge", n_entry=500), [{}]), ladder)
-        self.assertEqual(cpcv_embargo(StrategyTemplate("l", direction_logic="learned", n_entry=10), [{}]), ladder)
+        want = max(warmup_bars(tpl.with_params(**p)) for p in combos)
+        self.assertEqual(cpcv_embargo(tpl, combos), want)
+        self.assertGreaterEqual(want, 60)
+        self.assertGreater(cpcv_embargo(tpl, [{"n_entry": 60}]), cpcv_embargo(tpl, [{"n_entry": 20}]))
+        for h in (StrategyTemplate("h", channel_type="hedge"),
+                  StrategyTemplate("l", direction_logic="learned", n_entry=10)):
+            self.assertGreaterEqual(cpcv_embargo(h, [{}]), hedge_warmup(h.atr_n))
+        kel = StrategyTemplate("k", channel_type="keltner", n_entry=60)
+        self.assertGreater(cpcv_embargo(kel, [{}]), 2 * 60)          # the EMA's settling, not its span
 
+    def test_profit_factor_ignores_trades_that_straddle_a_test_group(self):
+        """A trade booked on its exit bar in training but held through a test
+        group must not bring the test period's P&L into the training score."""
+        T = 120
+        R = np.zeros((T, 2)); E = np.zeros((T, 2), dtype=np.int8); P = np.zeros((T, 2))
+        mask = np.ones(T, bool); mask[40:60] = False                 # a test group
+        E[30, 0] = 1; P[70, 0] = 1000.0                              # held across 40..59: must not count
+        E[5, 0] = 1;  P[10, 0] = -10.0                                # fully in training
+        E[80, 0] = 1; P[85, 0] = 5.0
+        E[62, 1] = 1; P[65, 1] = 3.0                                  # inside, after the gap
+        E[100, 1] = 1; P[100, 1] = -1.0                               # same-bar exit
+        inside = robustness._trades_inside(E, P, mask)
+        self.assertFalse(inside[70, 0])
+        self.assertTrue(inside[10, 0] and inside[85, 0] and inside[65, 1] and inside[100, 1])
+        scores = robustness._score_cols(R, E, P, mask, "profit_factor", 1)
+        self.assertAlmostEqual(scores[0], 0.5)                        # 5 / 10, not 1005 / 10
+        self.assertAlmostEqual(scores[1], 3.0)
 
 class FilterEvidenceTests(unittest.TestCase):
     def test_min_windows_counts_live_windows(self):
