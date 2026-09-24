@@ -64,7 +64,7 @@ from dataclasses import asdict
 import numpy as np
 import pandas as pd
 
-from data import synthetic_ohlc
+from data import synthetic_ohlc, yahoo_earliest_start
 from generator import generate_templates, param_grid_for, FAMILIES
 from live import (
     refit_params, due_for_refit, strategy_state, bars_since,
@@ -603,6 +603,13 @@ def signals(args) -> dict:
         # the validated process never chose
         if cfg.get("start") and pd.Timestamp(cfg["start"]) < pd.Timestamp(start):
             start = pd.Timestamp(cfg["start"]).strftime("%Y-%m-%d")
+        # ... but Yahoo keeps only ~2 years of hourly bars (60 days of finer
+        # ones): asking for more returns nothing at all
+        floor = None if args.synthetic else yahoo_earliest_start(interval, now)
+        if floor is not None and pd.Timestamp(start) < floor:
+            print(f"  WARNING: anchored spec starts {start}, but Yahoo serves {interval} bars only "
+                  f"from {floor.date()}; refits use that shorter history, not the full anchored window")
+            start = floor.strftime("%Y-%m-%d")
     print(f"Loading {len(spec['assets'])} assets, {need}+ bars of {interval} history"
           f"{' from ' + start if cfg.get('anchored') else ''}"
           f"{' [synthetic]' if args.synthetic else ''}...")

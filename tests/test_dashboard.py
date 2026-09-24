@@ -273,6 +273,34 @@ class SignalsWiringTests(unittest.TestCase):
             ED.load_assets = real
             shutil.rmtree(d, ignore_errors=True)
 
+    def test_an_anchored_hourly_spec_stays_inside_yahoos_history(self):
+        # Yahoo serves ~730 days of 1h bars; a request from an older anchored
+        # start would come back empty, so the load is clamped to what exists
+        class Loaded(Exception):
+            pass
+        seen = {}
+
+        def fake_load_assets(assets, **kw):
+            seen.update(kw)
+            raise Loaded
+
+        d = tempfile.mkdtemp(prefix="etfdash-anch1h-")
+        real = ED.load_assets
+        try:
+            spec = dict(version=ED.SPEC_VERSION, assets=["SPY"], slots=[],
+                        config=dict(interval="1h", periods_per_year=252 * 7, train_bars=500,
+                                    test_bars=125, anchored=True, start="2005-01-01"))
+            with open(os.path.join(d, "portfolio.json"), "w") as f:
+                json.dump(spec, f)
+            ED.load_assets = fake_load_assets
+            with self.assertRaises(Loaded):
+                ED.main(["signals", "--state-dir", d, "--interval", "1h",
+                         "--now", "2026-06-15 15:00"])
+            self.assertEqual(seen["start"], "2024-06-16")
+        finally:
+            ED.load_assets = real
+            shutil.rmtree(d, ignore_errors=True)
+
     def test_a_slot_that_could_not_be_fitted_waits_for_its_window(self):
         from dataclasses import asdict
         from types import SimpleNamespace

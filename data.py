@@ -76,6 +76,25 @@ def load_yfinance(
     return df
 
 
+# how far back Yahoo serves intraday bars (a request that starts earlier comes
+# back empty): about 730 days of '1h', 60 days of anything finer. One day of
+# margin each, since Yahoo counts from its own clock.
+YAHOO_INTRADAY_DAYS = {"1h": 729, "60m": 729}
+YAHOO_FINE_DAYS = 59
+
+
+def yahoo_earliest_start(interval: str, now: pd.Timestamp | None = None) -> pd.Timestamp | None:
+    """The earliest start date Yahoo still serves `interval` bars from, or None
+    for daily and longer bars (decades of history)."""
+    if not _is_intraday(interval):
+        return None
+    now = pd.Timestamp.now("UTC").tz_convert(None) if now is None else pd.Timestamp(now)
+    if now.tz is not None:
+        now = now.tz_convert("UTC").tz_localize(None)
+    days = YAHOO_INTRADAY_DAYS.get(interval, YAHOO_FINE_DAYS)
+    return (now - pd.Timedelta(days=days)).normalize()
+
+
 def _is_intraday(interval: str) -> bool:
     return interval.endswith(("m", "h")) and not interval.endswith("mo")
 
