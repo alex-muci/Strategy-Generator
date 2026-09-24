@@ -31,9 +31,12 @@ Switches (define a "template" -- a structurally distinct strategy):
                                    (HEDGE_LADDER) is weighted bar by bar by
                                    AdaHedge, a parameter-free exponential-
                                    weights (Hedge / follow-the-leader)
-                                   learner scoring the last HEDGE_MEMORY
-                                   bars; the channel is the weight-averaged
-                                   expert channel. Rewards are signed by
+                                   learner, discounted over a ladder of
+                                   lifetimes (HEDGE_HORIZONS) it also learns
+                                   to pick from, scoring the last
+                                   HEDGE_MEMORY bars net of cost_bps; the
+                                   channel is the weight-averaged expert
+                                   channel. Rewards are signed by
                                    direction_logic, so a countertrend
                                    template learns which lookback pays to
                                    FADE (anti-correlation).
@@ -267,7 +270,7 @@ def bollinger(df: pd.DataFrame, n: int, k: float):
 
 
 def channel(df: pd.DataFrame, kind: str, n: int, k: float, atr_n: int,
-            mode: str = "trend", role: str = "entry"):
+            mode: str = "trend", role: str = "entry", cost_bps: float = 0.0):
     if kind == "donchian":
         return donchian(df, n)
     if kind == "keltner":
@@ -275,7 +278,8 @@ def channel(df: pd.DataFrame, kind: str, n: int, k: float, atr_n: int,
     if kind == "bollinger":
         return bollinger(df, n, k)
     if kind == "hedge":
-        return hedge_channel(df, atr_n, mode=mode, scale=HEDGE_EXIT_SCALE if role == "exit" else 1.0)
+        return hedge_channel(df, atr_n, mode=mode, scale=HEDGE_EXIT_SCALE if role == "exit" else 1.0,
+                             cost_bps=cost_bps)
     raise ValueError(f"unknown channel_type {kind}")
 
 
@@ -294,21 +298,50 @@ def channel(df: pd.DataFrame, kind: str, n: int, k: float, atr_n: int,
 #   * loss     : each bar, expert e is scored on the ATR-normalised return
 #                of the stance it implied on the previous bar (new n-bar
 #                high -> long, new n-bar low -> short, else hold; a fade
-#                expert takes the opposite side). Losses are in [0, 1].
+#                expert takes the opposite side), net of the cost of the
+#                sides it traded to reach its new stance (cost_bps per
+#                side, in ATRs, the engine's own charge), so the learner
+#                rewards the lookback whose edge survives its turnover.
+#                Losses are in [0, 1].
 #   * learner  : AdaHedge (de Rooij, van Erven, Grunwald, Koolen, JMLR
-#                2014): exponential weights w_e ~ exp(-eta * cum. loss_e)
-#                whose learning rate eta = ln(N) / (accumulated mixability
-#                gap) starts at infinity, i.e. plain follow-the-leader,
-#                and shrinks only as much as the data forces it to. It is
-#                run over the last HEDGE_MEMORY bars only. Plain AdaHedge
-#                finds the best expert IN HINDSIGHT over all history: after
-#                a long trend a fade expert would need the whole history
-#                back before it could win. The bounded memory is what lets
-#                it track a change of regime, and it also makes the learner
-#                state a function of a fixed number of past bars, which the
-#                walk-forward's warm-up buffer relies on (walkforward.
+#                2014): exponential weights w_e ~ exp(-eta * deficit_e)
+#                (deficit = cumulative loss behind the leader) whose
+#                learning rate eta = ln(N) / (accumulated mixability gap)
+#                starts at infinity, i.e. follow-the-leader, and shrinks
+#                only as much as the data forces it to. Two changes to the
+#                plain algorithm, both parameter-free:
+#                - DISCOUNTING: losses and the gap decay with a lifetime H
+#                  (gamma = 1 - 1/H). Plain AdaHedge's eta only ever
+#                  falls; a discounted gap lets it rise again after a calm
+#                  stretch, so eta reflects RECENT surprise. A discounted
+#                  deficit is bounded by H times the expert's shortfall
+#                  per bar, so no expert is ever written off for good: one
+#                  that starts winning is back in front after about
+#                  H ln 2 bars, whatever it lost before.
+#                - A LADDER OF LIFETIMES HEDGE_HORIZONS instead of one
+#                  memory: one learner per lifetime, and a Bayesian
+#                  mixture on top (Vovk's aggregating algorithm, unit
+#                  rate, see _hedge_window) scores each learner on its
+#                  own hedge loss. When the long-memory learner is surprised
+#                  by a regime break the short-memory one has already
+#                  moved and its lower hedge loss wins the meta learner
+#                  over, so a new leader is in front within tens of bars;
+#                  in a stable regime the long-memory learner is the more
+#                  concentrated and takes the weight back. The played
+#                  weights stay a convex combination of the experts.
+#                (A fixed-share floor on the weights was tried and
+#                dropped: it bought no revival the ladder does not already
+#                give, and it flipped the learned direction on every
+#                pullback inside a trend.)
+#                Everything is still restarted every bar over the last
+#                HEDGE_MEMORY bars, so the learner state is an exact
+#                function of a fixed number of past bars, which the walk-
+#                forward's warm-up buffer relies on (walkforward.
 #                window_backtest: a window warmed on `warmup_bars` of
-#                history must match a full-history run exactly).
+#                history must match a full-history run exactly). The
+#                window's edge now carries gamma^HEDGE_MEMORY of a bar's
+#                weight (e^-1.6 at H = 160, e^-3 at H = 80, e^-6 at H =
+#                40) instead of all of it: a horizon, not a cliff.
 #   * channel  : upper/lower/mid = the weight-averaged expert channels. The
 #                exit channel reuses the weights over the ladder scaled by
 #                HEDGE_EXIT_SCALE (Turtle 20/10, 55/20 style).
@@ -318,6 +351,11 @@ def channel(df: pd.DataFrame, kind: str, n: int, k: float, atr_n: int,
 HEDGE_LADDER = (10, 20, 40, 80)
 HEDGE_EXIT_SCALE = 0.5
 HEDGE_MEMORY = 250            # bars of losses the learner scores (about a year of daily bars)
+HEDGE_HORIZONS = (20, 40, 80, 160)   # lifetimes H of the discounted learners (gamma = 1 - 1/H): the lookback
+                                     # ladder doubled, from a month to most of the memory. Shorter lifetimes
+                                     # revive a written-off expert sooner (16: ~16 bars, 20: ~20, 32: ~25) but
+                                     # flip the learned direction more inside a trend (16 fades 11 % of a
+                                     # trend's bars on the regime test series, 20 7 %, 32 7 %, 64 1 %)
 HEDGE_MODES = ("trend", "countertrend", "learned")
 
 
@@ -342,94 +380,175 @@ def hedge_experts(mode: str):
     raise ValueError(f"unknown hedge mode {mode}")
 
 
-def _adahedge_run(loss, t0, t1, w):
-    """AdaHedge from a cold start over loss[t0:t1] (N experts, losses in
-    [0, 1]); writes the final weights into `w`, returns the final eta."""
-    N = loss.shape[1]
-    L = np.zeros(N)
-    delta = 0.0
-    eta = np.inf
-    log_n = np.log(N)
+def _hedge_round(l, d, w, z, delta, eta, gamma):
+    """One AdaHedge round of one learner over N experts, in place.
+
+    `l` are this round's losses (in [0, 1]), `w` the weights the learner
+    PLAYS on them (overwritten with the next round's), `d` its deficits
+    (discounted cumulative loss behind the leader, so min d = 0), `z` the
+    normaliser of `w` (sum_e exp(-eta d[e])), `delta` and `eta` its
+    accumulated mixability gap and learning rate and `gamma` the discount
+    (1 for none). Returns (z, delta, eta, gap, h): the new state, the
+    round's gap and the Hedge loss h = w . l the played weights suffered."""
+    N = l.shape[0]
+    h = 0.0
     for e in range(N):
-        w[e] = 1.0 / N
+        h += w[e] * l[e]
+    if delta > 0.0:
+        # The mix loss -log(sum_e w[e] exp(-eta l[e])) / eta, from the
+        # deficits the weights were made of (w[e] = exp(-eta d[e]) / z), not
+        # from w itself. While delta is tiny eta is huge and a trailing
+        # expert's weight underflows to exactly 0; on the round it beats the
+        # leaders by a wide margin every term of the sum over w would be 0,
+        # the mix loss +inf, the round's gap discarded and eta left huge --
+        # on the very round that should end follow-the-leader. Here the
+        # smallest exponent of the sum is 0, so it lies in [1, N], as z does.
+        m1 = np.inf                            # min over e of d[e] + l[e]
+        for e in range(N):
+            if d[e] + l[e] < m1:
+                m1 = d[e] + l[e]
+        s1 = 0.0
+        for e in range(N):
+            s1 += np.exp(-eta * (d[e] + l[e] - m1))
+        mix = m1 - np.log(s1 / z) / eta
+    else:                                      # eta = inf and w uniform: the best expert's loss
+        mix = np.inf
+        for e in range(N):
+            if l[e] < mix:
+                mix = l[e]
+    gap = h - mix
+    if gap < 0.0:                              # rounding only: the mix loss never beats the Hedge loss
+        gap = 0.0
+    delta = gamma * delta + gap                # discounted cumulative mixability gap
+    # discounted deficits, re-centred on the new leader
+    m = np.inf
+    for e in range(N):
+        d[e] = gamma * d[e] + l[e]
+        if d[e] < m:
+            m = d[e]
+    for e in range(N):
+        d[e] -= m
+    # new learning rate and weights
+    if delta > 0.0:
+        eta = np.log(N) / delta
+        z = 0.0
+        for e in range(N):
+            w[e] = np.exp(-eta * d[e])
+            z += w[e]
+        for e in range(N):
+            w[e] /= z
+    else:
+        # only while every round so far scored all experts alike, so the
+        # deficits are all 0 and follow-the-leader is a tie
+        eta = np.inf
+        z = float(N)
+        for e in range(N):
+            w[e] = 1.0 / N
+    return z, delta, eta, gap, h
+
+
+def _hedge_window(loss, t0, t1, gammas, d, w, z, delta, eta, h, dm, v):
+    """The K discounted learners (one per lifetime, gammas[k]) and the meta
+    learner over them, from a cold start over loss[t0:t1]. The work arrays
+    hold the state: d, w (K x N) the deficits and played weights per
+    learner, z / delta / eta (K), h (K) the learners' Hedge losses of the
+    round, dm / v (K) the meta learner's deficits and weights. Returns
+    (meta Hedge loss, best expert loss) of the last round; the final
+    weights are left in w and v.
+
+    The meta learner is scored on the loss each learner's played weights
+    suffered (sum_k v[k] h[k] is then the loss the played mixture suffered)
+    and is the aggregating algorithm (Vovk 1990) with a unit learning rate,
+    i.e. Bayesian averaging with likelihood exp(-loss), discounted at the
+    longest lifetime. AdaHedge's own rate is wrong at this level: the
+    learners' losses are near-identical most of the time, so its mixability
+    gap stays tiny, eta explodes and the meta weights become follow-the-
+    leader on rounding noise (a mirror-image series moved 0.1 of the weight
+    on a 1e-14 loss difference). With a unit rate a tie stays a tie and a
+    regime break, 20 bars of 0.1 lower loss at the short lifetime, is 7:1
+    odds in its favour; the losses being in [0, 1] is what makes 1 the
+    natural rate."""
+    K = gammas.shape[0]
+    N = loss.shape[1]
+    gm = 0.0
+    for k in range(K):
+        if gammas[k] > gm:
+            gm = gammas[k]
+        z[k] = float(N)
+        delta[k] = 0.0
+        eta[k] = np.inf
+        dm[k] = 0.0
+        v[k] = 1.0 / K
+        for e in range(N):
+            d[k, e] = 0.0
+            w[k, e] = 1.0 / N
+    hm = 0.5
+    best = 0.5
     for t in range(t0, t1):
         l = loss[t]
-        # Hedge loss of the current mixture vs. the mix loss
-        h = 0.0
+        hm = 0.0
+        for k in range(K):
+            z[k], delta[k], eta[k], _, h[k] = _hedge_round(l, d[k], w[k], z[k], delta[k], eta[k], gammas[k])
+            hm += v[k] * h[k]
+        m = np.inf
+        for k in range(K):
+            dm[k] = gm * dm[k] + h[k]
+            if dm[k] < m:
+                m = dm[k]
+        s = 0.0
+        for k in range(K):
+            dm[k] -= m
+            v[k] = np.exp(-dm[k])
+            s += v[k]
+        for k in range(K):
+            v[k] /= s
+        best = np.inf
         for e in range(N):
-            h += w[e] * l[e]
-        if delta > 0.0:
-            # The mix loss -log(sum_e w[e] exp(-eta l[e])) / eta, from the
-            # cumulative losses the weights were made of (w[e] ~ exp(-eta d[e]),
-            # d = L - min L), not from w itself. While delta is tiny eta is huge
-            # and a trailing expert's weight underflows to exactly 0; on the
-            # round it beats the leaders by a wide margin every term of the sum
-            # over w is 0, the mix loss comes out +inf, the round's gap is
-            # discarded and eta stays huge -- on the very round that should end
-            # follow-the-leader. Here the smallest exponent of each sum is 0, so
-            # both sums lie in [1, N].
-            m0 = L.min()
-            m1 = np.inf                        # min over e of d[e] + l[e]
-            for e in range(N):
-                if L[e] - m0 + l[e] < m1:
-                    m1 = L[e] - m0 + l[e]
-            s0 = 0.0
-            s1 = 0.0
-            for e in range(N):
-                s0 += np.exp(-eta * (L[e] - m0))
-                s1 += np.exp(-eta * (L[e] - m0 + l[e] - m1))
-            mix = m1 - np.log(s1 / s0) / eta
-        else:                                  # eta = inf: mix loss is the best supported expert
-            mix = 1.0
-            for e in range(N):
-                if w[e] > 0.0 and l[e] < mix:
-                    mix = l[e]
-        gap = h - mix
-        if gap > 0.0:
-            delta += gap                       # cumulative mixability gap
-        for e in range(N):
-            L[e] += l[e]
-        # new learning rate and weights
-        m = L.min()
-        if delta > 0.0:
-            eta = log_n / delta
-            s = 0.0
-            for e in range(N):
-                w[e] = np.exp(-eta * (L[e] - m))
-                s += w[e]
-            for e in range(N):
-                w[e] /= s
-        else:
-            eta = np.inf                       # follow the leader
-            cnt = 0
-            for e in range(N):
-                if L[e] <= m:
-                    w[e] = 1.0
-                    cnt += 1
-                else:
-                    w[e] = 0.0
-            for e in range(N):
-                w[e] /= cnt
-    return eta
+            if l[e] < best:
+                best = l[e]
+    return hm, best
 
 
-def _adahedge_loop(loss, memory):
-    """Windowed AdaHedge over a T x N loss matrix: row t of the returned
-    T x N weights is AdaHedge run from scratch over the last `memory`
-    rounds up to and including t. Also returns the per-round eta. Plain
-    numpy so numba can compile it."""
+def _hedge_core(loss, memory, gammas):
+    """Windowed learner over a T x N loss matrix: row t of the returned
+    T x N weights is the mixture played after the last `memory` rounds up to
+    and including t, from a cold start. Also returns the learners' eta
+    (T x K), the meta learner's weights over them (T x K) and the surprise
+    of each round: the Hedge loss the played mixture suffered minus the
+    best expert's loss (T). Plain numpy so numba can compile it."""
     T, N = loss.shape
+    K = gammas.shape[0]
     W = np.empty((T, N))
-    etas = np.empty(T)
-    w = np.empty(N)
+    ETA = np.empty((T, K))
+    V = np.empty((T, K))
+    SURPRISE = np.empty(T)
+    d = np.empty((K, N)); w = np.empty((K, N))
+    z = np.empty(K); delta = np.empty(K); eta = np.empty(K); h = np.empty(K); dm = np.empty(K); v = np.empty(K)
     for t in range(T):
         t0 = t + 1 - memory
         if t0 < 0:
             t0 = 0
-        etas[t] = _adahedge_run(loss, t0, t + 1, w)
+        hm, best = _hedge_window(loss, t0, t + 1, gammas, d, w, z, delta, eta, h, dm, v)
         for e in range(N):
-            W[t, e] = w[e]
-    return W, etas
+            s = 0.0
+            for k in range(K):
+                s += v[k] * w[k, e]
+            W[t, e] = s
+        for k in range(K):
+            ETA[t, k] = eta[k]
+            V[t, k] = v[k]
+        SURPRISE[t] = hm - best if hm > best else 0.0   # a convex mix can round a few ulps under the best
+    return W, ETA, V, SURPRISE
+
+
+def _adahedge_loop(loss, memory=HEDGE_MEMORY, horizons=HEDGE_HORIZONS):
+    """Windowed, discounted AdaHedge over a ladder of lifetimes: W (T x N)
+    the played weights, ETA (T x K) the learners' learning rates, V (T x K)
+    the meta weights over the lifetimes, SURPRISE (T) the played mixture's
+    Hedge loss minus the best expert's, each round."""
+    loss = np.ascontiguousarray(loss, dtype=np.float64)
+    gammas = 1.0 - 1.0 / np.asarray(horizons, dtype=np.float64)
+    return _hedge_fast(loss, int(memory), np.ascontiguousarray(gammas))
 
 
 def _expert_stances(high, low, close, uppers, lowers, sides):
@@ -459,17 +578,22 @@ def _expert_stances(high, low, close, uppers, lowers, sides):
 
 try:
     from numba import njit as _njit_h
-    _adahedge_run = _njit_h(cache=True, nogil=True)(_adahedge_run)
-    _adahedge_fast = _njit_h(cache=True, nogil=True)(_adahedge_loop)
+    _hedge_round = _njit_h(cache=True, nogil=True)(_hedge_round)
+    _hedge_window = _njit_h(cache=True, nogil=True)(_hedge_window)
+    _hedge_fast = _njit_h(cache=True, nogil=True)(_hedge_core)
     _stances_fast = _njit_h(cache=True, nogil=True)(_expert_stances)
 except Exception:  # pragma: no cover
-    _adahedge_fast = _adahedge_loop
+    _hedge_fast = _hedge_core
     _stances_fast = _expert_stances
 
 
-def hedge_weights(df: pd.DataFrame, atr_n: int, mode: str = "trend") -> np.ndarray:
-    """T x n_experts learner weights, row t computed from bars <= t
-    (the last HEDGE_MEMORY of them)."""
+def _hedge_loss(df: pd.DataFrame, atr_n: int, mode: str, cost_bps: float = 0.0):
+    """The T x N loss matrix the learner scores (in [0, 1]) plus the ladder's
+    (lookbacks, sides): expert e's loss on bar t is 0.5 * (1 - payoff) where
+    the payoff is the ATR-normalised move of bar t in the direction of the
+    stance e held at the previous close, minus the cost (per side, in ATRs,
+    as the engine charges it) of the sides e traded at the close of t to
+    reach its new stance, halved and clipped to [-1, 1]."""
     lookbacks, sides = hedge_experts(mode)
     high = _to_arr(df["High"]); low = _to_arr(df["Low"]); close = _to_arr(df["Close"])
     T = len(close)
@@ -483,33 +607,74 @@ def hedge_weights(df: pd.DataFrame, atr_n: int, mode: str = "trend") -> np.ndarr
         uppers[:, e], lowers[:, e] = cache[int(n)]
     S = _stances_fast(high, low, close, uppers, lowers, np.ascontiguousarray(sides))
     a = _to_arr(atr(df, atr_n))
-    # ATR-normalised next-bar move, scored against the stance held at the previous close
-    z = np.zeros(T)
-    z[1:] = (close[1:] - close[:-1]) / np.where(a[:-1] > 0, a[:-1], np.nan)
-    payoff = np.clip(S[:-1] * z[1:, None] / 2.0, -1.0, 1.0)
+    a_prev = np.where(a[:-1] > 0, a[:-1], np.nan)
+    z = (close[1:] - close[:-1]) / a_prev                    # next-bar move, in ATRs
+    c = close[1:] * (float(cost_bps) / 1e4) / a_prev         # one side's cost, in ATRs
+    flips = np.abs(S[1:] - S[:-1])                            # sides traded to reach the new stance (a reversal is two)
+    payoff = np.clip((S[:-1] * z[:, None] - c[:, None] * flips) / 2.0, -1.0, 1.0)
     loss = np.full((T, N), 0.5)
     loss[1:] = 0.5 * (1.0 - np.nan_to_num(payoff, nan=0.0))
     formed = ~np.isnan(uppers)           # an unformed expert has no stance: neutral loss
     loss = np.where(formed, loss, 0.5)
-    W, _ = _adahedge_fast(np.ascontiguousarray(loss), int(HEDGE_MEMORY))
-    return W
+    return np.ascontiguousarray(loss), lookbacks, sides
 
 
-def hedge_direction(df: pd.DataFrame, atr_n: int) -> np.ndarray:
+def _hedge_run(df: pd.DataFrame, atr_n: int, mode: str, cost_bps: float):
+    loss, _, _ = _hedge_loss(df, atr_n, mode, cost_bps)
+    W, ETA, V, SURPRISE = _adahedge_loop(loss)
+    return W, ETA, V, SURPRISE, loss
+
+
+def _hedge_cached(df: pd.DataFrame, atr_n: int, mode: str, cost_bps: float, dfkey=None):
+    """One learner run per (bars, mode, ATR length, cost): the entry channel,
+    the exit channel and the learned direction all read the same weights."""
+    return _cached(df, ("hedge", mode, int(atr_n), float(cost_bps)),
+                   lambda: _hedge_run(df, atr_n, mode, cost_bps), dfkey)
+
+
+def hedge_weights(df: pd.DataFrame, atr_n: int, mode: str = "trend", cost_bps: float = 0.0) -> np.ndarray:
+    """T x n_experts learner weights, row t computed from bars <= t
+    (the last HEDGE_MEMORY of them)."""
+    return _hedge_cached(df, atr_n, mode, cost_bps)[0]
+
+
+def hedge_diagnostics(df: pd.DataFrame, atr_n: int, mode: str = "trend", cost_bps: float = 0.0) -> dict:
+    """What the learner did, bar by bar, for notebooks and dashboards:
+    `weights` (expert weights, columns follow_10 / fade_20 / ...), `loss`
+    (the expert losses it scored), `eta` (each lifetime's learning rate,
+    columns = HEDGE_HORIZONS), `horizon_weights` (the meta learner's weights
+    over the lifetimes: shorter ones gaining is the learner shortening its
+    memory) and `surprise` (the loss the played mixture suffered minus the
+    best expert's, in [0, 1]). Nothing here changes the strategy."""
+    W, ETA, V, SURPRISE, loss = _hedge_cached(df, atr_n, mode, cost_bps)
+    lookbacks, sides = hedge_experts(mode)
+    experts = [f"{'follow' if s > 0 else 'fade'}_{int(n)}" for n, s in zip(lookbacks, sides)]
+    idx = df.index
+    return {
+        "weights": pd.DataFrame(W, index=idx, columns=experts),
+        "loss": pd.DataFrame(loss, index=idx, columns=experts),
+        "eta": pd.DataFrame(ETA, index=idx, columns=list(HEDGE_HORIZONS)),
+        "horizon_weights": pd.DataFrame(V, index=idx, columns=list(HEDGE_HORIZONS)),
+        "surprise": pd.Series(SURPRISE, index=idx),
+    }
+
+
+def hedge_direction(df: pd.DataFrame, atr_n: int, cost_bps: float = 0.0) -> np.ndarray:
     """Per-bar direction for direction_logic 'learned': +1 follow the
     break, -1 fade it, from the net side weight of the learner over
     follow and fade experts. NaN until the learner is formed."""
-    W = hedge_weights(df, atr_n, "learned")
+    W = hedge_weights(df, atr_n, "learned", cost_bps)
     _, sides = hedge_experts("learned")
     d = np.where(W @ sides >= 0.0, 1.0, -1.0)
     d[:min(len(d), hedge_warmup(atr_n))] = np.nan
     return d
 
 
-def hedge_channel(df: pd.DataFrame, atr_n: int, mode: str = "trend", scale: float = 1.0):
+def hedge_channel(df: pd.DataFrame, atr_n: int, mode: str = "trend", scale: float = 1.0,
+                  cost_bps: float = 0.0):
     """Weight-averaged Donchian channel over the expert ladder (lookbacks
     scaled by `scale`), NaN until the learner is formed."""
-    W = hedge_weights(df, atr_n, mode)
+    W = hedge_weights(df, atr_n, mode, cost_bps)
     lookbacks, _ = hedge_experts(mode)
     T = len(df)
     up = np.zeros(T); lo = np.zeros(T)
@@ -662,13 +827,14 @@ def _to_arr(x) -> np.ndarray:
     return np.ascontiguousarray(np.asarray(x, dtype=np.float64))
 
 
-def _channel_arrays(df, kind, n, k, atr_n, dfkey=None, mode="trend", role="entry"):
+def _channel_arrays(df, kind, n, k, atr_n, dfkey=None, mode="trend", role="entry", cost_bps=0.0):
     def build():
-        up, lo, mid = channel(df, kind, n, k, atr_n, mode=mode, role=role)
+        up, lo, mid = channel(df, kind, n, k, atr_n, mode=mode, role=role, cost_bps=cost_bps)
         return (_to_arr(up), _to_arr(lo), _to_arr(mid))
     if kind == "hedge":
-        # no lookback / width: keyed on direction mode (signed rewards), ATR length and entry/exit role
-        spec = ("channel", kind, role, mode, atr_n)
+        # no lookback / width: keyed on direction mode (signed rewards), ATR
+        # length, entry/exit role and the cost the experts are charged
+        spec = ("channel", kind, role, mode, atr_n, float(cost_bps))
     else:
         spec = ("channel", kind, n, k if kind != "donchian" else 0.0, atr_n if kind == "keltner" else 0)
     return _cached(df, spec, build, dfkey)
@@ -691,7 +857,8 @@ def _compute_indicators(df: pd.DataFrame, tpl: StrategyTemplate, dfkey=None) -> 
         ready = ready & ~np.isnan(arr)
 
     mode = tpl.direction_logic
-    up, lo, _ = _channel_arrays(df, tpl.channel_type, tpl.n_entry, tpl.channel_k, tpl.atr_n, dfkey, mode, "entry")
+    up, lo, _ = _channel_arrays(df, tpl.channel_type, tpl.n_entry, tpl.channel_k, tpl.atr_n, dfkey, mode, "entry",
+                                tpl.cost_bps)
     use("upper", up)
     use("lower", lo)
     use("atr", _cached(df, ("atr", tpl.atr_n), lambda: _to_arr(atr(df, tpl.atr_n)), dfkey))
@@ -699,12 +866,14 @@ def _compute_indicators(df: pd.DataFrame, tpl: StrategyTemplate, dfkey=None) -> 
     # per-bar direction: +1 follow the break, -1 fade it; learned from the
     # follow/fade expert ladder (NaN while the learner is unformed), else constant
     if mode == "learned":
-        use("direction", _cached(df, ("hedge_dir", tpl.atr_n), lambda: hedge_direction(df, tpl.atr_n), dfkey))
+        use("direction", _cached(df, ("hedge_dir", tpl.atr_n, float(tpl.cost_bps)),
+                                 lambda: hedge_direction(df, tpl.atr_n, tpl.cost_bps), dfkey))
     else:
         ind["direction"] = np.full(n, 1.0 if mode == "trend" else -1.0)
 
     if tpl.exit_style == "channel":
-        upx, lox, midx = _channel_arrays(df, tpl.channel_type, tpl.n_exit, tpl.channel_k, tpl.atr_n, dfkey, mode, "exit")
+        upx, lox, midx = _channel_arrays(df, tpl.channel_type, tpl.n_exit, tpl.channel_k, tpl.atr_n, dfkey, mode, "exit",
+                                         tpl.cost_bps)
         use("upper_x", upx)
         use("lower_x", lox)
         use("mid_x", midx)

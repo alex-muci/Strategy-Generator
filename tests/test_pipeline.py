@@ -18,8 +18,8 @@ from data import synthetic_ohlc  # noqa: E402
 from strategy import (  # noqa: E402
     StrategyTemplate, backtest, cti, adx, choppiness, variance_ratio, efficiency_ratio,
     _compute_indicators, annualized_sharpe,
-    hedge_weights, hedge_channel, hedge_warmup, hedge_direction, hedge_experts, donchian,
-    HEDGE_LADDER, HEDGE_MEMORY, _adahedge_loop,
+    hedge_weights, hedge_channel, hedge_warmup, hedge_direction, hedge_experts, hedge_diagnostics, donchian,
+    HEDGE_LADDER, HEDGE_MEMORY, HEDGE_HORIZONS, _adahedge_loop, _hedge_loss,
 )
 from generator import generate_templates, param_grid_for  # noqa: E402
 from walkforward import (  # noqa: E402
@@ -326,7 +326,8 @@ class VolTargetSizingTests(unittest.TestCase):
 
 class HedgeChannelTests(unittest.TestCase):
     """The online-learned channel: parameter-free, causal, bounded memory,
-    and it learns the period and the side."""
+    no expert ever written off, and it learns the period, the side and
+    how long a memory pays."""
 
     def setUp(self):
         self.df = synthetic_ohlc(1200, seed=7)
@@ -334,15 +335,18 @@ class HedgeChannelTests(unittest.TestCase):
     def test_adahedge_follows_the_leader(self):
         loss = np.full((300, 4), 0.6)
         loss[:, 1] = 0.3                       # expert 1 is always better
-        W, eta = _adahedge_loop(loss, HEDGE_MEMORY)
+        W, eta, V, surprise = _adahedge_loop(loss, HEDGE_MEMORY)
         np.testing.assert_allclose(W.sum(axis=1), 1.0)
+        np.testing.assert_allclose(V.sum(axis=1), 1.0)
         self.assertGreater(W[-1, 1], 0.99)
+        self.assertLess(surprise[-1], 0.01)    # the mixture is as good as the best expert
         rng = np.random.default_rng(0)
         noisy = rng.uniform(0, 1, (3000, 4))
         noisy[:, 2] -= 0.08                    # a small but persistent edge
-        W, eta = _adahedge_loop(np.clip(noisy, 0, 1), HEDGE_MEMORY)
-        self.assertEqual(int(np.argmax(W[-1])), 2)
-        self.assertTrue(np.isfinite(eta[-1]))  # learning rate shrank from FTL to a finite eta
+        W, eta, _, surprise = _adahedge_loop(np.clip(noisy, 0, 1), HEDGE_MEMORY)
+        self.assertEqual(int(np.argmax(W[-500:].mean(axis=0))), 2)
+        self.assertTrue(np.isfinite(eta[-1]).all())  # every learning rate shrank from FTL to a finite eta
+        self.assertTrue((surprise >= 0).all())
 
     def test_a_written_off_expert_still_ends_follow_the_leader(self):
         """While the mixability gap is tiny, eta is huge and a trailing
@@ -353,27 +357,104 @@ class HedgeChannelTests(unittest.TestCase):
         c = 1e-5
         loss = np.array([(0, c), (0, c), (0, c), (0, 10 * c), (0, 300 * c), (0, 3000 * c),   # expert 0 leads ...
                          (1.0, 0.0)])                                                        # ... and is routed
-        W, eta = _adahedge_loop(loss, HEDGE_MEMORY)
-        np.testing.assert_array_equal(W[5], [1.0, 0.0])      # the precondition: written off completely
-        self.assertGreater(eta[5], 745.0)                    # and exp(-eta * 1) underflows as well
-        # the last round's mix loss is the written-off expert's 3313c deficit
+        W, eta, _, _ = _adahedge_loop(loss, HEDGE_MEMORY)
+        self.assertEqual(W[5, 1], 0.0)                       # the precondition: written off completely
+        self.assertAlmostEqual(W[5, 0], 1.0, places=12)
+        self.assertTrue((eta[5] > 745.0).all())              # and exp(-eta * 1) underflows as well
+        # the last round's mix loss is the written-off expert's ~3313c deficit
         # (it is the better of "leader loses 1" and "catch up 3313c, lose 0"),
-        # the Hedge loss is 1, so delta gains 1 - 3313c on top of what it had
-        delta = np.log(2) / eta[5] + 1.0 - 3313 * c
-        self.assertAlmostEqual(eta[6], np.log(2) / delta, places=9)
-        # expert 1 now leads by exactly that gap: weights 2/3 and 1/3, not 1 and 0
-        np.testing.assert_allclose(W[6], [1 / 3, 2 / 3], atol=1e-5)
+        # the Hedge loss is 1, so delta gains ~1 - 3313c and expert 1 leads by
+        # about that gap: weights near 2/3 and 1/3 (exactly so without the
+        # discount), not 1 and 0
+        np.testing.assert_allclose(W[6], [1 / 3, 2 / 3], atol=2e-2)
+
+    def test_no_expert_is_written_off_for_good(self):
+        """A discounted deficit is bounded by the lifetime times the shortfall
+        per bar, whatever the expert lost before, and the shortest lifetime
+        on the ladder bounds it tightest: an expert that starts winning is
+        back in front within tens of bars, and the meta learner, scoring
+        the lifetimes on their own hedge loss, follows the one that moved."""
+        loss = np.full((440, 4), 0.6)
+        loss[:400, 0] = 0.4                    # 400 rounds of write-off...
+        loss[400:, 3] = 0.4                    # ...then the trailer wins by the same edge
+        W, _, V, _ = _adahedge_loop(loss, HEDGE_MEMORY)
+        self.assertLess(W[399, 3], 1e-6)
+        self.assertGreater(W[399 + 30, 3], 0.5)                     # in front within thirty rounds
+        self.assertGreater(V[399 + 30, :2].sum(), V[399, :2].sum())  # carried by the short lifetimes
 
     def test_bounded_memory_tracks_a_change_of_leader(self):
         loss = np.full((2000, 4), 0.6)
         loss[:1000, 0] = 0.4                   # expert 0 leads for 1000 rounds...
         loss[1000:, 3] = 0.4                   # ...then expert 3 does
-        W, _ = _adahedge_loop(loss, HEDGE_MEMORY)
+        W, _, _, _ = _adahedge_loop(loss, HEDGE_MEMORY)
         self.assertGreater(W[999, 0], 0.9)
-        self.assertGreater(W[1000 + HEDGE_MEMORY, 3], 0.9)   # the old leader has left the memory
-        # row t depends on rows t-memory+1..t only
-        W2, _ = _adahedge_loop(loss[500:], HEDGE_MEMORY)
-        np.testing.assert_allclose(W[500 + HEDGE_MEMORY:], W2[HEDGE_MEMORY:])
+        self.assertLess(W[999, 3], 0.1)
+        self.assertGreater(W[1000 + 30, 3], 0.5)             # the new leader is in front in tens of bars...
+        self.assertGreater(W[1000 + 60, 3], 0.8)
+        self.assertGreater(W[1000 + HEDGE_MEMORY, 3], 0.9)   # ...not once the old one has left the memory
+        # row t depends on rows t-memory+1..t only, exactly (the walk-forward warm-up relies on it)
+        W2, _, _, _ = _adahedge_loop(loss[500:], HEDGE_MEMORY)
+        np.testing.assert_array_equal(W[500 + HEDGE_MEMORY:], W2[HEDGE_MEMORY:])
+
+    def test_eta_recovers_after_a_calm_stretch(self):
+        """Plain AdaHedge's learning rate only ever falls: once burnt, always
+        cautious. Discounting the mixability gap lets it climb back when the
+        experts stop disagreeing, faster at the shorter lifetimes."""
+        rng = np.random.default_rng(1)
+        loss = np.vstack([rng.uniform(0, 1, (100, 4)), np.full((150, 4), 0.5)])
+        _, eta, _, _ = _adahedge_loop(loss, HEDGE_MEMORY)
+        self.assertTrue((eta[249] > 2 * eta[99]).all())
+        self.assertGreater(eta[249, 0], 100 * eta[99, 0])
+        self.assertTrue((np.diff(eta[249]) < 0).all())       # the shortest lifetime recovered most
+
+    def test_meta_learner_shortens_the_memory_on_a_regime_break(self):
+        """The lifetimes are a ladder the learner picks from: when the leader
+        changes, the learners with a short memory adapt first and their hedge
+        loss wins the meta learner over; once the new leader is established
+        the long-memory learner, which concentrates most, takes it back."""
+        loss = np.full((1500, 4), 0.6)
+        rng = np.random.default_rng(3)
+        loss += rng.normal(0, 0.05, loss.shape)              # noise, so the deficits are not all at the cap
+        loss[:1000, 0] -= 0.2
+        loss[1000:, 3] -= 0.2
+        loss = np.clip(loss, 0, 1)
+        _, _, V, _ = _adahedge_loop(loss, HEDGE_MEMORY)
+        short = V[:, :2].sum(axis=1)
+        self.assertLess(short[950:1000].mean(), short[1005:1060].mean())      # shorter memory right after the break
+        self.assertLess(short[1300:1500].mean(), short[1005:1060].mean())     # and back to a long one after
+
+    def test_costs_move_weight_to_the_slower_experts(self):
+        """Each expert pays the sides it trades, in ATRs, as the engine
+        charges cost_bps: the fast lookback flips most, so a cost it does not
+        earn back moves the learner's weight down the ladder."""
+        loss0, _, _ = _hedge_loss(self.df, 20, "trend", 0.0)
+        loss1, _, _ = _hedge_loss(self.df, 20, "trend", 50.0)
+        self.assertTrue((loss1 >= loss0 - 1e-12).all())
+        charged = loss1 > loss0 + 1e-12
+        self.assertGreater(charged.sum(), 50)
+        self.assertLess(charged.mean(), 0.5)                    # only on the bars an expert changed its stance
+        W0 = hedge_weights(self.df, 20, "trend", 0.0)
+        W1 = hedge_weights(self.df, 20, "trend", 50.0)
+        warm = hedge_warmup(20)
+        self.assertLess(W1[warm:, 0].mean(), W0[warm:, 0].mean())
+        np.testing.assert_array_equal(W0, hedge_weights(self.df, 20, "trend"))   # cost_bps=0 is the cost-free loss
+        # and the template's cost reaches the learner: the channel changes with it
+        tpl = StrategyTemplate("t", channel_type="hedge", cost_bps=0.0)
+        a = _compute_indicators(self.df, tpl)["upper"]
+        b = _compute_indicators(self.df, tpl.with_params(cost_bps=50.0))["upper"]
+        self.assertFalse(np.allclose(np.nan_to_num(a), np.nan_to_num(b)))
+
+    def test_diagnostics_are_consistent(self):
+        d = hedge_diagnostics(self.df, 20, "learned", 5.0)
+        W = hedge_weights(self.df, 20, "learned", 5.0)
+        np.testing.assert_array_equal(d["weights"].to_numpy(), W)
+        self.assertEqual(list(d["weights"].columns), ["follow_10", "follow_20", "follow_40", "follow_80",
+                                                      "fade_10", "fade_20", "fade_40", "fade_80"])
+        self.assertEqual(list(d["eta"].columns), list(HEDGE_HORIZONS))
+        np.testing.assert_allclose(d["horizon_weights"].sum(axis=1), 1.0)
+        self.assertTrue((d["surprise"] >= 0).all() and (d["surprise"] <= 1).all())
+        self.assertTrue(((d["loss"] >= 0) & (d["loss"] <= 1)).all().all())
+        self.assertTrue(d["weights"].index.equals(self.df.index))
 
     def test_weights_are_causal_and_normalised(self):
         W = hedge_weights(self.df, 20, "trend")

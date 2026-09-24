@@ -21,7 +21,7 @@ conda create -p ./env python=3.12 pandas scikit-learn scipy matplotlib yfinance 
 conda activate ./env
 # or, with pip:  pip install -r requirements.txt   (the versions the suite was last run against)
 
-python -m unittest discover -s tests -v      # 195 tests (engine, templates, hedge learner, walk-forward, robustness, selection, data, live signals, both entry points)
+python -m unittest discover -s tests -v      # 240 tests (engine, templates, hedge learner, walk-forward, robustness, selection, data, live signals, both entry points)
 # faster (about 1:35 min instead of 4.5): pip install -r requirements-dev.txt, then, with ./env active,
 python -m pytest -n auto --dist loadscope   # same tests in parallel; loadscope keeps a class (and its one-off setup) on one worker
 
@@ -342,20 +342,50 @@ algorithm from the prediction-with-expert-advice literature:
   scales; it is not a tuned parameter.
 - **Loss**: every bar each expert is scored on the ATR-normalised next
   move of the stance it implied (new n-bar high -> long, new n-bar
-  low -> short, hold otherwise). For a `countertrend` template the
-  stance is the *fade*, so the learner rewards the lookback whose
-  breakouts are most **anti-correlated** with the following move.
+  low -> short, hold otherwise), **net of the sides it traded** to get
+  there, charged at the template's `cost_bps` in ATR units exactly as
+  the engine charges them: a fast lookback that flips every week has to
+  earn its turnover back before the learner trusts it. For a
+  `countertrend` template the stance is the *fade*, so the learner
+  rewards the lookback whose breakouts are most **anti-correlated**
+  with the following move.
 - **Learner**: **AdaHedge** (de Rooij, van Erven, Grunwald, Koolen,
   JMLR 2014), exponential weights whose learning rate is set from the
   accumulated mixability gap. It starts as plain **follow-the-leader**
   and only becomes more conservative when the data forces it to. No
-  learning rate, no threshold. It scores the last `HEDGE_MEMORY` (250)
-  bars: plain AdaHedge finds the best expert *in hindsight* over all
-  history, so after a long trend a fade expert would have to pay back
-  the whole history before it could win; the bounded memory is what
-  lets the learner *track* a change of regime, and it is also what
-  makes the learner state reproducible from the walk-forward's warm-up
-  buffer (see `walkforward.window_backtest`).
+  learning rate, no threshold. Two additions, both parameter-free:
+  - **Discounting.** Losses and the gap decay with a *lifetime* `H`
+    (`gamma = 1 - 1/H`) instead of counting in full and then vanishing.
+    Plain AdaHedge's learning rate only ever falls; a discounted gap
+    lets it climb back after a calm stretch, so it reflects *recent*
+    surprise. A discounted deficit is bounded by `H` times the
+    expert's shortfall per bar, whatever it lost before, so **no
+    expert is ever written off for good**: one that starts winning is
+    back in front after about `H ln 2` bars.
+  - **A ladder of lifetimes** (`HEDGE_HORIZONS` = 20, 40, 80, 160
+    bars, the lookback ladder doubled), one learner each, mixed on top
+    by Vovk's aggregating algorithm with a unit learning rate (Bayesian
+    averaging with likelihood `exp(-loss)`, discounted at the longest
+    lifetime) that scores every learner on its own hedge loss, i.e.
+    the memory is learned the same way the lookback is. When a regime
+    breaks the short-memory learner has already moved and its lower
+    loss tilts the mixture its way, so a new leader is in front within
+    about twenty bars; in a stable regime the learners agree. The
+    played weights stay a convex combination of the experts. (AdaHedge
+    is the wrong rule at this level: the learners' losses are near-
+    identical most of the time, its learning rate explodes and the
+    mixture becomes follow-the-leader on rounding noise.)
+  Everything is still restarted every bar over the last
+  `HEDGE_MEMORY` (250) bars, which keeps the learner state an exact
+  function of a fixed number of past bars, reproducible from the
+  walk-forward's warm-up buffer (see `walkforward.window_backtest`).
+  The window's edge now carries `gamma^250` of a bar's weight (e^-1.6
+  at H = 160, e^-3 at H = 80) instead of all of it: a horizon, not a
+  cliff. `strategy.hedge_diagnostics` returns, bar by bar, the expert
+  weights, the losses they were scored on, each lifetime's learning
+  rate, the meta learner's weights over the lifetimes (the short ones
+  gaining is the learner shortening its memory) and the *surprise*
+  (the played mixture's loss minus the best expert's).
 - **Channel**: the weight-averaged expert channel, i.e. an adaptive
   channel whose effective period is learned causally bar by bar. The
   exit channel uses the same weights over the ladder scaled by
@@ -382,7 +412,13 @@ Why this and not the other online-learning candidates:
   the sign flip that makes the countertrend learner score the fade.
 - **Plain Hedge / exponentiated gradient** needs a learning rate, and
   **fixed-share** needs a switching rate: parameters again. AdaHedge is
-  the parameter-free variant with the same regret guarantee.
+  the parameter-free variant with the same regret guarantee, and the
+  ladder of lifetimes stands in for the switching rate: the learner
+  picks the memory the way it picks the lookback. (A fixed-share floor
+  on the weights, `1/(N H)` of the leader's, was tried on top of the
+  ladder and dropped: it bought no revival the short lifetime does not
+  already give, and it flipped the learned direction to *fade* on every
+  pullback inside a trend.)
 - **Follow-the-leader** on its own is unstable on noisy losses (it flips
   between near-tied experts); AdaHedge *is* FTL until the losses show
   the flipping costs something, then smooths.
