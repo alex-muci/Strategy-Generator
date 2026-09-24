@@ -280,7 +280,7 @@ def _entry_orders(df, tpl: StrategyTemplate, ind: dict, pending, equity: float) 
     if pending is not None:
         side = pending["side"]
         return [dict(kind="limit", side=side, level=pending["level"],
-                     shares=_size(equity, tpl, ind, n, pending["level"]),
+                     shares=_size(equity, tpl, ind, n, pending["level"], pending["is_trend"]),
                      note=f"pullback limit already working, expires in "
                           f"{max(pending['expires_bar'] - (n - 1), 0)} bar(s)")]
     if _filter_block(df, tpl, ind):
@@ -307,11 +307,11 @@ def _entry_orders(df, tpl: StrategyTemplate, ind: dict, pending, equity: float) 
         take_short = (broke_down if is_trend else broke_up) and short_ok
         if take_long:
             out.append(dict(kind="market_on_open", side=1, level=None,
-                            shares=_size(equity, tpl, ind, n, float(df["Close"].iloc[-1])),
+                            shares=_size(equity, tpl, ind, n, float(df["Close"].iloc[-1]), is_trend),
                             note="close confirmed beyond the channel"))
         elif take_short:
             out.append(dict(kind="market_on_open", side=-1, level=None,
-                            shares=_size(equity, tpl, ind, n, float(df["Close"].iloc[-1])),
+                            shares=_size(equity, tpl, ind, n, float(df["Close"].iloc[-1]), is_trend),
                             note="close confirmed beyond the channel"))
         return out
 
@@ -325,7 +325,7 @@ def _entry_orders(df, tpl: StrategyTemplate, ind: dict, pending, equity: float) 
             out.append(dict(
                 kind="stop_then_limit", side=side, level=level,
                 limit=level - side * tpl.pullback_atr_mult * a,
-                shares=_size(equity, tpl, ind, n, level),
+                shares=_size(equity, tpl, ind, n, level, is_trend),
                 note=f"on a break of {level:.2f}, work a limit at "
                      f"{level - side * tpl.pullback_atr_mult * a:.2f} for "
                      f"{tpl.pullback_valid_bars} bar(s)"))
@@ -333,15 +333,18 @@ def _entry_orders(df, tpl: StrategyTemplate, ind: dict, pending, equity: float) 
             # a trend break is a stop order (fills as price runs through the
             # level); fading it is a limit order (fills as price reaches it)
             out.append(dict(kind="stop" if is_trend else "limit", side=side, level=level,
-                            shares=_size(equity, tpl, ind, n, level),
+                            shares=_size(equity, tpl, ind, n, level, is_trend),
                             note="breakout" if is_trend else "fade the break"))
     return out
 
 
-def _size(equity: float, tpl: StrategyTemplate, ind: dict, n: int, price: float) -> float:
+def _size(equity: float, tpl: StrategyTemplate, ind: dict, n: int, price: float, is_trend: bool) -> float:
     """Shares the engine would buy: fixed fractional risk on the ATR stop, or
-    the volatility-target notional when `vol_target` > 0, capped by the
-    leverage limit. Same formula as `strategy._bar_loop`."""
+    the volatility-target notional when `vol_target` > 0, scaled by the
+    learner's conviction in the logic the order was placed under (1 unless
+    the direction is learned), capped by the leverage limit. Same formula
+    as `strategy._bar_loop`, read off the last closed bar as the engine
+    reads bar i-1 on the fill bar."""
     a = float(ind["atr"][n - 1])
     if not (a > 0) or not (price > 0):
         return 0.0
@@ -352,6 +355,7 @@ def _size(equity: float, tpl: StrategyTemplate, ind: dict, n: int, price: float)
         qty = equity * (tpl.vol_target / np.sqrt(periods_per_year())) / rv / price
     else:
         qty = equity * tpl.risk_pct / (tpl.atr_mult_stop * a)
+    qty *= max(float(ind["direction"][n - 1]) * (1.0 if is_trend else -1.0), 0.0)
     return float(max(min(qty, tpl.max_leverage * equity / price), 0.0))
 
 
