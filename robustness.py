@@ -34,8 +34,9 @@ from scipy.stats import norm, skew as _skew, kurtosis as _kurtosis
 from scipy.cluster.hierarchy import linkage, leaves_list
 from scipy.spatial.distance import squareform
 
+import strategy as _strategy
 from strategy import backtest, periods_per_year
-from walkforward import smooth_scores, walk_forward, grid_combos
+from walkforward import smooth_scores, walk_forward, grid_combos, score_stats
 
 EULER_GAMMA = 0.5772156649015329
 
@@ -44,10 +45,13 @@ EULER_GAMMA = 0.5772156649015329
 # trials matrix
 # --------------------------------------------------------------------------
 
-def trial_returns(df: pd.DataFrame, tpl, combos: list, initial_equity: float = 100_000.0):
+def trial_returns(df: pd.DataFrame, tpl, combos: list, initial_equity: float = 100_000.0,
+                  with_pnl: bool = False):
     """Backtest every param combo over the FULL history.
     Returns (R, E): float array T x N of per-bar returns and int8 array
-    T x N flagging bars on which a trade was opened.
+    T x N flagging bars on which a trade was opened. With `with_pnl=True`
+    also P, float T x N holding each closed trade's P&L on its exit bar (what
+    cpcv needs to score a trade-level profit factor).
 
     The strategy is path-dependent, so a block cut out of R can start in the
     middle of a trade. That is serial dependence, not look-ahead; see the
@@ -55,11 +59,33 @@ def trial_returns(df: pd.DataFrame, tpl, combos: list, initial_equity: float = 1
     T, N = len(df), len(combos)
     R = np.zeros((T, N))
     E = np.zeros((T, N), dtype=np.int8)
+    P = np.zeros((T, N)) if with_pnl else None
     for j, params in enumerate(combos):
         res = backtest(df, tpl.with_params(**params), initial_equity=initial_equity)
         R[:, j] = res["returns"].to_numpy()
         E[:, j] = res["entries"]
-    return R, E
+        if with_pnl:
+            for t in res["trades"]:
+                P[df.index.get_loc(t["exit_date"]), j] += t["pnl"]
+    return (R, E, P) if with_pnl else (R, E)
+
+
+def cpcv_embargo(tpl, combos: list) -> int:
+    """CPCV embargo after each test group: twice the longest channel lookback
+    any grid point of `tpl` uses -- the template's default `n_entry` can be
+    shorter than the grid's longest one. A template that trades off the
+    online-learned expert ladder (hedge channel or learned direction) looks
+    back over the ladder's longest Donchian channel whatever its grid."""
+    looks = []
+    for p in combos or [{}]:
+        t = tpl.with_params(**p)
+        if t.channel_type != "hedge":
+            looks.append(t.n_entry)
+            if t.exit_style == "channel":
+                looks.append(t.n_exit)
+        if t.channel_type == "hedge" or t.direction_logic == "learned":
+            looks.append(max(_strategy.HEDGE_LADDER))
+    return 2 * int(max(looks))
 
 
 def evaluate_template(
@@ -87,9 +113,12 @@ def evaluate_template(
     """
     wfa = walk_forward(df, tpl, param_grid, selection=selection, **wfa_kwargs)
     combos, idx = grid_combos(param_grid)
-    R, E = trial_returns(df, tpl, combos)
+    metric = wfa_kwargs.get("metric", "sharpe")
+    R, E, P = trial_returns(df, tpl, combos, with_pnl=True)
+    # CPCV stresses the SAME selection rule the walk-forward used
     cp = cpcv(R, E, idx, n_groups=cpcv_groups, k_test=cpcv_k,
-              embargo_bars=2 * tpl.n_entry, selection=selection)
+              embargo_bars=cpcv_embargo(tpl, combos), selection=selection,
+              metric=metric, min_trades=wfa_kwargs.get("min_trades", 5), P=P)
     wfa["cpcv"] = {k: v for k, v in cp.items()
                    if k in ("path_sharpes", "path_max_dd", "n_paths", "sharpe_mean",
                             "sharpe_std", "sharpe_min", "prob_sharpe_negative")}
@@ -107,6 +136,37 @@ def _sharpe_cols(R: np.ndarray, mask: np.ndarray) -> np.ndarray:
     with np.errstate(invalid="ignore", divide="ignore"):
         sr = np.where(sd > 0, X.mean(axis=0) / sd * np.sqrt(periods_per_year()), 0.0)
     return sr
+
+
+def _score_cols(R: np.ndarray, E, P, mask: np.ndarray, metric: str, min_trades: int) -> np.ndarray:
+    """Walk-forward objective (walkforward.score_stats, incl. its min-trades
+    rule) of each column of R over the rows selected by mask. The rows are
+    treated as one concatenated track record. Without E every column counts
+    as having traded enough; profit_factor needs P (trade P&L on exit bars)."""
+    N = R.shape[1]
+    X = R[mask]
+    n_tr = E[mask].sum(axis=0) if E is not None else np.full(N, max(min_trades, 0))
+    sharpe = _sharpe_cols(R, mask)
+    if len(X):
+        eq = np.vstack([np.ones((1, N)), np.cumprod(1 + X, axis=0)])
+        total = eq[-1] - 1
+        dd = (eq / np.maximum.accumulate(eq, axis=0) - 1).min(axis=0)
+    else:
+        total, dd = np.zeros(N), np.zeros(N)
+    if metric == "profit_factor":
+        if P is None:
+            raise ValueError("cpcv(metric='profit_factor') needs P (trial_returns(..., with_pnl=True))")
+        pn = P[mask]
+        wins, losses = np.where(pn > 0, pn, 0).sum(axis=0), -np.where(pn < 0, pn, 0).sum(axis=0)
+    out = np.empty(N)
+    for j in range(N):
+        st = dict(n_trades=int(n_tr[j]), sharpe=float(sharpe[j]), total_return=float(total[j]),
+                  max_drawdown=float(dd[j]))
+        if metric == "profit_factor":
+            st["profit_factor"] = (wins[j] / losses[j] if losses[j] > 0
+                                   else (np.inf if wins[j] > 0 else 0.0))
+        out[j] = score_stats(st, metric, min_trades)
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -139,12 +199,16 @@ def cpcv(
     purge_bars: int = 0,
     min_trades: int = 5,
     selection: str = "plateau",
+    metric: str = "sharpe",
+    P: np.ndarray | None = None,
 ) -> dict:
     """Combinatorial purged CV of the parameter selection.
 
     R : T x N per-bar returns of the N parameter combos (trials)
     E : T x N entry flags (for the min-trades rule); optional
     idx : N x D lattice indices (for 'plateau' selection); optional
+    metric : the walk-forward objective (walkforward.score_stats)
+    P : T x N closed-trade P&L on exit bars; needed for metric='profit_factor'
 
     The T bars are cut into n_groups contiguous groups. For every choice
     of k_test groups as the test set, the remaining groups (minus an
@@ -153,6 +217,8 @@ def cpcv(
     the test groups. Test-group results are stitched into
     C(n_groups,k_test)*k_test/n_groups complete backtest paths, so the
     result is a DISTRIBUTION of OOS Sharpe ratios rather than one number.
+    As in the walk-forward, a split on which no trial has `min_trades`
+    trades in training stays flat on its test groups (chosen trial -1).
     """
     T, N = R.shape
     bounds = np.linspace(0, T, n_groups + 1).astype(int)
@@ -167,13 +233,14 @@ def cpcv(
         for g in test_groups:
             lo, hi = bounds[g], bounds[g + 1]
             train_mask[max(0, lo - purge_bars):min(T, hi + embargo_bars)] = False
-        scores = _sharpe_cols(R, train_mask)
-        if E is not None:
-            n_tr = E[train_mask].sum(axis=0)
-            scores = np.where(n_tr >= min_trades, scores, -np.inf)
+        scores = _score_cols(R, E, P, train_mask, metric, min_trades)
         if not np.isfinite(scores).any():
-            best = int(np.argmax(_sharpe_cols(R, train_mask)))
-        elif selection == "plateau" and idx is not None:
+            # nothing traded enough in training: flat, as walk_forward does
+            chosen[c] = -1
+            for g in test_groups:
+                path_returns[groups[g], assign[(c, g)]] = 0.0
+            continue
+        if selection == "plateau" and idx is not None:
             best = int(np.argmax(smooth_scores(scores, idx)))
         else:
             best = int(np.argmax(scores))

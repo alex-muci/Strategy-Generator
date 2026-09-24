@@ -333,6 +333,19 @@ class WalkForwardEfficiencyTests(unittest.TestCase):
         self.assertFalse(summarize_walk_forward(wins, oos)["pardo_pass"])   # WFE 0.4 < 0.5
         self.assertFalse(summarize_walk_forward(wins[:2], oos)["pardo_pass"])  # too few windows
 
+    def test_skipped_windows_count_as_not_profitable(self):
+        """A skipped window sat flat: it did not make money. 3 profitable live
+        windows out of 8 are 37.5 % profitable, not 100 %, and fail Pardo."""
+        wins, oos = self._windows(3)
+        wins = wins + [dict(skipped=True)] * 5
+        s = summarize_walk_forward(wins, oos)
+        self.assertEqual((s["n_windows"], s["n_live_windows"]), (8, 3))
+        self.assertAlmostEqual(s["pct_profitable_windows"], 3 / 8)
+        self.assertFalse(s["pardo_pass"])
+        s = summarize_walk_forward(wins[:5], oos)                  # 3 of 5: still a majority
+        self.assertAlmostEqual(s["pct_profitable_windows"], 0.6)
+        self.assertTrue(s["pardo_pass"])
+
 
 class ExitOrderingTests(unittest.TestCase):
     def test_channel_exit_fills_at_the_nearer_level(self):
