@@ -355,5 +355,97 @@ class TemplateBehaviourTests(unittest.TestCase):
             self.assertEqual({t["side"] for t in biased} - {side}, set(), sides)
 
 
+
+def _flat_then(n=40, i0=30):
+    """A flat 100 +/- 1 range, then bars to be shaped by the test. The
+    tests trade from `i0` on only (first_trade_bar), so the range's touches
+    of its own high are not entries."""
+    c = np.full(n, 100.0)
+    o, h, l = c.copy(), c + 1.0, c - 1.0
+    return o, h, l, c
+
+
+def _frame(o, h, l, c):
+    return pd.DataFrame({"Open": o, "High": h, "Low": l, "Close": c},
+                        index=pd.bdate_range("2020-01-01", periods=len(c)))
+
+
+class EngineExitOrderTests(unittest.TestCase):
+    """Which exit fires first on a bar where several could."""
+
+    def test_time_exit_at_the_open_beats_a_later_intrabar_stop(self):
+        """The time exit is an order at the open: a bar that opens above the
+        stop and crashes through it later is exited at the open."""
+        o, h, l, c = _flat_then()
+        i0 = 30
+        o[i0], h[i0], l[i0], c[i0] = 100.5, 103.0, 100.0, 102.5
+        o[i0 + 1:], h[i0 + 1:], l[i0 + 1:], c[i0 + 1:] = 102.5, 103.0, 102.0, 102.5
+        j = i0 + 5
+        o[j], h[j], l[j], c[j] = 102.5, 102.6, 90.0, 91.0      # through the hard stop after the open
+        tpl = StrategyTemplate("t", n_entry=20, atr_n=10, exit_style="time_stop", max_hold_bars=5, cost_bps=0.0)
+        trades = backtest(_frame(o, h, l, c), tpl, first_trade_bar=i0)["trades"]
+        self.assertEqual(len(trades), 1)
+        t = trades[0]
+        self.assertEqual((t["bars_held"], t["reason"], t["exit_price"]), (5, "time", 102.5))
+
+    def test_entry_bar_checks_the_trailing_stop(self):
+        """A chandelier tighter than the hard stop is working on the entry
+        bar too: a dip through it there is a same-bar stop at its level."""
+        o, h, l, c = _flat_then()
+        i0 = 30
+        o[i0], h[i0], l[i0], c[i0] = 101.5, 101.8, 99.0, 101.6   # buy stop at 101 gapped: fill at the open
+        o[i0 + 1:], h[i0 + 1:], l[i0 + 1:], c[i0 + 1:] = 101.6, 101.7, 101.5, 101.6
+        tpl = StrategyTemplate("t", n_entry=20, atr_n=10, exit_style="atr_trail", atr_mult_trail=1.0,
+                               atr_mult_stop=3.0, cost_bps=0.0)
+        res = backtest(_frame(o, h, l, c), tpl, first_trade_bar=i0)
+        a = res["indicators"]["atr"][i0 - 1]
+        first = res["trades"][0]
+        self.assertEqual(first["exit_date"], first["entry_date"])
+        self.assertEqual(first["reason"], "stop_same_bar")
+        self.assertAlmostEqual(first["exit_price"], 101.5 - 1.0 * a)
+        self.assertGreater(l[i0], 101.5 - 3.0 * a)                 # the hard stop alone would not have fired
+
+    def test_entry_bar_checks_the_opposite_channel(self):
+        """For a trend trade with a channel exit, the opposite n_exit channel
+        is a stop from the entry bar on, filled at its level as 'channel'."""
+        o, h, l, c = _flat_then()
+        i0 = 30
+        l[i0 - 3:i0], c[i0 - 3:i0] = 100.2, 100.6                  # a tight 3-bar exit channel under the break
+        o[i0], h[i0], l[i0], c[i0] = 101.2, 101.5, 99.8, 101.0
+        o[i0 + 1:], h[i0 + 1:], l[i0 + 1:], c[i0 + 1:] = 101.0, 101.1, 100.9, 101.0
+        tpl = StrategyTemplate("t", n_entry=20, n_exit=3, atr_n=10, exit_style="channel", cost_bps=0.0)
+        res = backtest(_frame(o, h, l, c), tpl, first_trade_bar=i0)
+        first = res["trades"][0]
+        self.assertEqual(first["exit_date"], first["entry_date"])
+        self.assertEqual((first["reason"], first["exit_price"]), ("channel", 100.2))
+
+
+class HedgeWarmupTests(unittest.TestCase):
+    """The online learner's warm-up contract: a window warmed on
+    `hedge_warmup` bars learns exactly what a full-history run learned. An
+    expert stance held until the next break depended on arbitrarily old bars
+    and broke it (4 % of equity and 8 trades on this window)."""
+
+    def test_warm_window_matches_the_full_run(self):
+        from strategy import hedge_weights, hedge_warmup
+        from walkforward import window_backtest
+        df = synthetic_ohlc(2500, seed=23)
+        wu = hedge_warmup(20)
+        for mode in ("trend", "learned"):
+            full = hedge_weights(df, 20, mode)
+            for k in (1688, 1950):
+                np.testing.assert_allclose(hedge_weights(df.iloc[k - wu:], 20, mode)[wu:], full[k:],
+                                           rtol=0, atol=1e-12, err_msg=f"{mode} {k}")
+        k = 1950
+        for dl in ("trend", "countertrend", "learned"):
+            tpl = StrategyTemplate("t", channel_type="hedge", direction_logic=dl, exit_style="atr_trail")
+            ref = backtest(df, tpl, first_trade_bar=k)
+            win = window_backtest(df, tpl, k, len(df))
+            np.testing.assert_allclose(win["equity"].to_numpy(), ref["equity"].to_numpy()[k:], rtol=1e-12,
+                                       err_msg=dl)
+            self.assertEqual([(t["entry_date"], t["entry_price"]) for t in win["trades"]],
+                             [(t["entry_date"], t["entry_price"]) for t in ref["trades"]], dl)
+
+
 if __name__ == "__main__":
     unittest.main()

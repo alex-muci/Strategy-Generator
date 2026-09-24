@@ -106,7 +106,14 @@ Execution model (no look-ahead):
     net side weight in favour of the side taken (0..1). Either way capped
     at `max_leverage` x equity; the ATR stop is unchanged
   * stops/limits are filled intrabar at the level, or at the open if the
-    open gapped through the level
+    open gapped through the level; a time exit is an order at the open, so
+    it goes before any intrabar stop on its bar
+  * every stop the exit rules run (hard ATR stop, chandelier, opposite
+    channel) is already working on the entry bar: a bar that trades through
+    it after the fill is a same-bar exit at its level
+  * a 'pullback' limit rests `pullback_atr_mult` ATRs from the broken level
+    on the side of the trade: back inside the channel when following the
+    break, deeper beyond it when fading
   * costs: `cost_bps` (commission + slippage) charged per side on notional
   * equity is marked to market at the CLOSE of each bar, after all fills
 """
@@ -300,8 +307,9 @@ def channel(df: pd.DataFrame, kind: str, n: int, k: float, atr_n: int,
 #                template scores FOLLOW experts, a countertrend one FADE
 #                experts, a 'learned' direction both.
 #   * loss     : each bar, expert e is scored on the ATR-normalised return
-#                of the stance it implied on the previous bar (new n-bar
-#                high -> long, new n-bar low -> short, else hold; a fade
+#                of the stance it implied on the previous bar (long after
+#                a new n-bar high, short after a new n-bar low, for up to
+#                n bars after that break, flat when there was none; a fade
 #                expert takes the opposite side), net of the cost of the
 #                sides it traded to reach its new stance (cost_bps per
 #                side, in ATRs, the engine's own charge), so the learner
@@ -338,8 +346,11 @@ def channel(df: pd.DataFrame, kind: str, n: int, k: float, atr_n: int,
 #                give, and it flipped the learned direction on every
 #                pullback inside a trend.)
 #                Everything is still restarted every bar over the last
-#                HEDGE_MEMORY bars, so the learner state is an exact
-#                function of a fixed number of past bars, which the walk-
+#                HEDGE_MEMORY bars and every loss in them is a function
+#                of the last 2 n bars (the stance looks back n bars for a
+#                break, see _expert_stances), so the learner state is an
+#                exact function of a fixed number of past bars
+#                (hedge_warmup), which the walk-
 #                forward's warm-up buffer relies on (walkforward.
 #                window_backtest: a window warmed on `warmup_bars` of
 #                history must match a full-history run exactly). The
@@ -364,9 +375,16 @@ HEDGE_MODES = ("trend", "countertrend", "learned")
 
 
 def hedge_warmup(atr_n: int) -> int:
-    """Bars before the learner's first fully formed output: every loss in
-    its memory needs formed experts and a formed ATR on the bar before."""
-    return int(max(HEDGE_LADDER) + atr_n + HEDGE_MEMORY)
+    """Bars before the learner's first fully formed output, which is then
+    exactly what a full-history run computes (the walk-forward's warm-up
+    buffer relies on it). Row t of the weights replays the losses of rows
+    t - HEDGE_MEMORY + 1 .. t, and loss row r is exact once
+      * the expert stances on r and r-1 are: a stance looks back n bars for
+        a break and each break test needs a full n-bar channel behind it, so
+        r >= 2 n (see `_expert_stances`), and
+      * the ATR on r-1 is: atr_n true ranges, each needing the close before
+        it, so r >= atr_n + 1."""
+    return int(HEDGE_MEMORY + max(2 * max(HEDGE_LADDER), int(atr_n) + 1))
 
 
 def hedge_experts(mode: str):
@@ -555,17 +573,31 @@ def _adahedge_loop(loss, memory=HEDGE_MEMORY, horizons=HEDGE_HORIZONS):
     return _hedge_fast(loss, int(memory), np.ascontiguousarray(gammas))
 
 
-def _expert_stances(high, low, close, uppers, lowers, sides):
+def _expert_stances(high, low, close, uppers, lowers, sides, spans):
     """Stance (+1/-1/0) each Donchian expert holds at the CLOSE of bar t:
     a new n-bar high (high[t] >= upper[t-1]) puts a follow expert
     (sides[e] = +1) long, a new n-bar low puts it short; a fade expert
-    (sides[e] = -1) takes the opposite side. Otherwise, and on a bar that
-    breaks both edges, the previous stance is held."""
+    (sides[e] = -1) takes the opposite side. A bar that breaks both edges
+    is no signal.
+
+    The stance is that of the most recent one-sided break within the last
+    `spans[e]` bars (t - spans[e] < break bar <= t), and 0 (flat) when there
+    was none. The span is the expert's own lookback: that is when the break
+    bar leaves the expert's n-bar channel, i.e. when the expert itself no
+    longer "sees" it. Bounding it is what makes the stance a function of a
+    FIXED number of past bars (2 n: the span plus the channel behind its
+    oldest break test) rather than of the whole history -- a stance simply
+    held until the next break could depend on bars arbitrarily far back
+    (nothing forces an n-bar channel to break within any fixed time), and a
+    walk-forward window warmed on `hedge_warmup` bars then learned different
+    weights than a full-history run did."""
     T, N = uppers.shape
     S = np.zeros((T, N))
     for e in range(N):
         sign = sides[e]
-        s = 0.0
+        span = spans[e]
+        last_t = -1                 # bar of the most recent one-sided break
+        last_s = 0.0                # ... and the stance it implied
         for t in range(1, T):
             u = uppers[t - 1, e]
             lo = lowers[t - 1, e]
@@ -573,10 +605,13 @@ def _expert_stances(high, low, close, uppers, lowers, sides):
                 up = high[t] >= u
                 dn = low[t] <= lo
                 if up and not dn:
-                    s = sign
+                    last_t = t
+                    last_s = sign
                 elif dn and not up:
-                    s = -sign
-            S[t, e] = s
+                    last_t = t
+                    last_s = -sign
+            if last_t >= 0 and t - last_t < span:
+                S[t, e] = last_s
     return S
 
 
@@ -609,7 +644,8 @@ def _hedge_loss(df: pd.DataFrame, atr_n: int, mode: str, cost_bps: float = 0.0):
             up, lo, _ = donchian(df, int(n))
             cache[int(n)] = (_to_arr(up), _to_arr(lo))
         uppers[:, e], lowers[:, e] = cache[int(n)]
-    S = _stances_fast(high, low, close, uppers, lowers, np.ascontiguousarray(sides))
+    S = _stances_fast(high, low, close, uppers, lowers, np.ascontiguousarray(sides),
+                      np.ascontiguousarray(lookbacks, dtype=np.int64))
     a = _to_arr(atr(df, atr_n))
     a_prev = np.where(a[:-1] > 0, a[:-1], np.nan)
     z = (close[1:] - close[:-1]) / a_prev                    # next-bar move, in ATRs
@@ -1002,52 +1038,54 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
             stop_level = stop_price  # hard stop is always active
             stop_reason = 0
 
-            if exit_style == 1:
-                # trailing level from the extreme up to bar i-1 (no intrabar look-ahead)
-                trail_stop = trail_extreme - side * atr_mult_trail * a
-                if side == 1:
-                    stop_level = max(stop_level, trail_stop)
-                else:
-                    stop_level = min(stop_level, trail_stop)
-            elif exit_style == 0 and pos_trend:
-                # the opposite channel is a stop on the SAME side as the hard
-                # stop; on the way through, whichever sits nearer to the price
-                # is hit first, so it must fill at that level, not at the
-                # further one
-                if side == 1 and lower_x[i - 1] > stop_level:
-                    stop_level = lower_x[i - 1]
-                    stop_reason = 1
-                elif side == -1 and upper_x[i - 1] < stop_level:
-                    stop_level = upper_x[i - 1]
-                    stop_reason = 1
+            if exit_style == 3 and i - entry_bar >= max_hold_bars:
+                # the time exit is an order at the OPEN: it is out before
+                # anything intrabar can reach a stop
+                exit_price = open_[i]
+                reason = 4
+            else:
+                if exit_style == 1:
+                    # trailing level from the extreme up to bar i-1 (no intrabar look-ahead)
+                    trail_stop = trail_extreme - side * atr_mult_trail * a
+                    if side == 1:
+                        stop_level = max(stop_level, trail_stop)
+                    else:
+                        stop_level = min(stop_level, trail_stop)
+                elif exit_style == 0 and pos_trend:
+                    # the opposite channel is a stop on the SAME side as the hard
+                    # stop; on the way through, whichever sits nearer to the price
+                    # is hit first, so it must fill at that level, not at the
+                    # further one
+                    if side == 1 and lower_x[i - 1] > stop_level:
+                        stop_level = lower_x[i - 1]
+                        stop_reason = 1
+                    elif side == -1 and upper_x[i - 1] < stop_level:
+                        stop_level = upper_x[i - 1]
+                        stop_reason = 1
 
-            if side == 1 and low[i] <= stop_level:
-                exit_price = min(open_[i], stop_level)
-                reason = stop_reason
-            elif side == -1 and high[i] >= stop_level:
-                exit_price = max(open_[i], stop_level)
-                reason = stop_reason
+                if side == 1 and low[i] <= stop_level:
+                    exit_price = min(open_[i], stop_level)
+                    reason = stop_reason
+                elif side == -1 and high[i] >= stop_level:
+                    exit_price = max(open_[i], stop_level)
+                    reason = stop_reason
 
-            if reason < 0:
-                if exit_style == 0:
-                    if not pos_trend:
-                        if side == 1 and high[i] >= mid_x[i - 1]:
-                            exit_price = max(open_[i], mid_x[i - 1])
-                            reason = 2
-                        elif side == -1 and low[i] <= mid_x[i - 1]:
-                            exit_price = min(open_[i], mid_x[i - 1])
-                            reason = 2
-                elif exit_style == 2:
-                    if side == 1 and high[i] >= target_price:
-                        exit_price = max(open_[i], target_price)
-                        reason = 3
-                    elif side == -1 and low[i] <= target_price:
-                        exit_price = min(open_[i], target_price)
-                        reason = 3
-                elif exit_style == 3:
-                    if i - entry_bar >= max_hold_bars:
-                        exit_price = open_[i]
-                        reason = 4
+                if reason < 0:
+                    if exit_style == 0:
+                        if not pos_trend:
+                            if side == 1 and high[i] >= mid_x[i - 1]:
+                                exit_price = max(open_[i], mid_x[i - 1])
+                                reason = 2
+                            elif side == -1 and low[i] <= mid_x[i - 1]:
+                                exit_price = min(open_[i], mid_x[i - 1])
+                                reason = 2
+                    elif exit_style == 2:
+                        if side == 1 and high[i] >= target_price:
+                            exit_price = max(open_[i], target_price)
+                            reason = 3
+                        elif side == -1 and low[i] <= target_price:
+                            exit_price = min(open_[i], target_price)
+                            reason = 3
 
             if reason >= 0:
                 gross = position * shares * (exit_price - entry_price)
@@ -1196,21 +1234,43 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
                 entered = True
 
         # ---- conservative same-bar stop check on the entry bar ----
+        # every stop the exit block would run from the next bar is already
+        # working on this one: the hard stop, the chandelier (anchored at the
+        # fill) and, for a trend trade with a channel exit, the opposite
+        # channel -- whichever sits nearest the fill. A stop the fill is
+        # already through (a close_confirm open that gapped past the exit
+        # channel) goes out at the fill itself.
         if entered:
-            hit = (position == 1 and low[i] <= stop_price) or (position == -1 and high[i] >= stop_price)
+            sb_level = stop_price
+            sb_reason = 5
+            if exit_style == 1:
+                trail_stop = fill_px - position * atr_mult_trail * a
+                if position == 1:
+                    sb_level = max(sb_level, trail_stop)
+                else:
+                    sb_level = min(sb_level, trail_stop)
+            elif exit_style == 0 and pos_trend:
+                if position == 1 and lower_x[i - 1] > sb_level:
+                    sb_level = lower_x[i - 1]
+                    sb_reason = 1
+                elif position == -1 and upper_x[i - 1] < sb_level:
+                    sb_level = upper_x[i - 1]
+                    sb_reason = 1
+            hit = (position == 1 and low[i] <= sb_level) or (position == -1 and high[i] >= sb_level)
             if hit:
-                gross = position * shares * (stop_price - entry_price)
-                xcost = cost_rate * shares * stop_price
+                sb_px = min(fill_px, sb_level) if position == 1 else max(fill_px, sb_level)
+                gross = position * shares * (sb_px - entry_price)
+                xcost = cost_rate * shares * sb_px
                 cash += gross - xcost
                 t_entry[n_trades] = entry_bar
                 t_exit[n_trades] = i
                 t_side[n_trades] = position
                 t_entry_px[n_trades] = entry_price
-                t_exit_px[n_trades] = stop_price
+                t_exit_px[n_trades] = sb_px
                 t_shares[n_trades] = shares
                 t_pnl[n_trades] = gross - xcost - entry_cost
                 t_cost[n_trades] = entry_cost + xcost
-                t_reason[n_trades] = 5
+                t_reason[n_trades] = sb_reason
                 n_trades += 1
                 position = 0
                 shares = 0.0
