@@ -67,8 +67,8 @@ import pandas as pd
 from data import synthetic_ohlc
 from generator import generate_templates, param_grid_for, FAMILIES
 from live import (
-    refit_params, due_for_refit, strategy_state,
-    portfolio_targets, trade_list, utcnow,
+    refit_params, due_for_refit, strategy_state, bars_since,
+    portfolio_targets, apply_gross_scale, trade_list, utcnow,
 )
 from pipeline import (
     resolve_interval, load_real, eval_config, worker_pool, evaluate_slots,
@@ -596,10 +596,18 @@ def signals(args) -> dict:
     now = pd.Timestamp(args.now) if args.now else None
 
     need = _history_bars_needed(spec)
+    start = _start_for_bars(need, interval)
+    if cfg.get("anchored"):
+        # an anchored walk-forward fits every window on ALL the history since
+        # the research's --start; a refit on a shorter tail would choose params
+        # the validated process never chose
+        if cfg.get("start") and pd.Timestamp(cfg["start"]) < pd.Timestamp(start):
+            start = pd.Timestamp(cfg["start"]).strftime("%Y-%m-%d")
     print(f"Loading {len(spec['assets'])} assets, {need}+ bars of {interval} history"
+          f"{' from ' + start if cfg.get('anchored') else ''}"
           f"{' [synthetic]' if args.synthetic else ''}...")
     data = load_assets(spec["assets"], interval=interval,
-                       start=_start_for_bars(need, interval), synthetic=args.synthetic,
+                       start=start, synthetic=args.synthetic,
                        bars=max(args.bars, need + 200), now=now)
     have = len(next(iter(data.values())))
     if have < need:
@@ -619,6 +627,10 @@ def signals(args) -> dict:
     # exposure and the gross cap stay against the REAL account
     weights = {s["slot"]: s["weight"] for s in spec["slots"]}
     targets = portfolio_targets(states, weights, args.account_equity, max_gross=args.max_gross)
+    # the gross cap shrinks every share count, not only the targets: the
+    # positions shown, the entry orders for the next bar, the CSV log and the
+    # futures levels all trade the scaled book
+    states = apply_gross_scale(states, targets["scale_applied"])
     holdings, holdings_given = _load_holdings(args.state_dir)
     if not holdings_given:
         holdings = {k: float(v) for k, v in live.get("last_targets", {}).items()}
@@ -732,7 +744,9 @@ def _slot_signal(slot: dict, df: pd.DataFrame, cfg: dict, live: dict, args,
 
     train = min(cfg["train_bars"], len(df))
     stale = due_for_refit(df, mem["fitted_on"], cfg["test_bars"])
-    if mem["params"] is None or (stale and not args.no_refit):
+    # the first fit, then once per test window -- also when the last fit found
+    # nothing: the walk-forward keeps such a window flat for all of it
+    if mem["fitted_on"] is None or (stale and not args.no_refit):
         fit = refit_params(df, base, param_grid_for(base, wide=cfg["wide_grid"]),
                            train_bars=train, metric=cfg["metric"],
                            selection=cfg["selection"], anchored=cfg["anchored"])
@@ -744,7 +758,7 @@ def _slot_signal(slot: dict, df: pd.DataFrame, cfg: dict, live: dict, args,
             mem["fitted_on"] = str(fit["fitted_on"])
             mem["is_sharpe"] = float(fit["is_stats"]["sharpe"])
             mem["is_trades"] = int(fit["is_stats"]["n_trades"])
-            notes.append(f"{key}: re-optimized on the last {train} bars -> "
+            notes.append(f"{key}: re-optimized on the last {fit['train_bars']} bars -> "
                          + ", ".join(f"{k}={v}" for k, v in mem["params"].items()))
     elif stale and args.no_refit:
         notes.append(f"{key}: a refit is due but --no-refit was given")
@@ -756,16 +770,18 @@ def _slot_signal(slot: dict, df: pd.DataFrame, cfg: dict, live: dict, args,
                   entry_price=None, entry_date=None, bars_held=0, unrealized=0.0,
                   n_trades_in_window=0, exit_orders=[], entry_orders=[],
                   blocked_by=["no parameter set could be fitted"], params={},
-                  fitted_on=mem["fitted_on"], refit_due=False, weight=slot["weight"],
+                  fitted_on=mem["fitted_on"], weight=slot["weight"],
+                  bars_since_refit=bars_since(df, mem["fitted_on"]),
+                  refit_due=due_for_refit(df, mem["fitted_on"], cfg["test_bars"]),
                   research=slot["research"])
         return st, notes
 
     tpl = base.with_params(**mem["params"])
-    st = strategy_state(df, tpl, equity=equity)
+    st = strategy_state(df, tpl, equity=equity, fitted_on=mem["fitted_on"])
     st.update(slot=key, asset=slot["asset"], template=slot["template_name"],
               params=mem["params"], fitted_on=mem["fitted_on"], weight=slot["weight"],
               research=slot["research"],
-              bars_since_refit=int((df.index > pd.Timestamp(mem["fitted_on"])).sum()),
+              bars_since_refit=bars_since(df, mem["fitted_on"]),
               refit_due=due_for_refit(df, mem["fitted_on"], cfg["test_bars"]))
     return st, notes
 

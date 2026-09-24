@@ -123,6 +123,37 @@ class LoaderTests(unittest.TestCase):
         df, _ = self._load(_frame(n=50), min_bars=50)
         self.assertEqual(len(df), 50)
 
+    def test_nothing_at_all_is_an_error_not_an_attribute_error(self):
+        with self.assertRaises(ValueError) as cm:
+            self._load(None)
+        self.assertIn("no data", str(cm.exception))
+
+    def test_repeated_and_unordered_bars_are_cleaned(self):
+        f = _frame()
+        last = f.iloc[[-1]].assign(Close=999.0)             # the later print of the same bar
+        f = pd.concat([f.iloc[::-1], last])
+        df, _ = self._load(f)
+        self.assertEqual(len(df), 300)
+        self.assertTrue(df.index.is_unique and df.index.is_monotonic_increasing)
+        self.assertEqual(df["Close"].iloc[-1], 999.0)
+
+    def test_intraday_stamps_become_naive_utc(self):
+        """yfinance stamps intraday bars in the exchange's zone; the project's
+        clock (live.utcnow, drop_forming_bar) is naive UTC."""
+        f = _frame()
+        f.index = pd.date_range("2026-03-02 09:30", periods=300, freq="h", tz="America/New_York")
+        df, _ = self._load(f, interval="1h")
+        self.assertIsNone(df.index.tz)
+        self.assertEqual(df.index[0], pd.Timestamp("2026-03-02 14:30"))
+        self.assertEqual(df.index.name, "Date")
+
+    def test_an_aware_daily_index_keeps_its_local_date(self):
+        f = _frame()
+        f.index = f.index.tz_localize("Asia/Tokyo")          # midnight Tokyo is the previous day in UTC
+        df, _ = self._load(f, interval="1d")
+        self.assertIsNone(df.index.tz)
+        self.assertEqual(df.index[0], pd.Timestamp("2020-01-01"))
+
 
 if __name__ == "__main__":
     unittest.main()

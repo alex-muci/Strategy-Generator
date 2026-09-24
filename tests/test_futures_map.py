@@ -120,6 +120,21 @@ class BookTests(unittest.TestCase):
         self.assertEqual((b.loc["IEF", "target"], b.loc["IEF", "action"], b.loc["IEF", "order_contracts"]),
                          (0, "SELL", 1))
 
+    def test_a_contract_held_outside_the_universe_is_closed(self):
+        """A research re-run that drops SPY must not leave 3 MES open forever."""
+        etf, fut = {"IEF": self.etf["IEF"]}, {"IEF": self.fut["IEF"]}
+        out = to_contracts(_book(), etf, fut, held={"MES": 3, "ZN": 1, "M6X": -2})
+        b = out["book"]
+        self.assertEqual((b.loc["SPY", "root"], b.loc["SPY", "target"], b.loc["SPY", "action"],
+                          b.loc["SPY", "order_contracts"]), ("MES", 0, "SELL", 3))
+        self.assertEqual(b.loc["IEF", "action"], "SELL")
+        self.assertTrue([n for n in out["notes"] if "MES" in n and "no longer in the portfolio" in n])
+        # an unknown root is flagged, not guessed at
+        self.assertTrue([n for n in out["notes"] if "M6X" in n and "not a contract" in n])
+        self.assertNotIn("M6X", set(b["root"]))
+        short = to_contracts(_book(), etf, fut, held={"MES": -2})["book"]
+        self.assertEqual((short.loc["SPY", "action"], short.loc["SPY", "order_contracts"]), ("BUY", 2))
+
     def test_an_unmapped_asset_is_reported_not_guessed(self):
         out = to_contracts(_book(XYZ=50_000), self.etf, self.fut)
         self.assertTrue(out["book"].empty)
