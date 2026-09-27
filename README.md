@@ -17,15 +17,17 @@ portfolio construction) plus the modern overfitting diagnostics.
 ## Setup
 
 ```bash
+# either with conda
 conda create -p ./env python=3.12 pandas scikit-learn scipy matplotlib yfinance numba
 conda activate ./env
-# or, with pip:  pip install -r requirements.txt   (the versions the suite was last run against)
+# or, alternatively,
+python -m venv env  # assuming 3.12 installed
+./env/Script/Activate
+pip install -r requirements.txt 
 
-python -m unittest discover -s tests -v      # 276 tests (engine, templates, hedge learner, walk-forward, robustness, selection, data, live signals, both entry points)
+python -m unittest discover -s tests -v      # 235 tests (engine, templates, hedge learner, walk-forward, robustness, selection, data, live signals, both entry points)
 # faster (about 1:35 min instead of 4.5): pip install -r requirements-dev.txt, then, with ./env active,
 python -m pytest -n auto --dist loadscope   # same tests in parallel; loadscope keeps a class (and its one-off setup) on one worker
-
-python main.py                                # synthetic data, 72 templates, ~1 min on 8 cores
 ```
 
 ## Running it
@@ -33,7 +35,7 @@ python main.py                                # synthetic data, 72 templates, ~1
 ```bash
 python main.py --help
 python main.py --family quick                       # 72 templates (Donchian, ER filter)
-python main.py --family default                     # 768 templates, all switches sampled
+python main.py --family default                     # 778 templates, all switches sampled
 python main.py --family online                      # 288 templates on the online-learned channel (no lookback to fit)
 python main.py --real SPY --start 2005-01-01 --family default --jobs 8
 python main.py --real SPY --start 2005-01-01 --family quick --sides long_only   # one-sided family (an asset with a drift)
