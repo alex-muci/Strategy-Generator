@@ -273,7 +273,9 @@ def walk_forward_portfolio(
             continue
         w = portfolio_weights(hist[sel], weighting)
         parts.append((block[sel] * w).sum(axis=1))
-        log.append(dict(period_start=start, selected=sel, weights=w.round(3).to_dict()))
+        # the weights as applied (unrounded): a replay of the period must reproduce
+        # the block's return to the last digit, not to three
+        log.append(dict(period_start=start, selected=sel, weights=w.to_dict()))
 
     port = pd.concat(parts) if parts else pd.Series(dtype=float)
     return dict(

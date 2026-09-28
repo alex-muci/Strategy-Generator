@@ -106,7 +106,7 @@ class EndToEndTests(unittest.TestCase):
 
     def test_every_output_is_written(self):
         for name in ("report.md", "template_ranking.csv", "template_ranking.png",
-                     "equity_curves.png", "pbo.png"):
+                     "equity_curves.png", "pbo.png", "run.json", "data.csv", "portfolio_returns.csv"):
             p = os.path.join(self.dir, name)
             self.assertTrue(os.path.exists(p), f"{name} missing")
             self.assertGreater(os.path.getsize(p), 0, f"{name} empty")

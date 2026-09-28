@@ -148,7 +148,8 @@ def _annualized_return(stats: dict) -> float:
 # --------------------------------------------------------------------------
 
 def window_backtest(df: pd.DataFrame, tpl, start: int, end: int, *,
-                    warmup: int | None = None, initial_equity: float = 100_000.0) -> dict:
+                    warmup: int | None = None, initial_equity: float = 100_000.0,
+                    log_orders: bool = False) -> dict:
     """Backtest `tpl` on the bars df.iloc[start:end], with the indicators
     warmed up on the bars before `start` but NO trade opened before it.
 
@@ -170,12 +171,16 @@ def window_backtest(df: pd.DataFrame, tpl, start: int, end: int, *,
     `open_position`: it is neither carried into the next window nor charged
     an exit cost. Both effects are measured in the README ("Known
     approximations"); the first is conservative and the larger of the two.
+
+    `log_orders` passes through to `backtest`: the window's `orders` frame
+    (nothing rests before its first bar, so it needs no cut).
     """
     n = len(df)
     start, end = int(start), int(min(end, n))
     warmup = warmup_bars(tpl) if warmup is None else int(warmup)
     buf = max(0, start - warmup)
-    res = backtest(df.iloc[buf:end], tpl, initial_equity=initial_equity, first_trade_bar=start - buf)
+    res = backtest(df.iloc[buf:end], tpl, initial_equity=initial_equity, first_trade_bar=start - buf,
+                   log_orders=log_orders)
     off = start - buf
     eq = res["equity"].to_numpy()[off:]
     out = dict(res)

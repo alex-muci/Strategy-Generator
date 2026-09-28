@@ -56,7 +56,50 @@ Outputs land in `./outputs/` (or `--out DIR`):
 | `wfa_matrix_*.png` | Pardo's walk-forward matrix (train x test lengths) for the top finalist |
 | `correlation_heatmap.png` | correlation of qualifying templates' OOS returns |
 | `selected_windows.csv` | per-window chosen parameters and IS/OOS stats of the finalists |
+| `run.json`, `data.csv`, `portfolio_returns.csv`, `selected_returns.csv` | the run, recorded for a replay (see below): every template with its per-window parameters, the two portfolios' selections and weights, the exact bars used, the series to check against |
+| `replay/<target>/` | written by `python replay.py` (or `--replay`): the orders and trades behind the best template, the static portfolio and the nested portfolio, each verified against the run |
 | `report.md` | written summary with all the numbers, including the **buy & hold benchmark**: Sharpe, CAGR and drawdown of simply holding the asset over the same OOS bars, the nested portfolio's beta and correlation to it and its information ratio (what is left after the asset's own drift is removed), and how many templates beat holding at all |
+
+### Replaying a run: the orders and trades behind the numbers
+
+The report quotes three curves -- the best template, the static portfolio and
+the nested walk-forward portfolio -- and `replay.py` shows what they traded:
+
+```bash
+python replay.py --out outputs                     # best, static and nested
+python replay.py --out outputs --which nested --jobs 4
+python replay.py --out outputs --which best --template "TR-don-stop-chan-noreg-noV-noB"   # any template of the run
+python main.py --real SPY --replay all             # run, then replay, in one go
+```
+
+Nothing is re-optimized: the replay re-runs only the (template, window)
+pairs a target is made of, with each window's chosen parameters and the same
+`window_backtest` call the walk-forward used, on the bars saved in
+`data.csv` (a fresh yfinance download is a different backtest). It is exact
+by construction and takes seconds. Every target is **verified first**: the
+replayed per-bar returns must equal the stored series to the last digit, the
+Sharpe must match, the trade count must match, per window. `check.json`
+holds the verdict and the numbers; read the lists only when it says `ok`.
+
+Per target, in `outputs/replay/<target>/`:
+
+| file | what it holds |
+|---|---|
+| `trades.csv` | every executed trade: template, walk-forward window, entry/exit dates and prices, side, shares, exit reason, P&L, costs; a position still open at a window's end is listed too (`closed = False`, `reason = open_at_window_end`: it is marked to market and dropped there, see "Known approximations"); for the portfolios, the template's weight and (nested) the selection period |
+| `orders.csv` | the order lifecycle, top to bottom: what was **working** on which bars and at what level (an entry stop at the channel, a fade limit, a resting pullback limit with its expiry, the stop in force -- hard, opposite channel or trailing -- and the target), collapsed into one row per stretch of bars at the same level, plus every submission, fill, expiry and cancellation on its own date |
+| `order_events.csv` | the raw per-bar order log the lifecycle rows were built from |
+| `returns.csv` | replayed vs stored per-bar returns and their difference |
+| `check.json` | the verdict and the numbers behind it |
+
+The order log is read out of the engine's own bar loop
+(`backtest(..., log_orders=True)`, off by default and free when off), not
+rebuilt from the rules, so it cannot drift from what the engine did. The
+fills follow the engine's conventions: a stop or limit fills at its level, or
+at the open when the bar gapped through it; a `close_confirm` entry and a
+time exit are orders at the open; every stop is already working on the entry
+bar. What the portfolios trade is exactly the trades of their selected
+templates in the windows they were selected for, scaled by the weights: a
+nested period is one walk-forward window, so its trades are those windows'.
 
 
 ## Trading it: the ETF dashboard
