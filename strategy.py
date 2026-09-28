@@ -955,6 +955,46 @@ EXIT_CODES = {"channel": 0, "atr_trail": 1, "target_stop": 2, "time_stop": 3}
 REGIME_CODES = {"none": 0, "trend_only": 1, "range_only": 2}
 REASONS = ["stop", "channel", "midline", "target", "time", "stop_same_bar"]
 
+# The order log (backtest(..., log_orders=True)): what the loop had WORKING on
+# a bar and what it did on it, read out of the loop itself rather than rebuilt
+# from the rules. One row per event; the row's bar is the bar the order was
+# live on or executed on. `detail` is per kind: the order type of an entry
+# (ORDER_TYPES), the stop kind of a working stop (STOP_KINDS), the expiry bar
+# of a pullback limit, the exit reason (REASONS) of an exit fill, and for a
+# cancelled pullback 0 = warm-up bar, 1 = indicators not usable.
+ORDER_KINDS = [
+    "entry_working",        # entry stop (trend) / limit (fade) / pullback trigger watched on this bar
+    "entry_submit_market",  # close_confirm: market-on-open order after a confirming close
+    "pullback_submit",      # pullback limit placed (rests from the next bar)
+    "pullback_working",     # pullback limit resting on this bar
+    "pullback_expire",      # ... expired unfilled
+    "pullback_cancel",      # ... cancelled (warm-up, or indicators no longer usable)
+    "entry_fill",           # position opened: price, shares; aux = initial hard stop
+    "entry_reject",         # a fill that sized to zero (learner conviction 0, or no cash)
+    "stop_working",         # the stop in force on this bar (hard / opposite channel / trail)
+    "target_working",       # the ATR target or channel midline in force on this bar
+    "time_exit_submit",     # time exit: market order at the open of this bar
+    "exit_fill",            # position closed: price, shares; aux = trade P&L, detail = REASONS index
+]
+ORDER_TYPES = ["-", "stop", "limit", "pullback", "market"]
+STOP_KINDS = ["hard", "channel", "trail"]
+_O_ENTRY_WORKING, _O_SUBMIT_MKT, _O_PB_SUBMIT, _O_PB_WORKING, _O_PB_EXPIRE, _O_PB_CANCEL = 0, 1, 2, 3, 4, 5
+_O_ENTRY_FILL, _O_ENTRY_REJECT, _O_STOP_WORKING, _O_TARGET_WORKING, _O_TIME_EXIT, _O_EXIT_FILL = 6, 7, 8, 9, 10, 11
+
+
+def _olog(o_i, o_f, m, bar, kind, side, detail, level, qty, aux):
+    """Append one order-log event (numba does not bounds-check, so the write
+    is guarded; the count still advances so an overflow is detectable)."""
+    if m < o_i.shape[0]:
+        o_i[m, 0] = bar
+        o_i[m, 1] = kind
+        o_i[m, 2] = side
+        o_i[m, 3] = detail
+        o_f[m, 0] = level
+        o_f[m, 1] = qty
+        o_f[m, 2] = aux
+    return m + 1
+
 
 def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
               upper_x, lower_x, mid_x, regime, vol_rank, bias,
@@ -962,7 +1002,7 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
               has_vol, vol_low, vol_high, has_bias, allow_long, allow_short,
               atr_mult_stop, atr_mult_target, atr_mult_trail, pullback_atr_mult,
               pullback_valid_bars, max_hold_bars, risk_pct, max_leverage, vol_target_bar, cost_rate,
-              initial_equity, first_trade_bar):
+              initial_equity, first_trade_bar, log_orders):
     """The bar loop. Plain numpy code so numba can compile it unchanged;
     the pure-Python version is used when numba is not installed.
 
@@ -977,9 +1017,15 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
     hand the loop a slice that starts before its window without any trade
     decided on the earlier bars leaking into the window's result.
 
+    `log_orders` keeps the order log (ORDER_KINDS) in `o_i` (bar, kind, side,
+    detail) and `o_f` (level, qty, aux), `m` rows; off, both are one row and
+    nothing is written, so the research loop pays a predictable branch per
+    bar and no more.
+
     Returns equity, entries, the closed-trade columns
-    (entry_bar, exit_bar, side, entry_px, exit_px, shares, pnl, cost, reason, count)
-    and the loop's final state (open position, resting order, last usable ATR)."""
+    (entry_bar, exit_bar, side, entry_px, exit_px, shares, pnl, cost, reason, count),
+    the loop's final state (open position, resting order, last usable ATR)
+    and the order log (o_i, o_f, m)."""
     n = len(close)
     equity = np.empty(n)
     entries = np.zeros(n, dtype=np.int8)
@@ -993,6 +1039,11 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
     t_pnl = np.empty(n)
     t_cost = np.empty(n)
     n_trades = 0
+    # order log: at most 5 events on any bar (see the sites below), 8 is the margin
+    cap = 8 * n + 8 if log_orders else 1
+    o_i = np.zeros((cap, 4), dtype=np.int64)
+    o_f = np.zeros((cap, 3))
+    m = 0
 
     cash = initial_equity
     position = 0
@@ -1038,19 +1089,25 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
             stop_level = stop_price  # hard stop is always active
             stop_reason = 0
 
+            stop_kind = 0
+
             if exit_style == 3 and i - entry_bar >= max_hold_bars:
                 # the time exit is an order at the OPEN: it is out before
                 # anything intrabar can reach a stop
                 exit_price = open_[i]
                 reason = 4
+                if log_orders:
+                    m = _olog(o_i, o_f, m, i, _O_TIME_EXIT, side, 0, exit_price, shares, 0.0)
             else:
                 if exit_style == 1:
                     # trailing level from the extreme up to bar i-1 (no intrabar look-ahead)
                     trail_stop = trail_extreme - side * atr_mult_trail * a
-                    if side == 1:
-                        stop_level = max(stop_level, trail_stop)
-                    else:
-                        stop_level = min(stop_level, trail_stop)
+                    if side == 1 and trail_stop > stop_level:
+                        stop_level = trail_stop
+                        stop_kind = 2
+                    elif side == -1 and trail_stop < stop_level:
+                        stop_level = trail_stop
+                        stop_kind = 2
                 elif exit_style == 0 and pos_trend:
                     # the opposite channel is a stop on the SAME side as the hard
                     # stop; on the way through, whichever sits nearer to the price
@@ -1059,9 +1116,18 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
                     if side == 1 and lower_x[i - 1] > stop_level:
                         stop_level = lower_x[i - 1]
                         stop_reason = 1
+                        stop_kind = 1
                     elif side == -1 and upper_x[i - 1] < stop_level:
                         stop_level = upper_x[i - 1]
                         stop_reason = 1
+                        stop_kind = 1
+
+                if log_orders:
+                    m = _olog(o_i, o_f, m, i, _O_STOP_WORKING, side, stop_kind, stop_level, shares, 0.0)
+                    if exit_style == 2:
+                        m = _olog(o_i, o_f, m, i, _O_TARGET_WORKING, side, 0, target_price, shares, 0.0)
+                    elif exit_style == 0 and not pos_trend:
+                        m = _olog(o_i, o_f, m, i, _O_TARGET_WORKING, side, 0, mid_x[i - 1], shares, 0.0)
 
                 if side == 1 and low[i] <= stop_level:
                     exit_price = min(open_[i], stop_level)
@@ -1100,6 +1166,8 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
                 t_pnl[n_trades] = gross - xcost - entry_cost
                 t_cost[n_trades] = entry_cost + xcost
                 t_reason[n_trades] = reason
+                if log_orders:
+                    m = _olog(o_i, o_f, m, i, _O_EXIT_FILL, position, reason, exit_price, shares, t_pnl[n_trades])
                 n_trades += 1
                 position = 0
                 shares = 0.0
@@ -1115,6 +1183,9 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
         # ---- no usable indicators (or still warming up): manage what is open,
         # start nothing new ----
         if not a_ok or i < first_trade_bar:
+            if log_orders and pend_active:
+                m = _olog(o_i, o_f, m, i, _O_PB_CANCEL, pend_side, 0 if i < first_trade_bar else 1,
+                          pend_level, 0.0, 0.0)
             pend_active = False  # don't leave a stale resting order behind
             equity[i] = cash + (position * shares * (close[i] - entry_price) if position != 0 else 0.0)
             continue
@@ -1137,22 +1208,29 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
 
         fill_side = 0
         fill_px = 0.0
+        fill_type = 0   # ORDER_TYPES index of the order that fills (order log only)
 
         # ---- pending pullback order ----
         fill_trend = is_trend
         if position == 0 and pend_active:
+            if log_orders:
+                m = _olog(o_i, o_f, m, i, _O_PB_WORKING, pend_side, pend_expires, pend_level, 0.0, 0.0)
             if pend_side == 1 and low[i] <= pend_level:
                 fill_side = 1
                 fill_px = min(open_[i], pend_level)
                 fill_trend = pend_trend
+                fill_type = 3
                 pend_active = False
             elif pend_side == -1 and high[i] >= pend_level:
                 fill_side = -1
                 fill_px = max(open_[i], pend_level)
                 fill_trend = pend_trend
+                fill_type = 3
                 pend_active = False
             elif i >= pend_expires:
                 pend_active = False
+                if log_orders:
+                    m = _olog(o_i, o_f, m, i, _O_PB_EXPIRE, pend_side, pend_expires, pend_level, 0.0, 0.0)
 
         # ---- new entry signals (based on previous bar's channel) ----
         if position == 0 and fill_side == 0 and not pend_active and can_enter:
@@ -1167,6 +1245,17 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
                 broke_down = low[i] <= lower[i - 1]
                 level_up = upper[i - 1]
                 level_down = lower[i - 1]
+                if log_orders:
+                    # what is watched on this bar: a stop at the channel when
+                    # following the break, a limit at it when fading, the
+                    # trigger of a pullback limit for the pullback style
+                    otype = 3 if entry_style == 2 else (1 if is_trend else 2)
+                    if long_ok:
+                        m = _olog(o_i, o_f, m, i, _O_ENTRY_WORKING, 1, otype,
+                                  level_up if is_trend else level_down, 0.0, 0.0)
+                    if short_ok:
+                        m = _olog(o_i, o_f, m, i, _O_ENTRY_WORKING, -1, otype,
+                                  level_down if is_trend else level_up, 0.0, 0.0)
 
             side = 0
             level = 0.0
@@ -1189,11 +1278,16 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
                 if entry_style == 1:
                     fill_side = side
                     fill_px = open_[i]
+                    fill_type = 4
+                    if log_orders:
+                        m = _olog(o_i, o_f, m, i, _O_SUBMIT_MKT, side, 4, fill_px, 0.0, 0.0)
                 elif entry_style == 0:
                     if is_trend:
                         fill_px = max(open_[i], level) if side == 1 else min(open_[i], level)
+                        fill_type = 1
                     else:
                         fill_px = min(open_[i], level) if side == 1 else max(open_[i], level)
+                        fill_type = 2
                     fill_side = side
                 else:
                     pend_active = True
@@ -1201,6 +1295,8 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
                     pend_trend = is_trend
                     pend_level = level - side * pullback_atr_mult * a
                     pend_expires = i + pullback_valid_bars
+                    if log_orders:
+                        m = _olog(o_i, o_f, m, i, _O_PB_SUBMIT, side, pend_expires, pend_level, 0.0, 0.0)
 
         # ---- open the position ----
         entered = False
@@ -1232,6 +1328,10 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
                 entry_bar = i
                 entries[i] = 1
                 entered = True
+                if log_orders:
+                    m = _olog(o_i, o_f, m, i, _O_ENTRY_FILL, fill_side, fill_type, fill_px, qty, stop_price)
+            elif log_orders:
+                m = _olog(o_i, o_f, m, i, _O_ENTRY_REJECT, fill_side, fill_type, fill_px, qty, 0.0)
 
         # ---- conservative same-bar stop check on the entry bar ----
         # every stop the exit block would run from the next bar is already
@@ -1243,19 +1343,26 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
         if entered:
             sb_level = stop_price
             sb_reason = 5
+            sb_kind = 0
             if exit_style == 1:
                 trail_stop = fill_px - position * atr_mult_trail * a
-                if position == 1:
-                    sb_level = max(sb_level, trail_stop)
-                else:
-                    sb_level = min(sb_level, trail_stop)
+                if position == 1 and trail_stop > sb_level:
+                    sb_level = trail_stop
+                    sb_kind = 2
+                elif position == -1 and trail_stop < sb_level:
+                    sb_level = trail_stop
+                    sb_kind = 2
             elif exit_style == 0 and pos_trend:
                 if position == 1 and lower_x[i - 1] > sb_level:
                     sb_level = lower_x[i - 1]
                     sb_reason = 1
+                    sb_kind = 1
                 elif position == -1 and upper_x[i - 1] < sb_level:
                     sb_level = upper_x[i - 1]
                     sb_reason = 1
+                    sb_kind = 1
+            if log_orders:
+                m = _olog(o_i, o_f, m, i, _O_STOP_WORKING, position, sb_kind, sb_level, shares, 0.0)
             hit = (position == 1 and low[i] <= sb_level) or (position == -1 and high[i] >= sb_level)
             if hit:
                 sb_px = min(fill_px, sb_level) if position == 1 else max(fill_px, sb_level)
@@ -1271,6 +1378,8 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
                 t_pnl[n_trades] = gross - xcost - entry_cost
                 t_cost[n_trades] = entry_cost + xcost
                 t_reason[n_trades] = sb_reason
+                if log_orders:
+                    m = _olog(o_i, o_f, m, i, _O_EXIT_FILL, position, sb_reason, sb_px, shares, t_pnl[n_trades])
                 n_trades += 1
                 position = 0
                 shares = 0.0
@@ -1293,11 +1402,12 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
     return (equity, entries, t_entry, t_exit, t_side, t_entry_px, t_exit_px, t_shares, t_pnl, t_cost,
             t_reason, n_trades, position, shares, entry_price, stop_price, target_price, trail_extreme,
             entry_bar, entry_cost, pend_active, pend_side, pend_level, pend_expires, last_a,
-            pos_trend, pend_trend)
+            pos_trend, pend_trend, o_i, o_f, m)
 
 
 try:  # compile the loop once per process; falls back to plain Python without numba
     from numba import njit as _njit
+    _olog = _njit(cache=True, nogil=True)(_olog)   # before the loop is compiled: it is called from it
     _bar_loop_fast = _njit(cache=True, nogil=True)(_bar_loop)
     HAVE_NUMBA = True
 except Exception:  # pragma: no cover
@@ -1305,14 +1415,42 @@ except Exception:  # pragma: no cover
     HAVE_NUMBA = False
 
 
+def _orders_frame(o_i: np.ndarray, o_f: np.ndarray, idx_arr: np.ndarray) -> pd.DataFrame:
+    """The order log of `_bar_loop` as a frame with real dates: one row per
+    event, `detail` decoded per kind (see ORDER_KINDS) into `detail_text`,
+    `expires` the date a pullback limit lapses."""
+    n = len(idx_arr)
+    kinds = np.asarray(ORDER_KINDS, dtype=object)[o_i[:, 1]]
+    detail = o_i[:, 3]
+    text = np.full(len(kinds), "", dtype=object)
+    for k, table in ((_O_ENTRY_WORKING, ORDER_TYPES), (_O_SUBMIT_MKT, ORDER_TYPES), (_O_ENTRY_FILL, ORDER_TYPES),
+                     (_O_ENTRY_REJECT, ORDER_TYPES), (_O_STOP_WORKING, STOP_KINDS), (_O_EXIT_FILL, REASONS)):
+        sel = o_i[:, 1] == k
+        text[sel] = np.asarray(table, dtype=object)[detail[sel]]
+    sel = o_i[:, 1] == _O_PB_CANCEL
+    text[sel] = np.where(detail[sel] == 0, "warm-up", "indicators")
+    dated = np.issubdtype(idx_arr.dtype, np.datetime64)
+    expires = (np.full(len(kinds), np.datetime64("NaT"), dtype=idx_arr.dtype) if dated
+               else np.full(len(kinds), None, dtype=object))   # a frame with no dates: raw index labels
+    pb = (o_i[:, 1] == _O_PB_SUBMIT) | (o_i[:, 1] == _O_PB_WORKING) | (o_i[:, 1] == _O_PB_EXPIRE)
+    sel = pb & (detail < n)
+    expires[sel] = idx_arr[detail[sel]]
+    return pd.DataFrame(dict(
+        date=idx_arr[o_i[:, 0]], kind=kinds, side=o_i[:, 2], level=o_f[:, 0], qty=o_f[:, 1], aux=o_f[:, 2],
+        detail=detail, detail_text=text, expires=expires,
+    ))
+
+
 def backtest(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: float = 100_000.0,
-             first_trade_bar: int = 0) -> dict:
+             first_trade_bar: int = 0, log_orders: bool = False) -> dict:
     """Run `tpl` over `df` (must have Open/High/Low/Close). Returns a dict:
         equity   : pd.Series of end-of-bar equity, indexed like df
         returns  : pd.Series of per-bar simple returns of equity
         entries  : np.ndarray (1 on bars where a new trade was opened)
         trades   : list of trade dicts
         stats    : summary performance stats
+        orders   : the order log as a DataFrame (see ORDER_KINDS) when
+                   `log_orders`, else None
 
     `first_trade_bar` > 0 uses the first bars as indicator warm-up only: the
     equity stays at `initial_equity` and no trade can open before that bar.
@@ -1340,15 +1478,20 @@ def backtest(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: float = 10
         tpl.sides != "short_only", tpl.sides != "long_only",
         float(tpl.atr_mult_stop), float(tpl.atr_mult_target), float(tpl.atr_mult_trail), float(tpl.pullback_atr_mult),
         int(tpl.pullback_valid_bars), int(tpl.max_hold_bars), float(tpl.risk_pct), float(tpl.max_leverage),
-        float(vol_target_bar), tpl.cost_bps / 1e4, float(initial_equity), first_trade_bar,
+        float(vol_target_bar), tpl.cost_bps / 1e4, float(initial_equity), first_trade_bar, bool(log_orders),
     )
     (equity, entries, t_entry, t_exit, t_side, t_entry_px, t_exit_px, t_shares, t_pnl, t_cost,
      t_reason, n_trades, f_position, f_shares, f_entry_price, f_stop, f_target, f_trail,
      f_entry_bar, f_entry_cost, f_pend_active, f_pend_side, f_pend_level, f_pend_expires, f_last_atr,
-     f_pos_trend, f_pend_trend) = out
+     f_pos_trend, f_pend_trend, o_i, o_f, n_orders) = out
 
     idx = df.index
     idx_arr = idx.to_numpy()
+    orders = None
+    if log_orders:
+        if n_orders > o_i.shape[0]:  # pragma: no cover - the capacity bound is proven in _bar_loop
+            raise RuntimeError(f"order log overflow: {n_orders} events, capacity {o_i.shape[0]}")
+        orders = _orders_frame(o_i[:n_orders], o_f[:n_orders], idx_arr)
     trades = [
         dict(entry_date=pd.Timestamp(idx_arr[t_entry[k]]), side=int(t_side[k]), entry_price=float(t_entry_px[k]),
              shares=float(t_shares[k]), cost=float(t_cost[k]), exit_date=pd.Timestamp(idx_arr[t_exit[k]]),
@@ -1380,7 +1523,7 @@ def backtest(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: float = 10
 
     return {"equity": equity_s, "returns": returns, "entries": entries, "trades": trades,
             "stats": stats, "open_position": open_position, "pending_order": pending_order,
-            "last_atr": float(f_last_atr), "indicators": ind}
+            "last_atr": float(f_last_atr), "indicators": ind, "orders": orders}
 
 
 def annualized_sharpe(rets: pd.Series | np.ndarray, ppy: int | None = None) -> float:

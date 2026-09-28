@@ -43,6 +43,7 @@ from pipeline import (
     family_diagnostics, build_portfolios, finalist_stats, benchmark_stats,
 )
 from portfolio import returns_frame
+from replay import save_run, replay_run, TARGETS as REPLAY_TARGETS
 from strategy import annualized_sharpe, max_drawdown, periods_per_year, BARS_PER_YEAR, SIDES
 
 
@@ -87,6 +88,9 @@ def parse_args(argv=None):
     p.add_argument("--no-matrix", action="store_true", help="skip Pardo's walk-forward matrix (slow-ish)")
     p.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) - 1))
     p.add_argument("--out", default="outputs")
+    p.add_argument("--replay", default=None, choices=list(REPLAY_TARGETS) + ["all"],
+                   help="after the run, replay the best template / static portfolio / nested portfolio from "
+                        "the saved run, verify it and write its orders and trades to OUT/replay/ (replay.py)")
     return p.parse_args(argv)
 
 
@@ -121,12 +125,15 @@ def main(argv=None) -> dict:
 
     asset = args.real or "synthetic"
     with worker_pool(args.jobs, {asset: df}, cfg) as pool:
-        out = _run(df, asset, templates, pool, args)
+        out = _run(df, asset, templates, pool, args, cfg)
     print(f"\nTotal runtime {time.time() - t0:.1f}s. Outputs in {os.path.join(args.out, '')}")
+    if args.replay:
+        print()
+        out["replay"] = replay_run(args.out, args.replay, jobs=args.jobs)
     return out
 
 
-def _run(df, asset, templates, pool, args) -> dict:
+def _run(df, asset, templates, pool, args, cfg=None) -> dict:
     # ---- 2. walk-forward + CPCV per template, in parallel ----
     t1 = time.time()
     results = evaluate_slots([(t.name, asset, t) for t in templates], pool, on_result=_progress)
@@ -155,6 +162,9 @@ def _run(df, asset, templates, pool, args) -> dict:
     _print_benchmark(bench, args)
 
     _report(df, results, port, nested, fam, finalists, bench, args)
+    # what a replay needs (replay.py): templates and per-window params, the
+    # selections and weights, the bars, the series to check against
+    save_run(args.out, df, results, port, nested, fam, args, cfg or eval_config(args, args.interval))
     return dict(results=results, returns=rets, family=fam, portfolio=port, nested=nested,
                 finalists=finalists, benchmark=bench)
 
@@ -490,7 +500,9 @@ def _report(df, results, port, nested, fam, finalists, bench, args):
     L.append("- CPCV: a template whose path distribution straddles zero owes its single WFA path to luck.\n")
     L.append("- Pardo: WFE >= 0.5 and a majority of profitable OOS windows are the minimum to consider trading.\n")
     L.append("\nFiles: equity_curves.png, correlation_heatmap.png, template_ranking.png/.csv, cpcv_distribution.png, "
-             "pbo.png, wfa_matrix_*.png, selected_windows.csv\n")
+             "pbo.png, wfa_matrix_*.png, selected_windows.csv; run.json, data.csv, portfolio_returns.csv and "
+             "selected_returns.csv record the run for `python replay.py --out DIR` (orders and trades of the best "
+             "template and both portfolios, verified against these numbers)\n")
 
     with open(f"{out}/report.md", "w", encoding="utf-8") as f:
         f.writelines(L)
