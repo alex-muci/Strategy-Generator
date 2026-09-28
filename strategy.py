@@ -1430,7 +1430,9 @@ def _orders_frame(o_i: np.ndarray, o_f: np.ndarray, idx_arr: np.ndarray) -> pd.D
     sel = o_i[:, 1] == _O_PB_CANCEL
     text[sel] = np.where(detail[sel] == 0, "warm-up", "indicators")
     dated = np.issubdtype(idx_arr.dtype, np.datetime64)
-    expires = (np.full(len(kinds), np.datetime64("NaT"), dtype=idx_arr.dtype) if dated
+    # NaT with an explicit unit: numpy deprecates the unit-less one; it converts
+    # to whatever resolution the index has
+    expires = (np.full(len(kinds), np.datetime64("NaT", "ns"), dtype=idx_arr.dtype) if dated
                else np.full(len(kinds), None, dtype=object))   # a frame with no dates: raw index labels
     pb = (o_i[:, 1] == _O_PB_SUBMIT) | (o_i[:, 1] == _O_PB_WORKING) | (o_i[:, 1] == _O_PB_EXPIRE)
     sel = pb & (detail < n)
