@@ -379,6 +379,33 @@ class RunReplayTests(unittest.TestCase):
             shutil.rmtree(copy, ignore_errors=True)
 
 
+class EmptyPortfolioTests(unittest.TestCase):
+    """Nothing qualifies: the static portfolio is empty and the nested one
+    sits in cash. Both replay as consistent, empty targets, not as mismatches."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.dir = tempfile.mkdtemp(prefix="replay-empty-")
+        cls.out = _quiet(M.main, [a if a != "-5" else "5" for a in BASE] + ["--out", cls.dir])
+        cls.rep = _quiet(R.replay_run, cls.dir, "all")
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.dir, ignore_errors=True)
+
+    def test_empty_targets_are_consistent(self):
+        self.assertEqual(self.out["portfolio"]["selected"], [])
+        static, nested = self.rep["static"]["check"], self.rep["nested"]["check"]
+        self.assertTrue(static["ok"] and static["empty"], static)
+        self.assertEqual(static["n_trades_replayed"], 0)
+        self.assertTrue(nested["ok"], nested)
+        self.assertEqual(nested["n_trades_replayed"], 0)
+        self.assertTrue((self.rep["nested"]["returns"] == 0).all())
+        self.assertTrue(self.rep["best"]["check"]["ok"])
+        for which in R.TARGETS:
+            self.assertTrue(os.path.exists(os.path.join(self.dir, R.REPLAY_DIR, which, "check.json")))
+
+
 class NestedPeriodTests(unittest.TestCase):
     """A nested period is the walk-forward window that starts on its date,
     found by date: periods short of history leave no selection at all."""

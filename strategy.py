@@ -978,7 +978,6 @@ ORDER_KINDS = [
 ]
 ORDER_TYPES = ["-", "stop", "limit", "pullback", "market"]
 STOP_KINDS = ["hard", "channel", "trail"]
-_OK = {k: i for i, k in enumerate(ORDER_KINDS)}
 _O_ENTRY_WORKING, _O_SUBMIT_MKT, _O_PB_SUBMIT, _O_PB_WORKING, _O_PB_EXPIRE, _O_PB_CANCEL = 0, 1, 2, 3, 4, 5
 _O_ENTRY_FILL, _O_ENTRY_REJECT, _O_STOP_WORKING, _O_TARGET_WORKING, _O_TIME_EXIT, _O_EXIT_FILL = 6, 7, 8, 9, 10, 11
 
@@ -1430,7 +1429,9 @@ def _orders_frame(o_i: np.ndarray, o_f: np.ndarray, idx_arr: np.ndarray) -> pd.D
         text[sel] = np.asarray(table, dtype=object)[detail[sel]]
     sel = o_i[:, 1] == _O_PB_CANCEL
     text[sel] = np.where(detail[sel] == 0, "warm-up", "indicators")
-    expires = np.full(len(kinds), np.datetime64("NaT"), dtype=idx_arr.dtype)
+    dated = np.issubdtype(idx_arr.dtype, np.datetime64)
+    expires = (np.full(len(kinds), np.datetime64("NaT"), dtype=idx_arr.dtype) if dated
+               else np.full(len(kinds), None, dtype=object))   # a frame with no dates: raw index labels
     pb = (o_i[:, 1] == _O_PB_SUBMIT) | (o_i[:, 1] == _O_PB_WORKING) | (o_i[:, 1] == _O_PB_EXPIRE)
     sel = pb & (detail < n)
     expires[sel] = idx_arr[detail[sel]]

@@ -56,7 +56,7 @@ import pandas as pd
 import pipeline
 from data import synthetic_ohlc
 from pipeline import worker_pool, pool_map
-from strategy import StrategyTemplate, annualized_sharpe
+from strategy import StrategyTemplate, annualized_sharpe, set_periods_per_year
 from walkforward import window_backtest
 
 MANIFEST_VERSION = 1
@@ -355,6 +355,9 @@ def replay_target(run: dict, which: str, pool=None, *, template: str | None = No
     orders, windows, check)."""
     m, df = run["manifest"], run["df"]
     stored_port = run["portfolio_returns"]
+    # every Sharpe and vol-target size below reads the run's annualization
+    # (worker_pool sets it for the pool; this covers a direct call too)
+    set_periods_per_year(m["config"]["periods_per_year"])
     if which == "best":
         name = template or m["best_template"]
         if name not in m["templates"]:
@@ -442,7 +445,11 @@ def verify(replayed: pd.Series, stored: pd.Series | None, sharpe_stored: float, 
     check is skipped and reported as such: Sharpe and trade counts decide."""
     sharpe = annualized_sharpe(replayed) if len(replayed) > 2 else 0.0
     has_series = stored is not None
-    if has_series:
+    empty = bool(len(replayed) == 0 and (stored is None or len(stored) == 0))
+    if empty:
+        # a portfolio nothing qualified for: no bars, no trades, and consistent
+        same_index, max_diff, series_ok = True, 0.0, True
+    elif has_series:
         same_index = bool(len(replayed) == len(stored) and replayed.index.equals(stored.index))
         aligned = replayed.reindex(stored.index).fillna(0.0)
         max_diff = float(np.abs(aligned.to_numpy() - stored.to_numpy()).max()) if len(stored) and len(replayed) else np.nan
@@ -450,7 +457,7 @@ def verify(replayed: pd.Series, stored: pd.Series | None, sharpe_stored: float, 
     else:
         same_index, max_diff, series_ok = None, None, True
     ok = series_ok and abs(sharpe - float(sharpe_stored)) <= 1e-9 and n_trades_stored == n_trades_replayed
-    return dict(ok=bool(ok), stored_series=has_series, same_bars=same_index,
+    return dict(ok=bool(ok), empty=empty, stored_series=has_series, same_bars=same_index,
                 n_bars_replayed=int(len(replayed)), n_bars_stored=int(len(stored)) if has_series else None,
                 max_abs_return_diff=max_diff, sharpe_replayed=float(sharpe), sharpe_stored=float(sharpe_stored),
                 n_trades_replayed=int(n_trades_replayed), n_trades_stored=int(n_trades_stored))
@@ -533,7 +540,9 @@ def write_target(out_dir: str, res: dict) -> str:
 def _verdict_line(res: dict, folder: str) -> str:
     c = res["check"]
     status = "OK      " if c["ok"] else "MISMATCH"
-    diff = f"max |return diff| {c['max_abs_return_diff']:.1e}" if c["stored_series"] else "no stored series (Sharpe and trades only)"
+    diff = ("empty target (nothing selected)" if c["empty"] else
+            f"max |return diff| {c['max_abs_return_diff']:.1e}" if c["stored_series"] else
+            "no stored series (Sharpe and trades only)")
     return (f"  {status} {res['which']:<7} Sharpe replayed {c['sharpe_replayed']:.4f} vs stored {c['sharpe_stored']:.4f}, "
             f"{diff}, trades {c['n_trades_replayed']} vs {c['n_trades_stored']}, "
             f"{len(res['names'])} template(s), {len(res['windows'])} window(s) -> {folder}{os.sep}")
