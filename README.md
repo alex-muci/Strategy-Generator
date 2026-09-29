@@ -25,7 +25,7 @@ python -m venv env  # assuming 3.12 installed
 ./env/Script/Activate
 pip install -r requirements.txt 
 
-python -m unittest discover -s tests -v      # 298 tests (engine, order log, templates, hedge learner, walk-forward, robustness, selection, data, live signals, replay, both entry points)
+python -m unittest discover -s tests -v      # 306 tests (engine, order log, templates, hedge learner and its wide ladder, walk-forward, robustness, selection, data, live signals, replay, both entry points)
 # faster (about 1:35 min instead of 4.5): pip install -r requirements-dev.txt, then, with ./env active,
 python -m pytest -n auto --dist loadscope   # same tests in parallel; loadscope keeps a class (and its one-off setup) on one worker
 ```
@@ -37,6 +37,7 @@ python main.py --help
 python main.py --family quick                       # 72 templates (Donchian, ER filter)
 python main.py --family default                     # 778 templates, all switches sampled
 python main.py --family online                      # 288 templates on the online-learned channel (no lookback to fit)
+python main.py --family online_wide                 # the same 288 over a wider ladder of experts (bands, regime-gated rungs)
 python main.py --real SPY --start 2005-01-01 --family default --jobs 8
 python main.py --real SPY --start 2005-01-01 --family quick --sides long_only   # one-sided family (an asset with a drift)
 python main.py --real SPY --start 2005-01-01 --family quick --vol-target 0.1  # use vol-target rather than ATR-stop (see Position sizing section section)
@@ -281,7 +282,9 @@ data.py         Load real data (yfinance) or generate synthetic
                 regime-switching OHLC (trend probability / drift tunable).
 
 strategy.py     Indicators (ATR, Donchian, Keltner, Bollinger, the AdaHedge
-                online-learned channel and direction, Kaufman ER,
+                online-learned channel and direction over a fixed ladder
+                of experts -- Donchian rungs, or those plus bands and
+                regime-gated rungs -- Kaufman ER,
                 ADX, Ehlers CTI, Choppiness, variance ratio), the
                 StrategyTemplate switches, and a bar-by-bar backtest
                 engine (ATR-stop or volatility-target position sizing,
@@ -290,8 +293,9 @@ strategy.py     Indicators (ATR, Donchian, Keltner, Bollinger, the AdaHedge
                 bar loop is Numba-compiled (pure-Python fallback if numba
                 is missing) and indicator arrays are cached per slice.
 
-generator.py    Builds families of templates (quick / default / full)
-                and the lattice parameter grid for each one.
+generator.py    Builds families of templates (quick / default / online /
+                online_wide / full) and the lattice parameter grid for
+                each one.
 
 walkforward.py  Rolling or anchored walk-forward optimizer with embargo,
                 plateau parameter selection, Pardo's Walk-Forward
@@ -345,7 +349,7 @@ A **template** is a fixed combination of categorical switches:
 | switch | values |
 |---|---|
 | `direction_logic` | `trend` (trade with the break) / `countertrend` (fade it) / `learned` (the online learner decides bar by bar, see below) |
-| `channel_type` | `donchian` / `keltner` (EMA +/- k ATR) / `bollinger` (SMA +/- k sd) / `hedge` (online-learned, see below) |
+| `channel_type` | `donchian` / `keltner` (EMA +/- k ATR) / `bollinger` (SMA +/- k sd) / `hedge` (online-learned, see below) / `hedge_wide` (the same learner over a wider ladder of experts, see below) |
 | `entry_style` | `stop` (at the level) / `close_confirm` (close beyond, next open) / `pullback` (after the break, a limit k ATR from the level: back inside the channel when following, deeper beyond it when fading) |
 | `exit_style` | `channel` (Turtle exit; midline target for countertrend) / `atr_trail` / `target_stop` / `time_stop` -- a hard ATR stop is always on |
 | `regime_indicator` | `er` Kaufman Efficiency Ratio / `adx` / `cti` Ehlers Correlation Trend / `chop` Choppiness / `vr` variance ratio |
@@ -468,6 +472,81 @@ algorithm from the prediction-with-expert-advice literature:
 templates: with a `channel` exit and no regime filter the grid is empty
 and the walk-forward has nothing left to fit. The `online` family is
 288 such templates; `full` includes them alongside the fitted ones.
+
+#### The wide ladder: `hedge_wide` and the `online_wide` family
+
+The ladder is a list of rules fixed in advance, so anything that is a
+rule can be an expert. `hedge_wide` runs the same learner, loss, memory
+and lifetimes over `HEDGE_LADDERS["hedge_wide"]`, twelve experts per side
+instead of four (`strategy.HedgeExpert` describes one):
+
+- **The four Donchian rungs** of `HEDGE_LADDER`, unchanged.
+- **Band experts**: Keltner and Bollinger channels around a 20-bar
+  midline (`HEDGE_WIDE_N`, the ladder's second rung) at the two widths
+  the walk-forward grid offers the fitted templates, 1.5 and 2.5
+  (`HEDGE_WIDE_WIDTHS`), in ATRs and in standard deviations. A break of
+  a band is a move of k volatility units from the mean rather than a new
+  n-bar extreme, so the ladder now spans *shape* as well as period. The
+  Keltner expert uses Keltner's original SMA midline rather than the
+  template's EMA: a rolling window is exact once full, so the warm-up
+  contract below still holds to the last bit; an EMA never is. (Both
+  bands reduce their SMA and standard deviation window by window rather
+  than with pandas' running sums, whose last bits depend on where the
+  series started; the fitted `bollinger` template's bands differ from
+  the expert's by that rounding, 1e-11, and no more.)
+- **Regime-gated rungs**: a copy of every Donchian rung that only acts in
+  the regime of its side. The gate is Kaufman's efficiency ratio over 20
+  bars at 0.35, the ER's own default split in `REGIME_INDICATORS`, not a
+  template's fitted threshold: a gated **fade** expert fades breaks only
+  while ER < 0.35 (the range regime), a gated **follow** expert follows
+  them only while ER >= 0.35. Outside its regime the expert is flat and
+  scores the neutral loss, so it is the ladder's *cash* expert for that
+  side: when fading a trend loses, the gated fade rungs collect the fade
+  side's weight and the mixture is no longer rewarding anyone for
+  fading. Stepping aside and back in are sides traded and are charged at
+  `cost_bps` like every other flip, so a gate that flickers pays for it.
+  The bands a gated expert contributes to the channel are its rung's,
+  whether or not its gate is open: the gate is about the stance it is
+  scored on, the channel is where the template trades.
+
+Everything else carries over: no learning rate, no threshold, no
+lookback or width in the grid (`param_grid_for` is as empty as for
+`hedge`), the same 410-bar warm-up (the 80-bar rung still leads it: a
+band's stance is exact after its window plus its span), and a window
+warmed on `hedge_warmup(atr_n, "hedge_wide")` bars matches a full-history
+run exactly (the test covers both ladders). Two things are specific to
+the wide ladder:
+
+- In the **learned direction** a gated expert **abstains** while its gate
+  is shut: a fade expert standing aside in a trend is not a vote to fade
+  the next break. Its weight lowers the conviction instead, so the
+  position shrinks when the learner's weight sits on experts that would
+  not trade this regime, to nothing when all of it does. The direction
+  still follows the regime series' trends and fades its range, but it
+  flips to fade on about a tenth of a trend's bars where the plain
+  ladder flipped on under one in a hundred: those are the Keltner and
+  Bollinger *fade* experts earning on pullbacks inside the trend, carried
+  by the short-lifetime learners. That is the learner doing its job with
+  mean-reversion experts on the ladder, not a bug, and on that series the
+  learned `hedge_wide` template still ends above both the plain
+  learned template and its own fixed-direction versions; but it is the
+  price of the band experts and a real series may charge it differently.
+- The learner is O(experts) per bar: a 24-expert `learned` run costs
+  about twice the 8-expert one.
+
+The `online_wide` family is the `online` family's 288 switch
+combinations over `hedge_wide`, so the two compare template for
+template (`TR-hdw-stop-chan-noreg-noV-noB` against
+`TR-hdg-stop-chan-noreg-noV-noB`, and so on). Whether a wider ladder
+helps is an empirical question the pipeline is built to answer, family
+against family; the learner's regret bound says only that the mixture
+tracks the best expert *on the ladder*, and a wider ladder has a higher
+best and a slower concentration. On the regime series the fixed-direction
+`hedge_wide` templates are a little worse than `hedge` (the wide `trend`
+template follows a mixture that includes bands, which break earlier and
+whipsaw more) and the learned one a little better. `hedge_diagnostics(...,
+ladder="hedge_wide")` names the experts `follow_kel20x1.5`,
+`fade_bol20x2.5`, `follow_40:trend`, `fade_40:range`, and so on.
 
 Why this and not the other online-learning candidates:
 
@@ -647,11 +726,17 @@ They are listed with the number that would justify reopening each one.
 - **More switches**: add an indicator to `REGIME_INDICATORS` or a new
   entry/exit branch in `strategy.backtest`, then list it in
   `generator.FAMILIES`.
-- **More experts for the hedge channel**: `HEDGE_LADDER` can hold any
-  set of Donchian lookbacks; Keltner / Bollinger widths, or a fade expert
-  that only acts inside a range regime, could join the ladder (the
+- **More experts for the hedge channel**: done, as `hedge_wide` and the
+  `online_wide` family (Keltner / Bollinger widths and regime-gated
+  rungs, see above). To go further, add a `HedgeExpert` to a ladder in
+  `HEDGE_LADDERS`, or a new ladder under a new channel type: an expert
+  is a pair of bands plus a side and an optional gate, and needs its
+  `formed` / `lead` right so that `hedge_warmup` keeps the warm-up
+  contract (rolling windows only: an EMA-based expert would break the
+  bit-exact match of a warmed window with a full-history run). The
   mixture stays causal and parameter-free as long as the ladder is fixed
-  in advance).
+  in advance; the `test_warm_window_matches_the_full_run` and
+  `WideLadderTests` tests are the checklist.
 - **Meta-labelling** (AFML ch. 3): use the template signals as primary
   models and train a classifier on the triple-barrier outcome to size
   or veto trades.

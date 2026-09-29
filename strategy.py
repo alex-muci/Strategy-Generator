@@ -42,6 +42,15 @@ Switches (define a "template" -- a structurally distinct strategy):
                                    direction_logic, so a countertrend
                                    template learns which lookback pays to
                                    FADE (anti-correlation).
+                    'hedge_wide' -> the same learner over a WIDER fixed
+                                   ladder (HEDGE_LADDERS['hedge_wide']): the
+                                   Donchian rungs, Keltner and Bollinger bands
+                                   at fixed widths, and a regime-gated copy
+                                   of every rung that only acts while the
+                                   efficiency ratio says trend (a follow
+                                   expert) or range (a fade expert). Still
+                                   nothing to fit: the ladder is fixed in
+                                   advance.
 
   entry_style     : 'stop'          -> enter the moment the channel trades
                                        (stop order for trend, limit for fade)
@@ -119,7 +128,7 @@ Execution model (no look-ahead):
 """
 
 from __future__ import annotations
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, replace
 import numpy as np
 import pandas as pd
 
@@ -288,9 +297,9 @@ def channel(df: pd.DataFrame, kind: str, n: int, k: float, atr_n: int,
         return keltner(df, n, k, atr_n)
     if kind == "bollinger":
         return bollinger(df, n, k)
-    if kind == "hedge":
+    if kind in HEDGE_CHANNELS:
         return hedge_channel(df, atr_n, mode=mode, scale=HEDGE_EXIT_SCALE if role == "exit" else 1.0,
-                             cost_bps=cost_bps)
+                             cost_bps=cost_bps, ladder=kind)
     raise ValueError(f"unknown channel_type {kind}")
 
 
@@ -305,7 +314,14 @@ def channel(df: pd.DataFrame, kind: str, n: int, k: float, atr_n: int,
 #   * experts  : Donchian channels with the fixed lookbacks HEDGE_LADDER
 #                (a log-spaced ladder, not a tuned parameter). A trend
 #                template scores FOLLOW experts, a countertrend one FADE
-#                experts, a 'learned' direction both.
+#                experts, a 'learned' direction both. The 'hedge_wide'
+#                channel runs the same learner over a wider fixed ladder
+#                (HEDGE_LADDERS, HedgeExpert): the Donchian rungs, Keltner
+#                and Bollinger bands at fixed widths, and a regime-gated
+#                copy of every rung that stands aside (flat, neutral loss)
+#                outside the regime of its side. Anything fixed in advance
+#                can be an expert; the mixture stays causal and free of
+#                fitted parameters.
 #   * loss     : each bar, expert e is scored on the ATR-normalised return
 #                of the stance it implied on the previous bar (long after
 #                a new n-bar high, short after a new n-bar low, for up to
@@ -373,33 +389,161 @@ HEDGE_HORIZONS = (20, 40, 80, 160)   # lifetimes H of the discounted learners (g
                                      # trend's bars on the regime test series, 20 7 %, 32 7 %, 64 1 %)
 HEDGE_MODES = ("trend", "countertrend", "learned")
 
+# The wide ladder ('hedge_wide'). Every number here is a rung, fixed in
+# advance like HEDGE_LADDER, never fitted.
+HEDGE_WIDE_N = 20               # midline lookback of the band experts (the ladder's second rung)
+HEDGE_WIDE_WIDTHS = (1.5, 2.5)  # band half-widths, in ATRs (Keltner) / standard deviations (Bollinger):
+                                # the two the walk-forward grid offers the fitted templates
+HEDGE_GATE_N = 20               # a gated expert reads Kaufman's efficiency ratio over this many bars and
+HEDGE_GATE_THRESHOLD = 0.35     # acts at or above this (a follow expert) or below it (a fade expert):
+                                # REGIME_INDICATORS['er']'s own defaults, not a template's regime_threshold
 
-def hedge_warmup(atr_n: int) -> int:
+
+@dataclass(frozen=True)
+class HedgeExpert:
+    """One expert of a hedge ladder: a channel, the side it takes on a break
+    of it (+1 follow, -1 fade) and whether it only acts in the regime of
+    that side. An expert is a rule fixed in advance, not a parameter, and
+    its stance on a bar is an exact function of the `lead` bars behind it
+    (the warm-up contract, see `hedge_warmup`)."""
+    kind: str = "donchian"   # 'donchian'  highest high / lowest low of n bars
+                             # 'keltner'   SMA(n) +/- k ATR(atr_n): Keltner's original SMA midline, not the
+                             #             template's EMA, because a rolling window is exact once full
+                             #             and an EMA never is (see walkforward._ema_settle_bars)
+                             # 'bollinger' SMA(n) +/- k stdev(n)
+                             # (the bands' SMA and stdev are reduced window by window, see
+                             # _window_mean_std, so a slice reproduces them bit for bit)
+    n: int = 20
+    k: float = 0.0           # band half-width (bands only)
+    gated: bool = False      # acts only while ER(HEDGE_GATE_N) says trend (follow) / range (fade)
+    side: int = 1            # +1 follow the break, -1 fade it (stamped by `hedge_ladder`)
+
+    @property
+    def span(self) -> int:
+        """Bars a break stays the expert's stance: its own lookback, when the
+        break bar leaves the Donchian channel or the SMA window behind a band."""
+        return int(self.n)
+
+    @property
+    def regime(self) -> str:
+        return "trend" if self.side > 0 else "range"
+
+    @property
+    def label(self) -> str:
+        base = str(int(self.n)) if self.kind == "donchian" else f"{self.kind[:3]}{int(self.n)}x{self.k:g}"
+        return f"{'follow' if self.side > 0 else 'fade'}_{base}{':' + self.regime if self.gated else ''}"
+
+    def formed(self, atr_n: int) -> int:
+        """Index of the first bar whose bands are fully formed."""
+        if self.kind == "keltner":
+            return max(int(self.n) - 1, int(atr_n))   # atr_n true ranges, each with the close before it
+        return int(self.n) - 1
+
+    def lead(self, atr_n: int) -> int:
+        """Bars before the stance on bar r is exact: the oldest break it can
+        hold is span - 1 bars back and was tested against the bands of the
+        bar before that, which must be formed (2 n for a Donchian rung); a
+        gated expert also reads the regime of bar r, formed after
+        HEDGE_GATE_N + 1 bars."""
+        lead = self.span + self.formed(atr_n) + 1
+        return max(lead, HEDGE_GATE_N + 1) if self.gated else lead
+
+    def bands(self, df: pd.DataFrame, atr_n: int, scale: float = 1.0):
+        """(upper, lower) arrays of the expert's channel at `scale` times its
+        lookback (the exit channel is the entry one at HEDGE_EXIT_SCALE)."""
+        m = max(2, int(round(int(self.n) * scale)))
+        if self.kind == "donchian":
+            up, lo, _ = donchian(df, m)
+            return _to_arr(up), _to_arr(lo)
+        if self.kind not in ("keltner", "bollinger"):
+            raise ValueError(f"unknown expert kind {self.kind}")
+        mid, sd = _window_mean_std(df["Close"].to_numpy(), m)   # the SMA / stdev, window by window
+        width = self.k * (_to_arr(atr(df, atr_n)) if self.kind == "keltner" else sd)
+        return mid + width, mid - width
+
+
+def _window_mean_std(x: np.ndarray, n: int):
+    """Rolling mean and population standard deviation of `x` over `n` bars,
+    every window reduced on its own (numpy over a sliding view) rather than
+    by a running sum. pandas' rolling mean and std carry a compensated
+    running sum whose last bits depend on where the series started (3e-14
+    on a mean of prices, 3e-11 on their std), so a slice would not
+    reproduce the full series' bands and the ladder's warm-up contract
+    (`hedge_warmup`: a warmed window matches a full-history run exactly)
+    would hold only to rounding. NaN before the first full window."""
+    x = np.ascontiguousarray(x, dtype=np.float64)
+    T = len(x)
+    mean = np.full(T, np.nan); std = np.full(T, np.nan)
+    if T >= n:
+        win = np.lib.stride_tricks.sliding_window_view(x, n)
+        mean[n - 1:] = win.mean(axis=1)
+        std[n - 1:] = win.std(axis=1)
+    return mean, std
+
+
+def _wide_ladder():
+    rungs = tuple(HedgeExpert("donchian", n) for n in HEDGE_LADDER)
+    bands = tuple(HedgeExpert(kind, HEDGE_WIDE_N, k) for kind in ("keltner", "bollinger") for k in HEDGE_WIDE_WIDTHS)
+    gated = tuple(HedgeExpert("donchian", n, gated=True) for n in HEDGE_LADDER)
+    return rungs + bands + gated
+
+
+# channel_type -> the side-less experts of its ladder (see hedge_ladder for the sided ones)
+HEDGE_LADDERS = {
+    "hedge": tuple(HedgeExpert("donchian", n) for n in HEDGE_LADDER),
+    "hedge_wide": _wide_ladder(),
+}
+HEDGE_CHANNELS = tuple(HEDGE_LADDERS)   # the channel types the learner builds
+
+
+def hedge_ladder_for(channel_type: str) -> str:
+    """The ladder a template's learner runs on: its own for a hedge channel,
+    the plain Donchian one for a learned direction on a fitted channel."""
+    return channel_type if channel_type in HEDGE_LADDERS else "hedge"
+
+
+def hedge_warmup(atr_n: int, ladder: str = "hedge") -> int:
     """Bars before the learner's first fully formed output, which is then
     exactly what a full-history run computes (the walk-forward's warm-up
     buffer relies on it). Row t of the weights replays the losses of rows
     t - HEDGE_MEMORY + 1 .. t, and loss row r is exact once
-      * the expert stances on r and r-1 are: a stance looks back n bars for
-        a break and each break test needs a full n-bar channel behind it, so
-        r >= 2 n (see `_expert_stances`), and
+      * the expert stances on r and r-1 are: each expert's `lead` (a stance
+        looks back `span` bars for a break and each break test needs formed
+        bands behind it, so r >= 2 n for a Donchian rung, see
+        `_expert_stances`), and
       * the ATR on r-1 is: atr_n true ranges, each needing the close before
         it, so r >= atr_n + 1."""
-    return int(HEDGE_MEMORY + max(2 * max(HEDGE_LADDER), int(atr_n) + 1))
+    experts = _ladder_spec(ladder)
+    return int(HEDGE_MEMORY + max(max(e.lead(atr_n) for e in experts), int(atr_n) + 1))
 
 
-def hedge_experts(mode: str):
-    """(lookbacks, sides) of the expert ladder for a direction mode:
-    trend -> follow experts only, countertrend -> fade experts only,
-    learned -> both, so the learner can switch between following and
-    fading as well as between periods."""
+def _ladder_spec(ladder: str):
+    try:
+        return HEDGE_LADDERS[ladder]
+    except KeyError:
+        raise ValueError(f"unknown hedge ladder {ladder!r}; known: {', '.join(HEDGE_LADDERS)}") from None
+
+
+def hedge_ladder(mode: str, ladder: str = "hedge") -> list:
+    """The sided experts the learner scores under a direction mode: the
+    ladder on the follow side (trend), on the fade side (countertrend) or
+    both (learned, so the learner can switch between following and fading
+    as well as between channels)."""
+    spec = _ladder_spec(ladder)
     if mode == "trend":
-        return np.array(HEDGE_LADDER, dtype=np.int64), np.ones(len(HEDGE_LADDER))
+        return [replace(e, side=1) for e in spec]
     if mode == "countertrend":
-        return np.array(HEDGE_LADDER, dtype=np.int64), -np.ones(len(HEDGE_LADDER))
+        return [replace(e, side=-1) for e in spec]
     if mode == "learned":
-        n = np.array(HEDGE_LADDER * 2, dtype=np.int64)
-        return n, np.concatenate([np.ones(len(HEDGE_LADDER)), -np.ones(len(HEDGE_LADDER))])
+        return [replace(e, side=1) for e in spec] + [replace(e, side=-1) for e in spec]
     raise ValueError(f"unknown hedge mode {mode}")
+
+
+def hedge_experts(mode: str, ladder: str = "hedge"):
+    """(lookbacks, sides) arrays of `hedge_ladder(mode, ladder)`."""
+    experts = hedge_ladder(mode, ladder)
+    return (np.array([int(e.n) for e in experts], dtype=np.int64),
+            np.array([float(e.side) for e in experts]))
 
 
 def _hedge_round(l, d, w, z, delta, eta, gamma):
@@ -573,12 +717,12 @@ def _adahedge_loop(loss, memory=HEDGE_MEMORY, horizons=HEDGE_HORIZONS):
     return _hedge_fast(loss, int(memory), np.ascontiguousarray(gammas))
 
 
-def _expert_stances(high, low, close, uppers, lowers, sides, spans):
-    """Stance (+1/-1/0) each Donchian expert holds at the CLOSE of bar t:
-    a new n-bar high (high[t] >= upper[t-1]) puts a follow expert
-    (sides[e] = +1) long, a new n-bar low puts it short; a fade expert
-    (sides[e] = -1) takes the opposite side. A bar that breaks both edges
-    is no signal.
+def _expert_stances(high, low, close, uppers, lowers, sides, spans, gates):
+    """Stance (+1/-1/0) each expert holds at the CLOSE of bar t: a break of
+    its upper band (high[t] >= upper[t-1]) puts a follow expert
+    (sides[e] = +1) long, a break of its lower band puts it short; a fade
+    expert (sides[e] = -1) takes the opposite side. A bar that breaks both
+    edges is no signal.
 
     The stance is that of the most recent one-sided break within the last
     `spans[e]` bars (t - spans[e] < break bar <= t), and 0 (flat) when there
@@ -590,7 +734,12 @@ def _expert_stances(high, low, close, uppers, lowers, sides, spans):
     held until the next break could depend on bars arbitrarily far back
     (nothing forces an n-bar channel to break within any fixed time), and a
     walk-forward window warmed on `hedge_warmup` bars then learned different
-    weights than a full-history run did."""
+    weights than a full-history run did.
+
+    `gates[t, e]` False flattens the stance on bar t (a regime-gated expert
+    outside its regime): the break is still remembered, and the stance comes
+    back when the gate reopens within the span. Flattening and re-entering
+    are sides traded, and `_hedge_loss` charges them."""
     T, N = uppers.shape
     S = np.zeros((T, N))
     for e in range(N):
@@ -610,7 +759,7 @@ def _expert_stances(high, low, close, uppers, lowers, sides, spans):
                 elif dn and not up:
                     last_t = t
                     last_s = -sign
-            if last_t >= 0 and t - last_t < span:
+            if last_t >= 0 and t - last_t < span and gates[t, e]:
                 S[t, e] = last_s
     return S
 
@@ -626,26 +775,59 @@ except Exception:  # pragma: no cover
     _stances_fast = _expert_stances
 
 
-def _hedge_loss(df: pd.DataFrame, atr_n: int, mode: str, cost_bps: float = 0.0):
+def _hedge_gates(df: pd.DataFrame, experts) -> np.ndarray:
+    """T x N gate: True where expert e may hold a stance on bar t. Always for
+    an ungated expert; for a gated one, where the efficiency ratio over
+    HEDGE_GATE_N bars says its side's regime (>= HEDGE_GATE_THRESHOLD for a
+    follow expert, below it for a fade one). A NaN ratio (unformed, or a
+    stretch with no movement at all) fails both tests: the expert stands
+    aside."""
+    T, N = len(df), len(experts)
+    gates = np.ones((T, N), dtype=np.bool_)
+    if any(e.gated for e in experts):
+        er = _to_arr(efficiency_ratio(df["Close"], HEDGE_GATE_N))
+        with np.errstate(invalid="ignore"):
+            trend = er >= HEDGE_GATE_THRESHOLD
+            rng = er < HEDGE_GATE_THRESHOLD
+        for j, e in enumerate(experts):
+            if e.gated:
+                gates[:, j] = trend if e.side > 0 else rng
+    return gates
+
+
+def _hedge_stances(df: pd.DataFrame, atr_n: int, mode: str, ladder: str = "hedge"):
+    """(S, formed, experts): the T x N stance (+1/-1/0) each expert of
+    `hedge_ladder(mode, ladder)` holds at the close of every bar (see
+    `_expert_stances`), the T x N mask of the bars its bands were formed
+    on, and the experts."""
+    experts = hedge_ladder(mode, ladder)
+    high = _to_arr(df["High"]); low = _to_arr(df["Low"]); close = _to_arr(df["Close"])
+    T = len(close)
+    N = len(experts)
+    uppers = np.empty((T, N)); lowers = np.empty((T, N))
+    cache = {}
+    for j, e in enumerate(experts):
+        key = (e.kind, int(e.n), float(e.k))
+        if key not in cache:
+            cache[key] = e.bands(df, atr_n)
+        uppers[:, j], lowers[:, j] = cache[key]
+    sides = np.array([float(e.side) for e in experts])
+    spans = np.array([e.span for e in experts], dtype=np.int64)
+    S = _stances_fast(high, low, close, uppers, lowers, sides, spans, _hedge_gates(df, experts))
+    return S, ~np.isnan(uppers), experts
+
+
+def _hedge_loss(df: pd.DataFrame, atr_n: int, mode: str, cost_bps: float = 0.0, ladder: str = "hedge"):
     """The T x N loss matrix the learner scores (in [0, 1]) plus the ladder's
     (lookbacks, sides): expert e's loss on bar t is 0.5 * (1 - payoff) where
     the payoff is the ATR-normalised move of bar t in the direction of the
     stance e held at the previous close, minus the cost (per side, in ATRs,
     as the engine charges it) of the sides e traded at the close of t to
     reach its new stance, halved and clipped to [-1, 1]."""
-    lookbacks, sides = hedge_experts(mode)
-    high = _to_arr(df["High"]); low = _to_arr(df["Low"]); close = _to_arr(df["Close"])
-    T = len(close)
-    N = len(lookbacks)
-    uppers = np.empty((T, N)); lowers = np.empty((T, N))
-    cache = {}
-    for e, n in enumerate(lookbacks):
-        if int(n) not in cache:
-            up, lo, _ = donchian(df, int(n))
-            cache[int(n)] = (_to_arr(up), _to_arr(lo))
-        uppers[:, e], lowers[:, e] = cache[int(n)]
-    S = _stances_fast(high, low, close, uppers, lowers, np.ascontiguousarray(sides),
-                      np.ascontiguousarray(lookbacks, dtype=np.int64))
+    S, formed, _ = _hedge_stances(df, atr_n, mode, ladder)
+    lookbacks, sides = hedge_experts(mode, ladder)
+    close = _to_arr(df["Close"])
+    T, N = S.shape
     a = _to_arr(atr(df, atr_n))
     a_prev = np.where(a[:-1] > 0, a[:-1], np.nan)
     z = (close[1:] - close[:-1]) / a_prev                    # next-bar move, in ATRs
@@ -654,41 +836,44 @@ def _hedge_loss(df: pd.DataFrame, atr_n: int, mode: str, cost_bps: float = 0.0):
     payoff = np.clip((S[:-1] * z[:, None] - c[:, None] * flips) / 2.0, -1.0, 1.0)
     loss = np.full((T, N), 0.5)
     loss[1:] = 0.5 * (1.0 - np.nan_to_num(payoff, nan=0.0))
-    formed = ~np.isnan(uppers)           # an unformed expert has no stance: neutral loss
-    loss = np.where(formed, loss, 0.5)
+    loss = np.where(formed, loss, 0.5)   # an unformed expert has no stance: neutral loss
     return np.ascontiguousarray(loss), lookbacks, sides
 
 
-def _hedge_run(df: pd.DataFrame, atr_n: int, mode: str, cost_bps: float):
-    loss, _, _ = _hedge_loss(df, atr_n, mode, cost_bps)
+def _hedge_run(df: pd.DataFrame, atr_n: int, mode: str, cost_bps: float, ladder: str):
+    loss, _, _ = _hedge_loss(df, atr_n, mode, cost_bps, ladder)
     W, ETA, V, SURPRISE = _adahedge_loop(loss)
     return W, ETA, V, SURPRISE, loss
 
 
-def _hedge_cached(df: pd.DataFrame, atr_n: int, mode: str, cost_bps: float, dfkey=None):
-    """One learner run per (bars, mode, ATR length, cost): the entry channel,
-    the exit channel and the learned direction all read the same weights."""
-    return _cached(df, ("hedge", mode, int(atr_n), float(cost_bps)),
-                   lambda: _hedge_run(df, atr_n, mode, cost_bps), dfkey)
+def _hedge_cached(df: pd.DataFrame, atr_n: int, mode: str, cost_bps: float, ladder: str = "hedge", dfkey=None):
+    """One learner run per (bars, ladder, mode, ATR length, cost): the entry
+    channel, the exit channel and the learned direction all read the same
+    weights."""
+    return _cached(df, ("hedge", ladder, mode, int(atr_n), float(cost_bps)),
+                   lambda: _hedge_run(df, atr_n, mode, cost_bps, ladder), dfkey)
 
 
-def hedge_weights(df: pd.DataFrame, atr_n: int, mode: str = "trend", cost_bps: float = 0.0) -> np.ndarray:
-    """T x n_experts learner weights, row t computed from bars <= t
-    (the last HEDGE_MEMORY of them)."""
-    return _hedge_cached(df, atr_n, mode, cost_bps)[0]
+def hedge_weights(df: pd.DataFrame, atr_n: int, mode: str = "trend", cost_bps: float = 0.0,
+                  ladder: str = "hedge") -> np.ndarray:
+    """T x n_experts learner weights over `hedge_ladder(mode, ladder)`, row t
+    computed from bars <= t (the last HEDGE_MEMORY of them)."""
+    return _hedge_cached(df, atr_n, mode, cost_bps, ladder)[0]
 
 
-def hedge_diagnostics(df: pd.DataFrame, atr_n: int, mode: str = "trend", cost_bps: float = 0.0) -> dict:
+def hedge_diagnostics(df: pd.DataFrame, atr_n: int, mode: str = "trend", cost_bps: float = 0.0,
+                      ladder: str = "hedge") -> dict:
     """What the learner did, bar by bar, for notebooks and dashboards:
-    `weights` (expert weights, columns follow_10 / fade_20 / ...), `loss`
-    (the expert losses it scored), `eta` (each lifetime's learning rate,
-    columns = HEDGE_HORIZONS), `horizon_weights` (the meta learner's weights
-    over the lifetimes: shorter ones gaining is the learner shortening its
-    memory) and `surprise` (the loss the played mixture suffered minus the
-    best expert's, in [0, 1]). Nothing here changes the strategy."""
-    W, ETA, V, SURPRISE, loss = _hedge_cached(df, atr_n, mode, cost_bps)
-    lookbacks, sides = hedge_experts(mode)
-    experts = [f"{'follow' if s > 0 else 'fade'}_{int(n)}" for n, s in zip(lookbacks, sides)]
+    `weights` (expert weights, columns follow_10 / fade_20 / ... and, on the
+    wide ladder, follow_kel20x1.5 / fade_bol20x2.5 / follow_40:trend /
+    fade_40:range ...), `loss` (the expert losses it scored), `eta` (each
+    lifetime's learning rate, columns = HEDGE_HORIZONS), `horizon_weights`
+    (the meta learner's weights over the lifetimes: shorter ones gaining is
+    the learner shortening its memory) and `surprise` (the loss the played
+    mixture suffered minus the best expert's, in [0, 1]). Nothing here
+    changes the strategy."""
+    W, ETA, V, SURPRISE, loss = _hedge_cached(df, atr_n, mode, cost_bps, ladder)
+    experts = [e.label for e in hedge_ladder(mode, ladder)]
     idx = df.index
     return {
         "weights": pd.DataFrame(W, index=idx, columns=experts),
@@ -699,37 +884,45 @@ def hedge_diagnostics(df: pd.DataFrame, atr_n: int, mode: str = "trend", cost_bp
     }
 
 
-def hedge_direction(df: pd.DataFrame, atr_n: int, cost_bps: float = 0.0) -> np.ndarray:
+def hedge_direction(df: pd.DataFrame, atr_n: int, cost_bps: float = 0.0, ladder: str = "hedge") -> np.ndarray:
     """Per-bar net side weight of the learner over follow and fade experts,
     in [-1, 1], for direction_logic 'learned': its sign is the direction
     (> 0 follow the break, else fade it) and its magnitude the learner's
     conviction, which scales the position (see `_bar_loop`). +1 is every
     expert on the follow side, 0 a dead heat. NaN until the learner is
-    formed."""
-    W = hedge_weights(df, atr_n, "learned", cost_bps)
-    _, sides = hedge_experts("learned")
-    d = np.clip(W @ sides, -1.0, 1.0)      # the rows of W sum to 1 up to rounding
-    d[:min(len(d), hedge_warmup(atr_n))] = np.nan
+    formed. A gated expert abstains while its gate is shut: a fade expert
+    standing aside in a trend is not a vote to fade the next break. Its
+    weight lowers the conviction instead, so the position shrinks when the
+    learner's weight sits on experts that would not trade this regime, to
+    nothing when all of it does (the engine rejects a zero-sized entry)."""
+    experts = hedge_ladder("learned", ladder)
+    W = hedge_weights(df, atr_n, "learned", cost_bps, ladder)
+    sides = np.array([float(e.side) for e in experts])
+    votes = W * _hedge_gates(df, experts)  # a shut gate is an abstention
+    d = np.clip(votes @ sides, -1.0, 1.0)      # the rows of W sum to 1 up to rounding
+    d[:min(len(d), hedge_warmup(atr_n, ladder))] = np.nan
     return d
 
 
 def hedge_channel(df: pd.DataFrame, atr_n: int, mode: str = "trend", scale: float = 1.0,
-                  cost_bps: float = 0.0):
-    """Weight-averaged Donchian channel over the expert ladder (lookbacks
-    scaled by `scale`), NaN until the learner is formed."""
-    W = hedge_weights(df, atr_n, mode, cost_bps)
-    lookbacks, _ = hedge_experts(mode)
+                  cost_bps: float = 0.0, ladder: str = "hedge"):
+    """Weight-averaged channel over the expert ladder (each expert's bands at
+    `scale` times its lookback), NaN until the learner is formed. A gated
+    expert's bands count at its weight whether or not its gate is open: the
+    gate is about the stance it is scored on, the channel is where the
+    template trades."""
+    W = hedge_weights(df, atr_n, mode, cost_bps, ladder)
+    experts = hedge_ladder(mode, ladder)
     T = len(df)
     up = np.zeros(T); lo = np.zeros(T)
     cache = {}
-    for e, n in enumerate(lookbacks):
-        m = max(2, int(round(int(n) * scale)))
-        if m not in cache:
-            u, l, _ = donchian(df, m)
-            cache[m] = (_to_arr(u), _to_arr(l))
-        up += W[:, e] * cache[m][0]
-        lo += W[:, e] * cache[m][1]
-    warm = min(T, hedge_warmup(atr_n))
+    for j, e in enumerate(experts):
+        key = (e.kind, int(e.n), float(e.k))
+        if key not in cache:
+            cache[key] = e.bands(df, atr_n, scale)
+        up += W[:, j] * cache[key][0]
+        lo += W[:, j] * cache[key][1]
+    warm = min(T, hedge_warmup(atr_n, ladder))
     up[:warm] = np.nan; lo[:warm] = np.nan
     idx = df.index
     upper = pd.Series(up, index=idx); lower = pd.Series(lo, index=idx)
@@ -753,7 +946,7 @@ REGIME_INDICATORS = {
 # --------------------------------------------------------------------------
 
 DIRECTION_LOGICS = ["trend", "countertrend", "learned"]
-CHANNEL_TYPES = ["donchian", "keltner", "bollinger", "hedge"]
+CHANNEL_TYPES = ["donchian", "keltner", "bollinger", "hedge", "hedge_wide"]
 ENTRY_STYLES = ["stop", "close_confirm", "pullback"]
 EXIT_STYLES = ["channel", "atr_trail", "target_stop", "time_stop"]
 REGIME_INDICATOR_NAMES = list(REGIME_INDICATORS)
@@ -874,9 +1067,10 @@ def _channel_arrays(df, kind, n, k, atr_n, dfkey=None, mode="trend", role="entry
     def build():
         up, lo, mid = channel(df, kind, n, k, atr_n, mode=mode, role=role, cost_bps=cost_bps)
         return (_to_arr(up), _to_arr(lo), _to_arr(mid))
-    if kind == "hedge":
-        # no lookback / width: keyed on direction mode (signed rewards), ATR
-        # length, entry/exit role and the cost the experts are charged
+    if kind in HEDGE_CHANNELS:
+        # no lookback / width: keyed on the ladder (the kind), direction mode
+        # (signed rewards), ATR length, entry/exit role and the cost the
+        # experts are charged
         spec = ("channel", kind, role, mode, atr_n, float(cost_bps))
     else:
         spec = ("channel", kind, n, k if kind != "donchian" else 0.0, atr_n if kind == "keltner" else 0)
@@ -909,8 +1103,9 @@ def _compute_indicators(df: pd.DataFrame, tpl: StrategyTemplate, dfkey=None) -> 
     # per-bar direction: +1 follow the break, -1 fade it; learned from the
     # follow/fade expert ladder (NaN while the learner is unformed), else constant
     if mode == "learned":
-        use("direction", _cached(df, ("hedge_dir", tpl.atr_n, float(tpl.cost_bps)),
-                                 lambda: hedge_direction(df, tpl.atr_n, tpl.cost_bps), dfkey))
+        ladder = hedge_ladder_for(tpl.channel_type)
+        use("direction", _cached(df, ("hedge_dir", ladder, tpl.atr_n, float(tpl.cost_bps)),
+                                 lambda: hedge_direction(df, tpl.atr_n, tpl.cost_bps, ladder), dfkey))
     else:
         ind["direction"] = np.full(n, 1.0 if mode == "trend" else -1.0)
 

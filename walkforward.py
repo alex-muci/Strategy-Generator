@@ -37,6 +37,8 @@ import pandas as pd
 from strategy import (
     backtest, annualized_sharpe, max_drawdown, periods_per_year, performance_stats, REGIME_INDICATORS,
     hedge_warmup,
+    hedge_ladder_for,
+    HEDGE_CHANNELS,
 )
 
 
@@ -73,11 +75,11 @@ def warmup_bars(tpl) -> int:
     need = [tpl.n_entry, tpl.atr_n]
     if tpl.channel_type == "keltner":
         need.append(_ema_settle_bars(2.0 / (tpl.n_entry + 1)))
-    if tpl.channel_type == "hedge" or tpl.direction_logic == "learned":
+    if tpl.channel_type in HEDGE_CHANNELS or tpl.direction_logic == "learned":
         # the online learner scores a fixed number of past bars, each of
-        # which needs formed experts and a formed ATR (a rolling window: exact
-        # once it is full)
-        need.append(hedge_warmup(tpl.atr_n))
+        # which needs formed experts and a formed ATR (rolling windows: exact
+        # once they are full)
+        need.append(hedge_warmup(tpl.atr_n, hedge_ladder_for(tpl.channel_type)))
     if tpl.exit_style == "channel":
         need.append(tpl.n_exit)
         if tpl.channel_type == "keltner":

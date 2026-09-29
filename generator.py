@@ -6,15 +6,20 @@ family of structurally distinct ones by combining switches, and let
 evaluation (walk-forward analysis + robustness tests + portfolio
 selection) decide which ones earn a place in the final portfolio.
 
-Four families are predefined:
+Five families are predefined:
 
-  quick     72 templates  (Donchian only, ER regime filter) -- smoke test
-  default  768 templates  (two channel types, five regime indicators)
-  online   288 templates  (the online-learned 'hedge' channel only, incl.
-                            the 'learned' follow-or-fade direction: no
-                            lookback or width in the grid, the walk-forward
-                            only re-fits exits / regime thresholds)
-  full     every combination of every switch (19008; overnight run)
+  quick        72 templates  (Donchian only, ER regime filter) -- smoke test
+  default     768 templates  (two channel types, five regime indicators)
+  online      288 templates  (the online-learned 'hedge' channel only, incl.
+                               the 'learned' follow-or-fade direction: no
+                               lookback or width in the grid, the walk-forward
+                               only re-fits exits / regime thresholds)
+  online_wide 288 templates  (the 'online' switches over the 'hedge_wide'
+                               channel: the same learner on a wider fixed
+                               ladder of experts -- Donchian rungs, Keltner and
+                               Bollinger bands, regime-gated rungs -- so the
+                               two families compare template for template)
+  full        every combination of every switch (23760; overnight run)
 
 The bigger the family, the more the *selection* step becomes a data
 mining exercise -- which is exactly why main.py reports the Probability
@@ -28,6 +33,7 @@ from strategy import (
     StrategyTemplate,
     DIRECTION_LOGICS,
     CHANNEL_TYPES,
+    HEDGE_CHANNELS,
     ENTRY_STYLES,
     EXIT_STYLES,
     REGIME_INDICATORS,
@@ -76,6 +82,17 @@ FAMILIES = {
         bias_filters=["none", "sma"],
         sides=["both"],
     ),
+    "online_wide": dict(
+        direction_logics=DIRECTION_LOGICS,
+        channel_types=["hedge_wide"],
+        entry_styles=["stop", "close_confirm"],
+        exit_styles=EXIT_STYLES,
+        regimes=[("er", "none"), ("er", "trend_only"), ("er", "range_only"),
+                 ("vr", "trend_only"), ("vr", "range_only"), ("chop", "range_only")],
+        vol_filters=[False],
+        bias_filters=["none", "sma"],
+        sides=["both"],
+    ),
     "full": dict(
         direction_logics=DIRECTION_LOGICS,
         channel_types=CHANNEL_TYPES,
@@ -94,7 +111,7 @@ FAMILIES = {
 
 _SHORT = {
     "trend": "TR", "countertrend": "CT", "learned": "LN",
-    "donchian": "don", "keltner": "kel", "bollinger": "bol", "hedge": "hdg",
+    "donchian": "don", "keltner": "kel", "bollinger": "bol", "hedge": "hdg", "hedge_wide": "hdw",
     "stop": "stop", "close_confirm": "cls", "pullback": "pb",
     "channel": "chan", "atr_trail": "trail", "target_stop": "tgt", "time_stop": "time",
     "none": "none", "trend_only": "trend", "range_only": "range",
@@ -158,7 +175,7 @@ def param_grid_for(tpl: StrategyTemplate, wide: bool = False) -> dict:
     finishes in minutes; `wide=True` roughly triples it.
     """
     grid = {}
-    online = tpl.channel_type == "hedge"   # lookbacks are learned online, not fitted
+    online = tpl.channel_type in HEDGE_CHANNELS   # lookbacks (and widths) are learned online, not fitted
     if not online:
         grid["n_entry"] = [20, 40, 60] if not wide else [10, 20, 30, 40, 55, 70, 90]
 

@@ -20,6 +20,9 @@ from strategy import (  # noqa: E402
     _compute_indicators, annualized_sharpe,
     hedge_weights, hedge_channel, hedge_warmup, hedge_direction, hedge_experts, hedge_diagnostics, donchian,
     HEDGE_LADDER, HEDGE_MEMORY, HEDGE_HORIZONS, _adahedge_loop, _hedge_loss,
+    hedge_ladder, hedge_ladder_for, HedgeExpert, HEDGE_LADDERS, HEDGE_CHANNELS, HEDGE_EXIT_SCALE,
+    HEDGE_GATE_N, HEDGE_GATE_THRESHOLD, HEDGE_WIDE_N, HEDGE_WIDE_WIDTHS, _hedge_gates, _hedge_stances,
+    bollinger, sma, atr, efficiency_ratio, REGIME_INDICATORS,
 )
 from generator import generate_templates, param_grid_for  # noqa: E402
 from walkforward import (  # noqa: E402
@@ -551,6 +554,240 @@ class HedgeChannelTests(unittest.TestCase):
         # a trade keeps the exit logic of the side it was opened under
         reasons = {t["reason"] for t in learned["trades"]}
         self.assertTrue({"channel", "midline"} & reasons)
+
+
+class WideLadderTests(unittest.TestCase):
+    """The 'hedge_wide' channel: the same learner over a wider fixed ladder
+    (the Donchian rungs, Keltner and Bollinger bands at fixed widths, and a
+    regime-gated copy of every rung). Nothing new to fit, the same warm-up
+    contract, and the plain ladder is left exactly as it was."""
+
+    def setUp(self):
+        self.df = synthetic_ohlc(1200, seed=7)
+
+    def test_the_ladder_is_fixed_in_advance_and_labelled(self):
+        spec = HEDGE_LADDERS["hedge_wide"]
+        self.assertEqual(HEDGE_CHANNELS, ("hedge", "hedge_wide"))
+        self.assertEqual([e.label for e in hedge_ladder("trend")], [f"follow_{n}" for n in HEDGE_LADDER])
+        self.assertEqual(len(spec), len(HEDGE_LADDER) + 2 * len(HEDGE_WIDE_WIDTHS) + len(HEDGE_LADDER))
+        labels = [e.label for e in hedge_ladder("learned", "hedge_wide")]
+        self.assertEqual(len(labels), 2 * len(spec))
+        self.assertEqual(len(set(labels)), len(labels))
+        self.assertEqual(labels[:4], ["follow_10", "follow_20", "follow_40", "follow_80"])
+        for k in HEDGE_WIDE_WIDTHS:
+            self.assertIn(f"follow_kel{HEDGE_WIDE_N}x{k}", labels)
+            self.assertIn(f"fade_bol{HEDGE_WIDE_N}x{k}", labels)
+        self.assertIn("follow_40:trend", labels)
+        self.assertIn("fade_40:range", labels)
+        self.assertNotIn("follow_40:range", labels)     # a follow expert is gated on trend, a fade one on range
+        self.assertNotIn("fade_40:trend", labels)
+        # the gate is the ER registry's own default split, not a fitted number
+        self.assertEqual((HEDGE_GATE_N, HEDGE_GATE_THRESHOLD),
+                         (REGIME_INDICATORS["er"]["n"], REGIME_INDICATORS["er"]["threshold"]))
+        self.assertEqual(hedge_ladder_for("hedge_wide"), "hedge_wide")
+        self.assertEqual(hedge_ladder_for("hedge"), "hedge")
+        self.assertEqual(hedge_ladder_for("donchian"), "hedge")
+        with self.assertRaises(ValueError):
+            hedge_ladder("trend", "nope")
+        with self.assertRaises(ValueError):
+            hedge_experts("sideways", "hedge_wide")
+        # the wide experts do not stretch the warm-up: the 80-bar rung still leads it
+        self.assertEqual(hedge_warmup(20, "hedge_wide"), hedge_warmup(20))
+        self.assertEqual(hedge_warmup(20), HEDGE_MEMORY + 2 * max(HEDGE_LADDER))
+
+    def test_bands_are_the_channels_the_fitted_templates_trade(self):
+        df, close = self.df, self.df["Close"]
+        don, kel, bol = HedgeExpert("donchian", 40), HedgeExpert("keltner", 20, 1.5), HedgeExpert("bollinger", 20, 2.5)
+        u, l = bol.bands(df, 20)
+        ub, lb, _ = bollinger(df, 20, 2.5)
+        np.testing.assert_allclose(u, ub.to_numpy(), rtol=1e-12); np.testing.assert_allclose(l, lb.to_numpy(), rtol=1e-12)
+        u, l = kel.bands(df, 14)
+        mid, w = sma(close, 20), 1.5 * atr(df, 14)          # the SMA form: exact once its window is full
+        np.testing.assert_allclose(u, (mid + w).to_numpy(), rtol=1e-12)
+        np.testing.assert_allclose(l, (mid - w).to_numpy(), rtol=1e-12)
+        u, l = don.bands(df, 20)
+        np.testing.assert_array_equal(u, donchian(df, 40)[0].to_numpy())
+        # the exit channel is the same expert at half its lookback, same width
+        u, _ = kel.bands(df, 14, HEDGE_EXIT_SCALE)
+        np.testing.assert_allclose(u, (sma(close, 10) + 1.5 * atr(df, 14)).to_numpy(), rtol=1e-12)
+        np.testing.assert_array_equal(don.bands(df, 20, HEDGE_EXIT_SCALE)[0], donchian(df, 20)[0].to_numpy())
+        # to rounding, because the bands are reduced window by window: a slice of the
+        # series reproduces them bit for bit, which pandas' running sums do not
+        for e in (kel, bol):
+            for k in (300, 777):
+                np.testing.assert_array_equal(e.bands(df.iloc[k:], 20)[0][40:], e.bands(df, 20)[0][k + 40:], e.label)
+        self.assertFalse(np.array_equal(bollinger(df.iloc[300:], 20, 2.5)[0].to_numpy()[40:],
+                                        bollinger(df, 20, 2.5)[0].to_numpy()[340:]))
+        # span, formed and lead: a rung's stance is exact 2 n bars in; a band's once its
+        # window (and the ATR's) is full plus its span; a gated one also needs its gate
+        self.assertEqual((don.span, don.formed(20), don.lead(20)), (40, 39, 80))
+        self.assertEqual((kel.span, kel.formed(20), kel.lead(20)), (20, 20, 41))
+        self.assertEqual((bol.span, bol.formed(20), bol.lead(20)), (20, 19, 40))
+        self.assertEqual(HedgeExpert("donchian", 10, gated=True).lead(20), HEDGE_GATE_N + 1)
+        self.assertEqual(HedgeExpert("donchian", 80, gated=True).lead(20), 160)
+        for e in (don, bol):
+            self.assertEqual(int(np.argmax(~np.isnan(e.bands(df, 20)[0]))), e.formed(20))
+        # the first true range has no close before it, so the ATR is counted formed a bar late
+        self.assertLessEqual(int(np.argmax(~np.isnan(kel.bands(df, 20)[0]))), kel.formed(20))
+        with self.assertRaises(ValueError):
+            HedgeExpert("ichimoku", 20).bands(df, 20)
+
+    def test_a_gated_expert_is_its_rung_inside_the_regime_and_flat_outside(self):
+        df = self.df
+        er = efficiency_ratio(df["Close"], HEDGE_GATE_N).to_numpy()
+        S, formed, experts = _hedge_stances(df, 20, "countertrend", "hedge_wide")
+        gates = _hedge_gates(df, experts)
+        labels = [e.label for e in experts]
+        self.assertTrue(formed[HEDGE_MEMORY:].all())
+        for cost in (0.0, 50.0):
+            loss, _, _ = _hedge_loss(df, 20, "countertrend", cost, "hedge_wide")
+            for n in HEDGE_LADDER:
+                u, g = labels.index(f"fade_{n}"), labels.index(f"fade_{n}:range")
+                self.assertTrue(gates[:, u].all())
+                np.testing.assert_array_equal(gates[:, g], er < HEDGE_GATE_THRESHOLD)   # NaN fails: stands aside
+                np.testing.assert_array_equal(S[:, g], np.where(gates[:, g], S[:, u], 0.0))   # the rung, gated
+                open_ = gates[1:, g] & gates[:-1, g]
+                shut = ~gates[1:, g] & ~gates[:-1, g]
+                self.assertGreater(open_.sum(), 100); self.assertGreater(shut.sum(), 100)
+                np.testing.assert_array_equal(loss[1:][open_, g], loss[1:][open_, u])   # inside: the rung itself
+                self.assertTrue((loss[1:][shut, g] == 0.5).all())                        # outside: flat, neutral
+                # stepping aside is a side traded: on a bar the gate shuts while the
+                # ungated rung holds its stance, the gated expert pays the one exit
+                # the ungated one does not, a quarter of the cost in ATRs
+                held = (S[1:, u] == S[:-1, u]) & (S[:-1, u] != 0)
+                shuts = np.where(gates[:-1, g] & ~gates[1:, g] & held)[0] + 1
+                self.assertGreater(len(shuts), 5)
+                a_prev = atr(df, 20).to_numpy()[shuts - 1]
+                charge = 0.25 * df["Close"].to_numpy()[shuts] * cost / 1e4 / a_prev
+                extra = loss[shuts, g] - loss[shuts, u]
+                self.assertTrue((extra <= charge + 1e-12).all())
+                inside = (loss[shuts, u] > 0) & (loss[shuts, u] < 1) & (loss[shuts, g] > 0) & (loss[shuts, g] < 1)
+                self.assertGreater(inside.sum(), len(shuts) * 0.8)     # the payoff clip at +/-1 eats the rest
+                np.testing.assert_allclose(extra[inside], charge[inside], atol=1e-12)
+        # the follow side is gated on trend
+        fexp = hedge_ladder("trend", "hedge_wide")
+        fg = _hedge_gates(df, fexp)
+        np.testing.assert_array_equal(fg[:, [e.label for e in fexp].index("follow_20:trend")], er >= HEDGE_GATE_THRESHOLD)
+        self.assertTrue(_hedge_gates(df, hedge_ladder("trend")).all())    # the plain ladder has no gates
+
+    def test_weights_are_causal_normalised_and_kept_apart_from_the_plain_ladder(self):
+        W = hedge_weights(self.df, 20, "learned", 5.0, "hedge_wide")
+        self.assertEqual(W.shape, (len(self.df), 2 * len(HEDGE_LADDERS["hedge_wide"])))
+        np.testing.assert_allclose(W.sum(axis=1), 1.0)
+        self.assertTrue((W >= 0).all())
+        np.testing.assert_allclose(W[:700], hedge_weights(self.df.iloc[:700], 20, "learned", 5.0, "hedge_wide"))
+        W0 = hedge_weights(self.df, 20, "learned", 5.0)
+        self.assertEqual(W0.shape[1], 2 * len(HEDGE_LADDER))
+        n = len(HEDGE_LADDERS["hedge_wide"])
+        self.assertFalse(np.allclose(W0, W[:, list(range(4)) + list(range(n, n + 4))]))   # a different mixture
+        d = hedge_diagnostics(self.df, 20, "learned", 5.0, "hedge_wide")
+        self.assertEqual(list(d["weights"].columns), [e.label for e in hedge_ladder("learned", "hedge_wide")])
+        np.testing.assert_array_equal(d["weights"].to_numpy(), W)
+        self.assertTrue(((d["loss"] >= 0) & (d["loss"] <= 1)).all().all())
+
+    def test_channel_is_a_mixture_of_the_experts(self):
+        warm = hedge_warmup(20, "hedge_wide")
+        for mode in ("trend", "learned"):
+            up, lo, mid = hedge_channel(self.df, 20, mode, 1.0, 5.0, "hedge_wide")
+            self.assertEqual(int(up.isna().sum()), warm)
+            experts = hedge_ladder(mode, "hedge_wide")
+            ups = np.stack([e.bands(self.df, 20)[0] for e in experts], axis=1)[warm:]
+            los = np.stack([e.bands(self.df, 20)[1] for e in experts], axis=1)[warm:]
+            self.assertTrue((up.to_numpy()[warm:] <= ups.max(axis=1) + 1e-9).all())
+            self.assertTrue((up.to_numpy()[warm:] >= ups.min(axis=1) - 1e-9).all())
+            self.assertTrue((lo.to_numpy()[warm:] <= los.max(axis=1) + 1e-9).all())
+            self.assertTrue((lo.to_numpy()[warm:] >= los.min(axis=1) - 1e-9).all())
+            np.testing.assert_allclose(mid.to_numpy()[warm:], (up + lo).to_numpy()[warm:] / 2)
+        plain = hedge_channel(self.df, 20, "trend", 1.0, 5.0)[0]
+        self.assertFalse(np.allclose(np.nan_to_num(up), np.nan_to_num(plain)))
+
+    def test_direction_abstains_while_a_gate_is_shut(self):
+        experts = hedge_ladder("learned", "hedge_wide")
+        W = hedge_weights(self.df, 20, "learned", 0.0, "hedge_wide")
+        gates = _hedge_gates(self.df, experts)
+        sides = np.array([float(e.side) for e in experts])
+        d = hedge_direction(self.df, 20, 0.0, "hedge_wide")
+        warm = hedge_warmup(20, "hedge_wide")
+        self.assertTrue(np.isnan(d[:warm]).all())
+        np.testing.assert_allclose(d[warm:], np.clip((W * gates) @ sides, -1.0, 1.0)[warm:])
+        aside = (W * ~gates).sum(axis=1)[warm:]                  # weight on experts standing aside
+        self.assertTrue((np.abs(d[warm:]) <= 1.0 - aside + 1e-12).all())
+        self.assertGreater(aside.max(), 0.1)                     # and it is not a corner case
+        # the plain ladder's direction is untouched by the gates
+        np.testing.assert_array_equal(hedge_direction(self.df, 20, 0.0),
+                                      np.where(np.arange(len(d)) < hedge_warmup(20), np.nan,
+                                               np.clip(hedge_weights(self.df, 20, "learned", 0.0)
+                                                       @ hedge_experts("learned")[1], -1, 1)))
+
+    def test_templates_have_nothing_to_fit_and_read_no_width(self):
+        df = self.df
+        tpl = StrategyTemplate("t", channel_type="hedge_wide", cost_bps=0.0)
+        self.assertEqual(param_grid_for(tpl), {})
+        self.assertEqual(param_grid_for(tpl, wide=True), {})
+        base = backtest(df, tpl)
+        self.assertGreater(base["stats"]["n_trades"], 5)
+        eq = base["equity"].to_numpy()
+        for k, v in (("channel_k", 0.7), ("n_entry", 13), ("n_exit", 7), ("regime_threshold", 0.01), ("regime_n", 7)):
+            np.testing.assert_array_equal(eq, backtest(df, tpl.with_params(**{k: v}))["equity"].to_numpy(), k)
+        # the ATR length and the cost do reach the learner
+        self.assertFalse(np.array_equal(eq, backtest(df, tpl.with_params(atr_n=14))["equity"].to_numpy()))
+        self.assertFalse(np.array_equal(eq, backtest(df, tpl.with_params(cost_bps=50.0))["equity"].to_numpy()))
+        self.assertFalse(np.array_equal(eq, backtest(df, tpl.with_params(channel_type="hedge"))["equity"].to_numpy()))
+        self.assertGreaterEqual(warmup_bars(tpl), hedge_warmup(20, "hedge_wide"))
+        # a learned direction on a fitted channel keeps the plain ladder
+        don = backtest(df, StrategyTemplate("t", direction_logic="learned", cost_bps=5.0))["indicators"]["direction"]
+        np.testing.assert_array_equal(don, hedge_direction(df, 20, 5.0))
+        wide = backtest(df, tpl.with_params(direction_logic="learned", cost_bps=5.0))["indicators"]["direction"]
+        np.testing.assert_array_equal(wide, hedge_direction(df, 20, 5.0, "hedge_wide"))
+        # the family: the online switches, template for template, over the wide ladder
+        fam, online = generate_templates("online_wide"), generate_templates("online")
+        self.assertEqual(len(fam), len(online))
+        self.assertEqual([t.name.replace("-hdw-", "-hdg-") for t in fam], [t.name for t in online])
+        self.assertTrue(all(t.channel_type == "hedge_wide" for t in fam))
+        for t in fam:
+            for key in ("n_entry", "n_exit", "channel_k"):
+                self.assertNotIn(key, param_grid_for(t), t.name)
+        res = walk_forward(df, fam[0], param_grid_for(fam[0]), train_bars=400, test_bars=100)
+        self.assertEqual(len(res["oos_returns"]), len(df) - 400)
+
+    def test_learns_to_stand_aside_and_where_to_fade(self):
+        """On the regime series the countertrend learner puts the fade side's
+        weight on the gated rungs through the trend (they stand aside while
+        fading loses) and back on the ungated ones in the range; the trend
+        learner does the mirror image. The learned direction follows the
+        trends and fades the range as the plain ladder does, and the bars it
+        fades inside a trend are the band fades earning on pullbacks."""
+        rs = regime_series()
+        Wc = hedge_weights(rs, 20, "countertrend", 0.0, "hedge_wide")
+        lab = [e.label for e in hedge_ladder("countertrend", "hedge_wide")]
+        gated = [i for i, l in enumerate(lab) if l.endswith(":range")]
+        rungs = [lab.index(f"fade_{n}") for n in HEDGE_LADDER]
+        self.assertGreater(Wc[500:1000, gated].sum(axis=1).mean(), 0.6)
+        self.assertLess(Wc[500:1000, rungs].sum(axis=1).mean(), 0.2)
+        self.assertGreater(Wc[1400:2000, rungs].sum(axis=1).mean(), Wc[1400:2000, gated].sum(axis=1).mean() * 0.8)
+        Wt = hedge_weights(rs, 20, "trend", 0.0, "hedge_wide")
+        labt = [e.label for e in hedge_ladder("trend", "hedge_wide")]
+        gt = [i for i, l in enumerate(labt) if l.endswith(":trend")]
+        ut = [labt.index(f"follow_{n}") for n in HEDGE_LADDER]
+        self.assertGreater(Wt[500:1000, ut].sum(axis=1).mean(), 0.7)
+        self.assertGreater(Wt[1400:2000, gt].sum(axis=1).mean(), 0.8)
+        d = hedge_direction(rs, 20, 0.0, "hedge_wide")
+        self.assertGreater((d[500:1000] > 0).mean(), 0.8)      # trend: follow
+        self.assertGreater((d[1400:2000] < 0).mean(), 0.9)     # mean reversion: fade
+        self.assertGreater((d[2500:3000] > 0).mean(), 0.8)     # trend again: follow
+        W = hedge_weights(rs, 20, "learned", 0.0, "hedge_wide")
+        labl = [e.label for e in hedge_ladder("learned", "hedge_wide")]
+        bands = [i for i, l in enumerate(labl) if l.startswith("fade_kel") or l.startswith("fade_bol")]
+        flip = np.zeros(len(d), dtype=bool)
+        flip[500:1000] = d[500:1000] < 0
+        flip[2500:3000] = d[2500:3000] < 0
+        self.assertGreater(flip.sum(), 20)
+        self.assertGreater(W[flip][:, bands].sum(axis=1).mean(), 0.4)
+        learned = backtest(rs, StrategyTemplate("t", channel_type="hedge_wide", direction_logic="learned", cost_bps=0.0))
+        follow = backtest(rs, StrategyTemplate("t", channel_type="hedge_wide", direction_logic="trend", cost_bps=0.0))
+        fade = backtest(rs, StrategyTemplate("t", channel_type="hedge_wide", direction_logic="countertrend", cost_bps=0.0))
+        self.assertGreater(learned["stats"]["total_return"], follow["stats"]["total_return"])
+        self.assertGreater(learned["stats"]["total_return"], fade["stats"]["total_return"])
 
 
 class WalkForwardTests(unittest.TestCase):
