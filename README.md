@@ -25,7 +25,7 @@ python -m venv env  # assuming 3.12 installed
 ./env/Script/Activate
 pip install -r requirements.txt 
 
-python -m unittest discover -s tests -v      # 306 tests (engine, order log, templates, hedge learner and its wide ladder, walk-forward, robustness, selection, data, live signals, replay, both entry points)
+python -m unittest discover -s tests -v      # 307 tests (engine, order log, templates, hedge learner and its wide ladder, walk-forward, robustness, selection, data, live signals, replay, both entry points)
 # faster (about 1:35 min instead of 4.5): pip install -r requirements-dev.txt, then, with ./env active,
 python -m pytest -n auto --dist loadscope   # same tests in parallel; loadscope keeps a class (and its one-off setup) on one worker
 ```
@@ -383,7 +383,10 @@ For a `learned` direction either rule is then scaled by the learner's
 takes, 0 to 1. A bar on which the follow and fade experts are near-tied
 opens a small position, a one-sided book a full one, and a pullback
 limit placed under a logic the learner has abandoned by the time it
-fills opens nothing. The dashboard's share counts carry the same scale.
+fills opens nothing. A `trend` or `countertrend` template on the
+`hedge_wide` ladder is scaled the same way by its **active weight**, the
+weight on the experts whose regime gate is open (see the wide ladder
+below). The dashboard's share counts carry the same scale.
 
 Both are capped at `--max-leverage` x equity. Set the target near the
 asset's own volatility and the strategies trade at about 1x notional
@@ -507,7 +510,19 @@ instead of four (`strategy.HedgeExpert` describes one):
   `cost_bps` like every other flip, so a gate that flickers pays for it.
   The bands a gated expert contributes to the channel are its rung's,
   whether or not its gate is open: the gate is about the stance it is
-  scored on, the channel is where the template trades.
+  scored on, the channel is where the template trades. **The weight on
+  experts standing aside is weight on cash**: a `trend` or `countertrend`
+  template sizes every entry by its *active weight*, the weight on the
+  experts whose gate is open (`strategy.hedge_active`), exactly as a
+  learned direction is sized by its conviction. Without that the gated
+  rungs would win the weight in the wrong regime and the template would
+  keep trading at full size off a channel that is then a near-uniform
+  average of the rungs (while shut they all score the same neutral loss,
+  so nothing tells them apart): the learner would know and the template
+  would not act on it. On the regime series it is the difference between
+  the wide `trend` template losing 31 % and 4 % through the range, and
+  it turns the gated rungs into what a regime filter is meant to be, one
+  that is learned bar by bar instead of fitted per window.
 
 Everything else carries over: no learning rate, no threshold, no
 lookback or width in the grid (`param_grid_for` is as empty as for
@@ -519,17 +534,17 @@ the wide ladder:
 
 - In the **learned direction** a gated expert **abstains** while its gate
   is shut: a fade expert standing aside in a trend is not a vote to fade
-  the next break. Its weight lowers the conviction instead, so the
-  position shrinks when the learner's weight sits on experts that would
-  not trade this regime, to nothing when all of it does. The direction
-  still follows the regime series' trends and fades its range, but it
-  flips to fade on about a tenth of a trend's bars where the plain
-  ladder flipped on under one in a hundred: those are the Keltner and
-  Bollinger *fade* experts earning on pullbacks inside the trend, carried
-  by the short-lifetime learners. That is the learner doing its job with
-  mean-reversion experts on the ladder, not a bug, and on that series the
-  learned `hedge_wide` template still ends above both the plain
-  learned template and its own fixed-direction versions; but it is the
+  the next break. Its weight lowers the conviction instead (the same
+  active-weight rule as above), so the position shrinks when the
+  learner's weight sits on experts that would not trade this regime, to
+  nothing when all of it does. The direction still follows the regime
+  series' trends and fades its range, but it flips to fade on about a
+  tenth of a trend's bars where the plain ladder flipped on under one in
+  a hundred: those are the Keltner and Bollinger *fade* experts earning
+  on pullbacks inside the trend, carried by the short-lifetime learners.
+  That is the learner doing its job with mean-reversion experts on the
+  ladder, not a bug, and on that series the learned `hedge_wide`
+  template still ends above the plain learned template; but it is the
   price of the band experts and a real series may charge it differently.
 - The learner is O(experts) per bar: a 24-expert `learned` run costs
   about twice the 8-expert one.
@@ -541,12 +556,14 @@ template (`TR-hdw-stop-chan-noreg-noV-noB` against
 helps is an empirical question the pipeline is built to answer, family
 against family; the learner's regret bound says only that the mixture
 tracks the best expert *on the ladder*, and a wider ladder has a higher
-best and a slower concentration. On the regime series the fixed-direction
-`hedge_wide` templates are a little worse than `hedge` (the wide `trend`
-template follows a mixture that includes bands, which break earlier and
-whipsaw more) and the learned one a little better. `hedge_diagnostics(...,
-ladder="hedge_wide")` names the experts `follow_kel20x1.5`,
-`fade_bol20x2.5`, `follow_40:trend`, `fade_40:range`, and so on.
+best and a slower concentration. On the regime series (one synthetic
+series, a pipeline check and no more) the wide `trend` template earns a
+little less than `hedge` in the trends (the mixture includes bands, which
+break earlier and whipsaw more) and loses far less in the range, thanks
+to the active-weight sizing; the learned one ends a little above the
+plain learned template. `hedge_diagnostics(..., ladder="hedge_wide")`
+names the experts `follow_kel20x1.5`, `fade_bol20x2.5`,
+`follow_40:trend`, `fade_40:range`, and so on.
 
 Why this and not the other online-learning candidates:
 

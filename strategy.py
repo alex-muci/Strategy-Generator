@@ -50,7 +50,11 @@ Switches (define a "template" -- a structurally distinct strategy):
                                    efficiency ratio says trend (a follow
                                    expert) or range (a fade expert). Still
                                    nothing to fit: the ladder is fixed in
-                                   advance.
+                                   advance. The weight on experts standing
+                                   aside is weight on cash: a trend or
+                                   countertrend template sizes its entries
+                                   by the ACTIVE weight (hedge_active), a
+                                   learned one lets them abstain.
 
   entry_style     : 'stop'          -> enter the moment the channel trades
                                        (stop order for trend, limit for fade)
@@ -112,8 +116,10 @@ Execution model (no look-ahead):
     notional of equity x (vol_target / sqrt(bars per year)) / realized
     per-bar vol (std of close-to-close returns over `vol_target_n` bars).
     A 'learned' direction scales either by the learner's conviction, its
-    net side weight in favour of the side taken (0..1). Either way capped
-    at `max_leverage` x equity; the ATR stop is unchanged
+    net side weight in favour of the side taken (0..1); a fixed direction
+    on a ladder with regime-gated experts ('hedge_wide') by the weight on
+    the experts whose gate is open. Either way capped at `max_leverage` x
+    equity; the ATR stop is unchanged
   * stops/limits are filled intrabar at the level, or at the open if the
     open gapped through the level; a time exit is an order at the open, so
     it goes before any intrabar stop on its bar
@@ -462,23 +468,39 @@ class HedgeExpert:
         return mid + width, mid - width
 
 
+def _window_mean_std_loop(x, n):
+    """Rolling mean and population standard deviation of `x` over `n` bars,
+    every window summed on its own, in order, two passes (see
+    `_window_mean_std`). NaN before the first full window."""
+    T = x.shape[0]
+    mean = np.full(T, np.nan)
+    std = np.full(T, np.nan)
+    for t in range(n - 1, T):
+        s = 0.0
+        for j in range(t - n + 1, t + 1):
+            s += x[j]
+        m = s / n
+        q = 0.0
+        for j in range(t - n + 1, t + 1):
+            d = x[j] - m
+            q += d * d
+        mean[t] = m
+        std[t] = np.sqrt(q / n)
+    return mean, std
+
+
 def _window_mean_std(x: np.ndarray, n: int):
     """Rolling mean and population standard deviation of `x` over `n` bars,
-    every window reduced on its own (numpy over a sliding view) rather than
-    by a running sum. pandas' rolling mean and std carry a compensated
-    running sum whose last bits depend on where the series started (3e-14
-    on a mean of prices, 3e-11 on their std), so a slice would not
-    reproduce the full series' bands and the ladder's warm-up contract
-    (`hedge_warmup`: a warmed window matches a full-history run exactly)
-    would hold only to rounding. NaN before the first full window."""
-    x = np.ascontiguousarray(x, dtype=np.float64)
-    T = len(x)
-    mean = np.full(T, np.nan); std = np.full(T, np.nan)
-    if T >= n:
-        win = np.lib.stride_tricks.sliding_window_view(x, n)
-        mean[n - 1:] = win.mean(axis=1)
-        std[n - 1:] = win.std(axis=1)
-    return mean, std
+    each window reduced on its own rather than by a running sum. pandas'
+    rolling mean and std carry a compensated running sum whose last bits
+    depend on where the series started (3e-14 on a mean of prices, 3e-11
+    on their std), so a slice would not reproduce the full series' bands
+    and the ladder's warm-up contract (`hedge_warmup`: a warmed window
+    matches a full-history run exactly) would hold only to rounding. An
+    explicit sequential loop rather than a numpy reduction over a sliding
+    view, so the result does not depend on numpy's (unspecified, pairwise)
+    summation order either. O(T n), and n is at most a ladder rung."""
+    return _window_stats_fast(np.ascontiguousarray(x, dtype=np.float64), int(n))
 
 
 def _wide_ladder():
@@ -770,9 +792,11 @@ try:
     _hedge_window = _njit_h(cache=True, nogil=True)(_hedge_window)
     _hedge_fast = _njit_h(cache=True, nogil=True)(_hedge_core)
     _stances_fast = _njit_h(cache=True, nogil=True)(_expert_stances)
+    _window_stats_fast = _njit_h(cache=True, nogil=True)(_window_mean_std_loop)
 except Exception:  # pragma: no cover
     _hedge_fast = _hedge_core
     _stances_fast = _expert_stances
+    _window_stats_fast = _window_mean_std_loop
 
 
 def _hedge_gates(df: pd.DataFrame, experts) -> np.ndarray:
@@ -902,6 +926,28 @@ def hedge_direction(df: pd.DataFrame, atr_n: int, cost_bps: float = 0.0, ladder:
     d = np.clip(votes @ sides, -1.0, 1.0)      # the rows of W sum to 1 up to rounding
     d[:min(len(d), hedge_warmup(atr_n, ladder))] = np.nan
     return d
+
+
+def hedge_active(df: pd.DataFrame, atr_n: int, mode: str, cost_bps: float = 0.0,
+                 ladder: str = "hedge") -> np.ndarray:
+    """Per-bar weight of the learner on the experts whose gate is open, in
+    [0, 1]: the conviction a `trend` or `countertrend` template on a ladder
+    with regime-gated experts sizes its entries by (the direction array is
+    +/- this, see `_compute_indicators`). The weight on experts standing
+    aside is weight on cash: when following breaks loses in a range the
+    gated follow rungs collect the weight, and without this the template
+    would keep trading at full size off a channel that is then a near
+    uniform average of the rungs (the gated rungs all score the same
+    neutral loss while shut), which threw away what the learner knew. 1
+    everywhere on a ladder without gates. NaN until the learner is formed."""
+    experts = hedge_ladder(mode, ladder)
+    if any(e.gated for e in experts):
+        W = hedge_weights(df, atr_n, mode, cost_bps, ladder)
+        a = np.clip((W * _hedge_gates(df, experts)).sum(axis=1), 0.0, 1.0)
+    else:
+        a = np.ones(len(df))      # exactly 1, not the rows of W summed to within an ulp
+    a[:min(len(a), hedge_warmup(atr_n, ladder))] = np.nan
+    return a
 
 
 def hedge_channel(df: pd.DataFrame, atr_n: int, mode: str = "trend", scale: float = 1.0,
@@ -1102,10 +1148,15 @@ def _compute_indicators(df: pd.DataFrame, tpl: StrategyTemplate, dfkey=None) -> 
 
     # per-bar direction: +1 follow the break, -1 fade it; learned from the
     # follow/fade expert ladder (NaN while the learner is unformed), else constant
+    ladder = hedge_ladder_for(tpl.channel_type)
     if mode == "learned":
-        ladder = hedge_ladder_for(tpl.channel_type)
         use("direction", _cached(df, ("hedge_dir", ladder, tpl.atr_n, float(tpl.cost_bps)),
                                  lambda: hedge_direction(df, tpl.atr_n, tpl.cost_bps, ladder), dfkey))
+    elif tpl.channel_type in HEDGE_CHANNELS and any(e.gated for e in HEDGE_LADDERS[ladder]):
+        # a fixed direction on a gated ladder: sized by the weight whose gate is open
+        sign = 1.0 if mode == "trend" else -1.0
+        use("direction", _cached(df, ("hedge_active", ladder, mode, tpl.atr_n, float(tpl.cost_bps)),
+                                 lambda: sign * hedge_active(df, tpl.atr_n, mode, tpl.cost_bps, ladder), dfkey))
     else:
         ind["direction"] = np.full(n, 1.0 if mode == "trend" else -1.0)
 

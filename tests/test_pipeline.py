@@ -22,6 +22,7 @@ from strategy import (  # noqa: E402
     HEDGE_LADDER, HEDGE_MEMORY, HEDGE_HORIZONS, _adahedge_loop, _hedge_loss,
     hedge_ladder, hedge_ladder_for, HedgeExpert, HEDGE_LADDERS, HEDGE_CHANNELS, HEDGE_EXIT_SCALE,
     HEDGE_GATE_N, HEDGE_GATE_THRESHOLD, HEDGE_WIDE_N, HEDGE_WIDE_WIDTHS, _hedge_gates, _hedge_stances,
+    hedge_active, _window_mean_std,
     bollinger, sma, atr, efficiency_ratio, REGIME_INDICATORS,
 )
 from generator import generate_templates, param_grid_for  # noqa: E402
@@ -616,6 +617,14 @@ class WideLadderTests(unittest.TestCase):
         for e in (kel, bol):
             for k in (300, 777):
                 np.testing.assert_array_equal(e.bands(df.iloc[k:], 20)[0][40:], e.bands(df, 20)[0][k + 40:], e.label)
+        x = close.to_numpy()
+        m, sd = _window_mean_std(x, 20)
+        self.assertTrue(np.isnan(m[:19]).all() and not np.isnan(m[19:]).any())
+        for k in range(1, 200, 13):
+            mk, sk = _window_mean_std(x[k:], 20)
+            np.testing.assert_array_equal(mk[19:], m[k + 19:]); np.testing.assert_array_equal(sk[19:], sd[k + 19:])
+        np.testing.assert_allclose(m, close.rolling(20).mean().to_numpy(), rtol=1e-12)
+        np.testing.assert_allclose(sd, close.rolling(20).std(ddof=0).to_numpy(), rtol=1e-9, atol=1e-12)
         self.assertFalse(np.array_equal(bollinger(df.iloc[300:], 20, 2.5)[0].to_numpy()[40:],
                                         bollinger(df, 20, 2.5)[0].to_numpy()[340:]))
         # span, formed and lead: a rung's stance is exact 2 n bars in; a band's once its
@@ -719,6 +728,45 @@ class WideLadderTests(unittest.TestCase):
                                                np.clip(hedge_weights(self.df, 20, "learned", 0.0)
                                                        @ hedge_experts("learned")[1], -1, 1)))
 
+    def test_a_fixed_direction_is_sized_by_the_active_weight(self):
+        """On a gated ladder a trend / countertrend template's entries are
+        scaled by the weight on the experts whose gate is open, the way a
+        learned direction is scaled by its conviction: a trade entered from
+        flat on bar i holds equity[i-1] * risk_pct / (atr_mult_stop *
+        ATR[i-1]) shares times that weight on bar i-1. The plain ladder has
+        no gates, so its direction stays the constant it always was."""
+        df = regime_series()
+        for dl, sign in (("trend", 1.0), ("countertrend", -1.0)):
+            tpl = StrategyTemplate("t", channel_type="hedge_wide", direction_logic=dl, cost_bps=0.0, max_leverage=1e9)
+            active = hedge_active(df, 20, dl, 0.0, "hedge_wide")
+            warm = hedge_warmup(20, "hedge_wide")
+            self.assertTrue(np.isnan(active[:warm]).all())
+            self.assertTrue((active[warm:] >= 0).all() and (active[warm:] <= 1).all())
+            res = backtest(df, tpl)
+            np.testing.assert_array_equal(res["indicators"]["direction"], sign * active)
+            eq = res["equity"].to_numpy(); a = res["indicators"]["atr"]
+            self.assertGreater(len(res["trades"]), 30)
+            scales = []
+            for t in res["trades"]:
+                i = df.index.get_loc(t["entry_date"])
+                full = eq[i - 1] * tpl.risk_pct / (tpl.atr_mult_stop * a[i - 1])
+                self.assertAlmostEqual(t["shares"] / full, active[i - 1], places=9, msg=f"{dl} {t['entry_date']}")
+                scales.append(active[i - 1])
+            self.assertGreater(sum(s < 0.5 for s in scales), 5)      # small in the wrong regime...
+            self.assertGreater(sum(s > 0.9 for s in scales), 5)      # ...full in the right one
+            # the trend template stands mostly aside in the range; the fade template only
+            # partly in the trends, whose ER(20) sits below the 0.35 gate on about half
+            # of their bars (a 0.2 % drift on 0.8 % noise is a weak trend to the ER)
+            wrong = slice(1400, 2000) if dl == "trend" else slice(500, 1000)
+            right = slice(500, 1000) if dl == "trend" else slice(1400, 2000)
+            self.assertLess(active[wrong].mean(), 0.3 if dl == "trend" else 0.75)
+            self.assertGreater(active[right].mean(), 0.7)
+            self.assertLess(active[wrong].mean(), active[right].mean() - 0.2)
+            # a ladder without gates is fully active and its direction is the constant it was
+            np.testing.assert_array_equal(hedge_active(df, 20, dl, 0.0)[warm:], 1.0)
+            plain = backtest(df, tpl.with_params(channel_type="hedge"))["indicators"]["direction"]
+            np.testing.assert_array_equal(plain, np.full(len(df), sign))
+
     def test_templates_have_nothing_to_fit_and_read_no_width(self):
         df = self.df
         tpl = StrategyTemplate("t", channel_type="hedge_wide", cost_bps=0.0)
@@ -783,11 +831,22 @@ class WideLadderTests(unittest.TestCase):
         flip[2500:3000] = d[2500:3000] < 0
         self.assertGreater(flip.sum(), 20)
         self.assertGreater(W[flip][:, bands].sum(axis=1).mean(), 0.4)
+        # sized by the active weight, the fixed-direction templates lose little in the
+        # regime that is not theirs, where the plain ladder trades at full size
+        bars = np.arange(len(rs))
+        in_trend = ((bars >= 410) & (bars < 1000)) | (bars >= 2000)
+        for dl, wrong in (("trend", ~in_trend & (bars >= 1000)), ("countertrend", in_trend)):
+            wide = backtest(rs, StrategyTemplate("t", channel_type="hedge_wide", direction_logic=dl))
+            plain = backtest(rs, StrategyTemplate("t", channel_type="hedge", direction_logic=dl))
+            def seg(res):
+                r = res["equity"].pct_change().fillna(0).to_numpy()[wrong]
+                return float(np.prod(1 + r) - 1)
+            self.assertLess(seg(plain), -0.2)
+            self.assertGreater(seg(wide), seg(plain) + 0.08)
         learned = backtest(rs, StrategyTemplate("t", channel_type="hedge_wide", direction_logic="learned", cost_bps=0.0))
-        follow = backtest(rs, StrategyTemplate("t", channel_type="hedge_wide", direction_logic="trend", cost_bps=0.0))
         fade = backtest(rs, StrategyTemplate("t", channel_type="hedge_wide", direction_logic="countertrend", cost_bps=0.0))
-        self.assertGreater(learned["stats"]["total_return"], follow["stats"]["total_return"])
         self.assertGreater(learned["stats"]["total_return"], fade["stats"]["total_return"])
+        self.assertGreater(learned["stats"]["total_return"], 0.3)
 
 
 class WalkForwardTests(unittest.TestCase):
