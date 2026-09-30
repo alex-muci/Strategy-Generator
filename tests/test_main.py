@@ -21,11 +21,14 @@ from __future__ import annotations
 import contextlib
 import io
 import os
+import pickle
 import shutil
 import sys
 import tempfile
 import time
 import unittest
+from multiprocessing import get_context
+from unittest import mock
 
 import numpy as np
 import pandas as pd
@@ -58,6 +61,12 @@ def _cfg(**over):
     for k, v in over.items():
         setattr(args, k, v)
     return P.eval_config(args, "1d")
+
+
+def _seen_by_worker(asset):
+    """What a pool worker holds for `asset`: the frame, and the annualization
+    the config asked for, as its own strategy module reads it."""
+    return asset, os.getpid(), P._DATA[asset], P._CFG["periods_per_year"], S.periods_per_year()
 
 
 class _RestoresAnnualization(unittest.TestCase):
@@ -221,6 +230,52 @@ class ParallelTests(unittest.TestCase):
         with P.worker_pool(1, {"x": None}, _cfg()) as pool:
             self.assertIsNone(pool)
             self.assertEqual(sorted(P.pool_map(pool, abs, [-1, 2])), [1, 2])
+
+    # spawn is what Windows (and macOS) run: the workers inherit nothing from
+    # this process, so whatever they see of the data went through worker_pool.
+    def test_spawned_workers_see_the_full_frames_and_the_config(self):
+        data = {"a": synthetic_ohlc(n_bars=500, seed=1), "b": synthetic_ohlc(n_bars=700, seed=2)}
+        cfg = P.eval_config(M.parse_args([]), "1h")    # intraday: a worker left at the daily default shows
+        ppy0 = S.periods_per_year()
+        try:
+            with P.worker_pool(2, data, cfg, context=get_context("spawn")) as pool:
+                self.assertIs(P._DATA["a"], data["a"])  # this process: the frames themselves, not a copy
+                seen = list(P.pool_map(pool, _seen_by_worker, ["a", "b"] * 4))
+        finally:
+            S.set_periods_per_year(ppy0)
+        self.assertEqual(len(seen), 8)
+        for asset, pid, df, cfg_ppy, ppy in seen:
+            self.assertNotEqual(pid, os.getpid())
+            pd.testing.assert_frame_equal(df, data[asset])
+            self.assertEqual((cfg_ppy, ppy), (252 * 7, 252 * 7))
+
+    def test_the_frames_reach_the_workers_by_file_not_through_initargs(self):
+        """Under spawn Process.start() writes initargs into a pipe the child
+        drains only after re-importing __main__, so with the frames in
+        initargs Pool() took n_jobs imports, one after the other. initargs
+        must stay small; the pickle is removed with the pool."""
+        data = {"a": synthetic_ohlc(n_bars=2000, seed=1)}
+        ctx = get_context("spawn")
+        with mock.patch.object(ctx, "Pool", wraps=ctx.Pool) as spy:
+            with P.worker_pool(2, data, _cfg(), context=ctx) as pool:
+                path, cfg = spy.call_args.kwargs["initargs"]
+                self.assertTrue(os.path.exists(path))
+                self.assertEqual(cfg, _cfg())
+                self.assertLess(len(pickle.dumps((path, cfg))), 4096)
+                self.assertGreater(len(pickle.dumps(data)), 4096 * 10)
+                with open(path, "rb") as f:
+                    pd.testing.assert_frame_equal(pickle.load(f)["a"], data["a"])
+                self.assertEqual(sorted(P.pool_map(pool, abs, [-1, 2])), [1, 2])
+        self.assertFalse(os.path.exists(path))
+
+    def test_the_data_file_is_removed_when_the_pool_is_terminated_too(self):
+        ctx = get_context("spawn")
+        with mock.patch.object(ctx, "Pool", wraps=ctx.Pool) as spy:
+            with self.assertRaises(RuntimeError):
+                with P.worker_pool(2, {"a": synthetic_ohlc(n_bars=300, seed=1)}, _cfg(), context=ctx):
+                    path = spy.call_args.kwargs["initargs"][0]
+                    raise RuntimeError("something downstream failed")
+        self.assertFalse(os.path.exists(path))
 
 
 class EntryPointRegressionTests(_RestoresAnnualization):

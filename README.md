@@ -25,7 +25,7 @@ python -m venv env  # assuming 3.12 installed
 ./env/Script/Activate
 pip install -r requirements.txt 
 
-python -m unittest discover -s tests -v      # 307 tests (engine, order log, templates, hedge learner and its wide ladder, walk-forward, robustness, selection, data, live signals, replay, both entry points)
+python -m unittest discover -s tests -t . -v # 310 tests (engine, order log, templates, hedge learner and its wide ladder, walk-forward, robustness, selection, data, live signals, replay, both entry points)
 # faster (about 1:35 min instead of 4.5): pip install -r requirements-dev.txt, then, with ./env active,
 python -m pytest -n auto --dist loadscope   # same tests in parallel; loadscope keeps a class (and its one-off setup) on one worker
 ```
@@ -338,8 +338,9 @@ tests/          unittest suite: no look-ahead, costs, stops, CPCV path
                 coverage, PBO on noise vs. signal, DSR, bootstrap, HRP,
                 the annualization contract, the live order predictions
                 against the engine, the dashboard round trip, main.py end
-                to end (incl. a --jobs 2 run) and its parity with the
-                dashboard's research, the data loader against a fake yfinance.
+                to end (incl. a --jobs 2 run, and the pool's data hand-off
+                under the spawn start method Windows uses) and its parity with
+                the dashboard's research, the data loader against a fake yfinance.
 ```
 
 ## The strategy templates
