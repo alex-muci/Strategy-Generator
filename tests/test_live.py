@@ -536,3 +536,57 @@ class PortfolioTargetTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SpreadSizingTests(unittest.TestCase):
+    """live.py restates the engine's sizing for the next bar's orders; on an
+    instrument below zero with a point value, per-unit costs and a margin cap
+    it must still be the engine's number, under both rules."""
+
+    @classmethod
+    def setUpClass(cls):
+        df = synthetic_ohlc(1400, seed=17)
+        shift = float(df["High"].max()) + 5.0
+        cls.df = df.assign(**{c: df[c] - shift for c in ("Open", "High", "Low", "Close")})
+
+    def _check(self, tpl, min_hits=6):
+        hits = 0
+        for t in range(LOOKBACK + 20, len(self.df), 3):
+            st = strategy_state(self.df.iloc[:t], tpl, equity=100_000.0, lookback_bars=LOOKBACK)
+            if st["position"] is not None or not st["entry_orders"]:
+                continue
+            after = backtest(self.df.iloc[t - LOOKBACK:t + 1], tpl, initial_equity=100_000.0)
+            if not after["entries"][-1]:
+                continue
+            side = (after["open_position"] or {}).get("side")
+            trade = [tr for tr in after["trades"] if tr["entry_date"] == self.df.index[t]]
+            if trade:
+                side, shares = trade[0]["side"], trade[0]["shares"]
+            else:
+                shares = after["open_position"]["shares"]
+            o = [o for o in st["entry_orders"] if o["side"] == side][0]
+            self.assertLess(o["level"], 0.0)
+            self.assertGreater(o["shares"], 0.0, f"bar {t}")
+            self.assertAlmostEqual(o["shares"] / shares, 100_000.0 / after["equity"].iloc[-2], places=6, msg=f"bar {t}")
+            self.assertEqual(st["point_value"], tpl.point_value)
+            hits += 1
+        self.assertGreater(hits, min_hits)
+
+    def test_atr_rule_on_a_spread(self):
+        self._check(StrategyTemplate("t", entry_style="stop", exit_style="target_stop", cost_bps=0.0,
+                                     cost_per_unit=15.0, margin_per_unit=3000.0, point_value=1000.0, max_leverage=0.5))
+
+    def test_vol_target_capped_on_the_margin(self):
+        self._check(StrategyTemplate("t", entry_style="stop", exit_style="target_stop", cost_bps=0.0, vol_target=2.0,
+                                     cost_per_unit=15.0, margin_per_unit=3000.0, point_value=1000.0, max_leverage=0.5))
+
+    def test_the_book_carries_the_point_value(self):
+        st = dict(slot="X|t", asset="X", template="t", position=1, shares=3.0, last_close=-1.5, point_value=1000.0,
+                  entry_price=-2.0, entry_date=None, unrealized=1500.0, exit_orders=[dict(kind="stop", level=-3.0)])
+        out = portfolio_targets([st], {"X|t": 1.0}, account_equity=100_000.0)
+        self.assertAlmostEqual(float(out["legs"]["notional"].iloc[0]), 3.0 * -1.5 * 1000.0)
+        self.assertAlmostEqual(float(out["by_asset"].loc["X", "notional"]), -4500.0)
+        self.assertAlmostEqual(out["open_risk"], 3.0 * 1.5 * 1000.0)
+        tl = trade_list(out["by_asset"], {"X": 1.0})
+        self.assertAlmostEqual(float(tl.loc["X", "order_shares"]), 2.0)
+        self.assertAlmostEqual(float(tl.loc["X", "order_notional"]), 2.0 * -1.5 * 1000.0)

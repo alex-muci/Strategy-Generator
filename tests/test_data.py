@@ -157,3 +157,60 @@ class LoaderTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CsvLoaderTests(unittest.TestCase):
+    """`load_csv`: a local file for what Yahoo does not serve, e.g. a spread."""
+
+    def setUp(self):
+        import tempfile
+        self.dir = tempfile.mkdtemp()
+        df = D.synthetic_ohlc(400, seed=9)
+        shift = float(df["High"].max()) + 3.0
+        for c in ("Open", "High", "Low", "Close"):
+            df[c] = df[c] - shift            # every price below zero
+        self.df = df
+        self.path = os.path.join(self.dir, "spread.csv")
+        df.to_csv(self.path, float_format="%.17g")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_round_trip_keeps_negative_prices(self):
+        out = D.load_csv(self.path)
+        pd.testing.assert_frame_equal(out, self.df, check_exact=False, rtol=1e-12, check_names=False, check_freq=False)
+        self.assertEqual(out.index.name, "Date")
+        self.assertIsNone(out.index.tz)
+        self.assertLess(float(out["High"].max()), 0.0)
+
+    def test_no_trade_rows_are_dropped_and_zero_closes_are_kept(self):
+        df = self.df.copy()
+        df.iloc[10, :4] = 0.0                            # a no-trade day: all-zero prices
+        df.iloc[20, [0, 3]] = 0.0                        # a real zero print: kept
+        df.iloc[30, 1] = np.nan                          # a missing price: dropped
+        df = pd.concat([df, df.iloc[[5]]]).sample(frac=1.0, random_state=1)   # a duplicate stamp, shuffled
+        df.to_csv(os.path.join(self.dir, "messy.csv"))
+        out = D.load_csv(os.path.join(self.dir, "messy.csv"))
+        self.assertEqual(len(out), 398)
+        self.assertTrue(out.index.is_monotonic_increasing and out.index.is_unique)
+        self.assertNotIn(self.df.index[10], out.index)
+        self.assertNotIn(self.df.index[30], out.index)
+        self.assertEqual(float(out.loc[self.df.index[20], "Close"]), 0.0)
+
+    def test_columns_match_any_case_and_volume_is_optional(self):
+        df = self.df.rename(columns=str.lower).drop(columns="volume")
+        df.index.name = "timestamp"
+        df.to_csv(os.path.join(self.dir, "lower.csv"))
+        out = D.load_csv(os.path.join(self.dir, "lower.csv"))
+        self.assertEqual(list(out.columns), ["Open", "High", "Low", "Close", "Volume"])
+        self.assertTrue(out["Volume"].isna().all())
+        np.testing.assert_allclose(out["Close"].to_numpy(), self.df["Close"].to_numpy())
+
+    def test_missing_price_columns_and_too_few_bars_raise(self):
+        self.df.drop(columns="Low").to_csv(os.path.join(self.dir, "nolow.csv"))
+        with self.assertRaises(ValueError) as cm:
+            D.load_csv(os.path.join(self.dir, "nolow.csv"))
+        self.assertIn("Low", str(cm.exception))
+        with self.assertRaises(ValueError):
+            D.load_csv(self.path, min_bars=1000)

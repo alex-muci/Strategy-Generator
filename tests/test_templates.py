@@ -293,21 +293,10 @@ class TemplateBehaviourTests(unittest.TestCase):
                     self.assertTrue(prev_close > bias[i - 1] if tr["side"] == 1 else prev_close < bias[i - 1],
                                     f"{plain.name}: entered against the bias filter")
 
-    def test_longs_and_shorts_are_exact_mirrors(self):
-        """Reflect the price series and every long becomes the same short: same
-        entry bar, mirrored prices, identical P&L (with the leverage cap and
-        costs off, the ATR-based size is the same on both sides). Anything the
-        short-side code does differently from the long side shows up here.
-        The variance-ratio indicator is built on log returns, which do not
-        mirror, so it is the one template family left out. A one-sided
-        template is mirrored into the other side's template."""
-        mirror = _mirror(self.df)
-        c = 2.0 * (float(self.df["High"].max()) + 1.0)
+    def _check_mirror(self, mirror: pd.DataFrame, c: float, params: dict, min_checked: int = 500):
         checked = 0
         for tpl in self.sample:
-            if tpl.regime_filter != "none" and tpl.regime_indicator == "vr":
-                continue
-            t = tpl.with_params(cost_bps=0.0, max_leverage=1e9)
+            t = tpl.with_params(**params)
             a, b = backtest(self.df, t), backtest(mirror, t.with_params(sides=_MIRROR_SIDES[t.sides]))
             np.testing.assert_allclose(a["equity"].to_numpy(), b["equity"].to_numpy(), rtol=1e-9,
                                        err_msg=f"{tpl.name}: mirrored run has a different equity curve")
@@ -318,8 +307,30 @@ class TemplateBehaviourTests(unittest.TestCase):
                 self.assertAlmostEqual(x["entry_price"], c - y["entry_price"], places=8)
                 self.assertAlmostEqual(x["exit_price"], c - y["exit_price"], places=8)
                 self.assertAlmostEqual(x["pnl"], y["pnl"], places=6)
+                self.assertAlmostEqual(x["shares"], y["shares"], delta=1e-9 * x["shares"])
                 checked += 1
-        self.assertGreater(checked, 500)
+        self.assertGreater(checked, min_checked)
+
+    def test_longs_and_shorts_are_exact_mirrors(self):
+        """Reflect the price series and every long becomes the same short: same
+        entry bar, mirrored prices, identical P&L (with the leverage cap and
+        costs off, the ATR-based size is the same on both sides). Anything the
+        short-side code does differently from the long side shows up here.
+        Every regime indicator mirrors, the variance ratio included (it is
+        built on price differences). A one-sided template is mirrored into
+        the other side's template."""
+        c = 2.0 * (float(self.df["High"].max()) + 1.0)
+        self._check_mirror(_mirror(self.df), c, dict(cost_bps=0.0, max_leverage=1e9))
+
+    def test_the_mirror_through_zero_holds_with_the_cap_and_per_unit_costs_on(self):
+        """Reflect around 0 instead: every price becomes negative. With the
+        instrument described in currency terms (a margin and a cost per unit,
+        no bps of a notional) the cap and the costs are the same on both
+        sides too, so the mirror is exact on a series below zero."""
+        flipped = pd.DataFrame({"Open": -self.df["Open"], "High": -self.df["Low"], "Low": -self.df["High"],
+                                "Close": -self.df["Close"], "Volume": self.df["Volume"]}, index=self.df.index)
+        self._check_mirror(flipped, 0.0, dict(cost_bps=0.0, cost_per_unit=1.0, margin_per_unit=500.0,
+                                              point_value=100.0, max_leverage=0.6))
 
     def test_each_switch_changes_the_strategy(self):
         """Templates that differ in one switch are structurally different

@@ -77,8 +77,26 @@ def eval_config(args, interval: str) -> dict:
         metric=args.metric, selection=args.selection, wide_grid=args.wide_grid,
         cost_bps=args.cost_bps, risk_pct=args.risk_pct, max_leverage=args.max_leverage,
         vol_target=args.vol_target, vol_target_n=args.vol_target_n,
+        point_value=args.point_value, cost_per_unit=args.cost_per_unit, margin_per_unit=args.margin_per_unit,
         cpcv_groups=args.cpcv_groups, cpcv_k=args.cpcv_k,
     )
+
+
+def instrument_of(c: dict) -> dict:
+    """The instrument settings of a research config, with the defaults of a
+    cash share for configs written before they existed."""
+    return dict(point_value=float(c.get("point_value", 1.0) or 1.0),
+                cost_per_unit=float(c.get("cost_per_unit", 0.0) or 0.0),
+                margin_per_unit=float(c.get("margin_per_unit", 0.0) or 0.0))
+
+
+def instrument_text(c: dict) -> str:
+    """One phrase describing a non-default instrument, empty for a cash share."""
+    ins = instrument_of(c)
+    if ins == dict(point_value=1.0, cost_per_unit=0.0, margin_per_unit=0.0):
+        return ""
+    return (f"point value {ins['point_value']:g} per unit, {ins['cost_per_unit']:g} per unit per side, "
+            f"margin {ins['margin_per_unit']:g} per unit")
 
 
 def sizing_text(c: dict) -> str:
@@ -86,8 +104,11 @@ def sizing_text(c: dict) -> str:
     have no vol_target keys: they were run with the ATR-stop rule)."""
     vt = float(c.get("vol_target", 0.0) or 0.0)
     if vt > 0:
-        return f"{vt:.0%} annualized vol target per entry ({c.get('vol_target_n', 60)}-bar realized vol)"
-    return f"{c['risk_pct']:.1%} of equity risked per trade"
+        text = f"{vt:.0%} annualized vol target per entry ({c.get('vol_target_n', 60)}-bar realized vol, in price points)"
+    else:
+        text = f"{c['risk_pct']:.1%} of equity risked per trade"
+    ins = instrument_text(c)
+    return f"{text}; instrument: {ins}" if ins else text
 
 
 # --------------------------------------------------------------------------
@@ -114,7 +135,7 @@ def _init_worker_from_file(path: str, cfg: dict) -> None:
 
 def _costed(tpl, c: dict):
     return tpl.with_params(cost_bps=c["cost_bps"], risk_pct=c["risk_pct"], max_leverage=c["max_leverage"],
-                           vol_target=c["vol_target"], vol_target_n=c["vol_target_n"])
+                           vol_target=c["vol_target"], vol_target_n=c["vol_target_n"], **instrument_of(c))
 
 
 def _wfa_kwargs(c: dict) -> dict:
@@ -312,9 +333,28 @@ def against_benchmark(r: pd.Series, bh: pd.Series) -> dict:
     return dict(beta=beta, corr=float(np.corrcoef(x, y)[0, 1]), info_ratio=annualized_sharpe(y - beta * x))
 
 
-def benchmark_stats(bh_returns: pd.Series, rets: pd.DataFrame, port: dict, nested: dict) -> dict:
-    """Buy-and-hold over the same out-of-sample bars, and the two portfolios
-    measured against it.
+BENCH_BUY_HOLD = "buy and hold"
+BENCH_ONE_UNIT = "hold 1 unit"
+
+
+def benchmark_returns(df: pd.DataFrame, point_value: float = 1.0, initial_equity: float = 100_000.0):
+    """(kind, per-bar returns) of the benchmark nobody optimized. Holding the
+    asset is a return series only while its price is positive; an instrument
+    that trades at or below zero (a spread) has no buy-and-hold return, so the
+    benchmark is then the P&L of holding one unit, on the initial equity:
+    additive, on an arbitrary scale (Sharpe, beta, correlation and the
+    information ratio are scale-free; CAGR and drawdown are not)."""
+    close = df["Close"]
+    if (df["Low"] > 0).all():
+        return BENCH_BUY_HOLD, close.pct_change()
+    return BENCH_ONE_UNIT, float(point_value) * close.diff() / float(initial_equity)
+
+
+def benchmark_stats(bh_returns: pd.Series, rets: pd.DataFrame, port: dict, nested: dict,
+                    kind: str = BENCH_BUY_HOLD) -> dict:
+    """Buy-and-hold over the same out-of-sample bars (or, for an instrument
+    that trades through zero, holding one unit: `benchmark_returns`), and the
+    two portfolios measured against it. `kind` names which.
 
     Every template here was walked forward, selected and stress-tested; the
     asset itself was not, so it is the one curve with no selection bias at
@@ -326,6 +366,7 @@ def benchmark_stats(bh_returns: pd.Series, rets: pd.DataFrame, port: dict, neste
     bh = bh_returns.reindex(rets.index).fillna(0.0)
     tpl_sharpes = rets.apply(annualized_sharpe)
     out = dict(
+        kind=kind,
         returns=bh,
         buy_hold=curve_stats(bh),
         n_templates=int(rets.shape[1]),

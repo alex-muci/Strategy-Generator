@@ -451,7 +451,10 @@ def _room_to_stop(st: dict) -> tuple[float | None, str, str]:
     frac = float(np.clip(room / full, 0.0, 1.0)) if full > 0 else 0.0
     level = "critical" if frac < 0.15 else ("warning" if frac < 0.33 else "")
     note = {"critical": " ✖ very close", "warning": " ⚠ close", "": ""}[level]
-    return frac, level, f"{room / price:.1%} away{note}"
+    # as a fraction of the price when there is one; a spread near zero has
+    # no meaningful percentage, so the distance is quoted in price points
+    away = f"{room / abs(price):.1%}" if abs(price) > 1e-12 and abs(room / price) < 5 else f"{room:.2f} pts"
+    return frac, level, f"{away} away{note}"
 
 
 def _positions_section(states: list) -> str:

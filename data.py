@@ -3,13 +3,17 @@ data.py
 -------
 Data loading for the Ranger-style breakout system generator.
 
-Two sources are provided:
+Three sources are provided:
 
 1. load_yfinance(ticker, start, end)  -> real daily OHLC data.
    Requires `pip install yfinance` and an internet connection.
    Use this in your own environment to run the pipeline on real markets.
 
-2. synthetic_ohlc(...)  -> a regime-switching random walk used for
+2. load_csv(path)  -> OHLC(V) from a local file: anything Yahoo does not
+   serve, such as a futures calendar spread, whose prices may be zero or
+   negative (the engine handles them; see strategy.validate_instrument).
+
+3. synthetic_ohlc(...)  -> a regime-switching random walk used for
    offline testing/demo purposes (no internet needed). It alternates
    between trending and range-bound regimes so that the different
    strategy templates (trend / counter-trend / sideways) actually
@@ -72,6 +76,37 @@ def load_yfinance(
             f"{ticker!r}: only {len(df)} usable bars (interval={interval}), need at least "
             f"{min_bars}. Widen the date range or use a coarser interval."
         )
+    df.index.name = "Date"
+    return df
+
+
+def load_csv(path: str, interval: str = "1d", min_bars: int = 200) -> pd.DataFrame:
+    """OHLC(V) bars from a local CSV: the first column is the bar's timestamp,
+    the others hold Open, High, Low, Close and optionally Volume (matched by
+    name, any case; other columns are dropped).
+
+    Rows with a missing price and rows where every price is exactly 0 (the
+    no-trade days a spread vendor prints) are dropped. Nothing else is: a
+    negative or zero price is a price, on an instrument that has them.
+    The index comes back tz-naive (`_naive_index`), deduplicated (last print
+    of a repeated stamp) and sorted, like `load_yfinance`'s.
+    """
+    raw = pd.read_csv(path, index_col=0, parse_dates=True)
+    if not isinstance(raw.index, pd.DatetimeIndex):
+        raw.index = pd.to_datetime(raw.index)
+    by_name = {str(c).strip().lower(): c for c in raw.columns}
+    missing = [c for c in ("open", "high", "low", "close") if c not in by_name]
+    if missing:
+        raise ValueError(f"{path!r}: missing columns {[m.capitalize() for m in missing]} (have {list(raw.columns)})")
+    df = pd.DataFrame({name: pd.to_numeric(raw[by_name[name.lower()]], errors="coerce")
+                       for name in ("Open", "High", "Low", "Close")}, index=raw.index)
+    df["Volume"] = pd.to_numeric(raw[by_name["volume"]], errors="coerce") if "volume" in by_name else np.nan
+    prices = df[["Open", "High", "Low", "Close"]]
+    df = df[prices.notna().all(axis=1) & ~(prices == 0).all(axis=1)]
+    df = df.set_axis(_naive_index(df.index, interval))
+    df = df[~df.index.duplicated(keep="last")].sort_index()
+    if len(df) < min_bars:
+        raise ValueError(f"{path!r}: only {len(df)} usable bars, need at least {min_bars}.")
     df.index.name = "Date"
     return df
 

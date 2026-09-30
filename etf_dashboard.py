@@ -135,7 +135,12 @@ def parse_args(argv=None):
     r.add_argument("--vol-target", type=float, default=0.0,
                    help="annualized volatility each entry is sized to, per slot (e.g. 0.15); "
                         "0 = risk --risk-pct on the ATR stop. The same target gives every asset the same risk")
-    r.add_argument("--vol-target-n", type=int, default=60, help="bars of close-to-close returns in the realized-vol estimate")
+    r.add_argument("--vol-target-n", type=int, default=60, help="bars of close-to-close changes in the realized-vol estimate")
+    r.add_argument("--point-value", type=float, default=1.0,
+                   help="currency per 1.0 of price per unit (1 for a share); the same for every asset of the run")
+    r.add_argument("--cost-per-unit", type=float, default=0.0, help="commission+slippage per unit per side, in currency")
+    r.add_argument("--margin-per-unit", type=float, default=0.0,
+                   help="initial margin per unit; when given, --max-leverage caps margin / equity")
     r.add_argument("--min-sharpe", type=float, default=0.3)
     r.add_argument("--max-strategies", type=int, default=8)
     r.add_argument("--corr-ceiling", type=float, default=0.6)

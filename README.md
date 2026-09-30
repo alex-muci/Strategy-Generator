@@ -25,7 +25,7 @@ python -m venv env  # assuming 3.12 installed
 ./env/Script/Activate
 pip install -r requirements.txt 
 
-python -m unittest discover -s tests -t . -v # 312 tests (engine, order log, templates, hedge learner and its wide ladder, walk-forward, robustness, selection, data, live signals, replay, both entry points)
+python -m unittest discover -s tests -t . -v # 354 tests (engine, order log, templates, hedge learner and its wide ladder, walk-forward, robustness, selection, data, live signals, replay, both entry points, spreads: shift invariance, point value, per-unit costs, margin cap, the ETF trick)
 # faster (about 1:35 min instead of 4.5): pip install -r requirements-dev.txt, then, with ./env active,
 python -m pytest -n auto --dist loadscope   # same tests in parallel; loadscope keeps a class (and its one-off setup) on one worker
 ```
@@ -43,6 +43,7 @@ python main.py --real SPY --start 2005-01-01 --family quick --sides long_only   
 python main.py --real SPY --start 2005-01-01 --family quick --vol-target 0.1  # use vol-target rather than ATR-stop (see Position sizing section section)
 python main.py --real QQQ --start 2010-01-01 --train 500 --test 125   # rolling window (default): each window re-optimizes on the last 500 bars only
 python main.py --real GC=F --train 750 --test 250 --anchored --selection best   # anchored: training (window expands from bar 0)
+python main.py --csv brent_z25z26.csv --point-value 1000 --margin-per-unit 3000 --cost-per-unit 15 --cost-bps 0 --max-leverage 0.5   # a futures spread from a file (prices through zero; see Futures and spreads)
 python main.py --trend-prob 0.8 --trend-drift 0.002  # synthetic data with a KNOWN trend edge
 ```
 
@@ -278,7 +279,8 @@ market and the contract that expresses it:
 ## Architecture
 
 ```
-data.py         Load real data (yfinance) or generate synthetic
+data.py         Load real data (yfinance), a local OHLCV CSV (a spread,
+                prices through zero) or generate synthetic
                 regime-switching OHLC (trend probability / drift tunable).
 
 strategy.py     Indicators (ATR, Donchian, Keltner, Bollinger, the AdaHedge
@@ -370,14 +372,23 @@ information available up to that point.
 Size is decided once, at entry, and held to the exit. Two rules, chosen
 from the command line (never tuned by the walk-forward):
 
-* **ATR stop, fixed fractional** (default): shares such that the loss at
-  the `atr_mult_stop` ATR stop is `--risk-pct` of equity (1 %).
-* **Volatility target** (`--vol-target 0.15`): notional = equity x
-  (target / realized vol), where realized vol is the standard deviation
-  of close-to-close returns over `--vol-target-n` bars (60), both
-  annualized with the bar frequency. The ATR stop stays where it was, so
-  the loss at the stop is now `atr_mult_stop x ATR x shares` rather than
-  `risk_pct` of equity.
+* **ATR stop, fixed fractional** (default): units such that the loss at
+  the `atr_mult_stop` ATR stop is `--risk-pct` of equity (1 %):
+  `units = equity x risk_pct / (atr_mult_stop x ATR x point_value)`.
+* **Volatility target** (`--vol-target 0.15`): the units whose dollar
+  volatility is the target: `units = equity x target_bar / (sigma x
+  point_value)`, where `target_bar` is the annualized target scaled to one
+  bar and `sigma` the standard deviation of close-to-close **changes in
+  price points** over `--vol-target-n` bars (60). The dollar vol wanted
+  (target x equity) over the dollar vol of one unit (point value x sigma).
+  On a share this is the familiar notional = equity x target / pct vol to
+  within a few percent (sigma ~ pct vol x price); on a spread, whose pct
+  vol does not exist, it is the only form there is. The ATR stop stays
+  where it was, so the loss at the stop is now `atr_mult_stop x ATR x
+  point_value x units` rather than `risk_pct` of equity.
+
+A unit is a share (`--point-value 1`, the default) or a lot (`--point-value
+1000` for Brent, 50 for ES). Neither rule divides by a price.
 
 For a `learned` direction either rule is then scaled by the learner's
 **conviction**: its net side weight in favour of the side the trade
@@ -389,8 +400,10 @@ size of a `trend` or `countertrend` template too, is the magnitude of
 the learner's own **position** (see the wide ladder below). The
 dashboard's share counts carry the same scale.
 
-Both are capped at `--max-leverage` x equity. Set the target near the
-asset's own volatility and the strategies trade at about 1x notional
+Both are capped at `--max-leverage` x equity of **notional** (units x point
+value x |price|), or, when `--margin-per-unit` is given, of **margin**
+(units x margin per unit; then set `--max-leverage` at or below 1). Set the
+target near the asset's own volatility and the strategies trade at about 1x notional
 while in position, so `equity_curves.png` puts buy & hold on the same
 axis as the strategies (the ATR rule leaves them on different scales and
 the asset gets a secondary axis). Across assets the same target assigns
@@ -398,6 +411,54 @@ the same risk to every slot, which is what the multi-asset dashboard
 wants. Two things keep a strategy's realized vol below the target: time
 spent flat, and the leverage cap, which binds all the time on a quiet
 asset (a 15 % target on a 5 % vol asset asks for 3x).
+
+### Futures and spreads (prices at or below zero)
+
+A futures calendar spread (Brent Dec25-Dec26, say) is quoted front minus
+back and trades through zero. Nothing needs to be added to its prices to
+run it here: the engine is **shift-invariant**. Every rule works on price
+differences (channels, ATR, stops, targets, every regime indicator, the
+learner's stances and losses, the P&L), so adding any constant to every
+price, including one that makes the whole series negative, leaves the
+trades, the P&L and the equity unchanged, and `tests/test_instrument.py`
+proves it for every switch and both sizing rules. The three things that
+used to read the price level -- the leverage cap, the volatility-target
+size and the costs -- are described in currency instead:
+
+| flag | meaning | Brent spread example |
+|---|---|---|
+| `--point-value` | currency per 1.0 of price per unit (lot) | 1000 (1000 bbl) |
+| `--cost-per-unit` | commission + slippage per unit per side, in currency | 15 (a tick plus commission), with `--cost-bps 0` |
+| `--margin-per-unit` | initial margin per unit, the leverage cap's basis | 3000 (check the exchange) |
+
+`--cost-bps` is a fraction of a notional a spread does not have, so a series
+with a price at or below zero is refused unless `--margin-per-unit` is given
+and `--cost-bps` is 0 (`strategy.validate_instrument`, before any window
+runs). P&L is `side x units x point_value x (price change)` on every bar,
+for a share (point value 1) and a lot alike; `shares` in the trade lists
+are units.
+
+The data comes from a file: `--csv PATH`, the first column the date, then
+`Open High Low Close [Volume]` in any case. Rows whose four prices are all
+exactly 0 (a vendor's no-trade day) are dropped; a real 0.00 close is kept.
+One listed spread has a year or two of liquid history, not enough for a
+walk-forward, so stitch successive spreads (Z24-Z25, Z25-Z26, ...) with the
+ETF trick in `extra_utils/ETF_trick_spreads.py`, run **in points**:
+`point_value=1, contracts=1, side=+1, k0=0`, `roll_cost` in points. The
+output is then the listed spread itself between rolls, shifted by a
+constant (which does not matter), with each roll's gap and cost folded in;
+give the multiplier to the engine once, as `--point-value`, and let the
+engine take the short side itself. Use settlements as the close when the
+vendor has them, and confirm the sign convention (front minus back) before
+reading a `long` as a bet on backwardation.
+
+The benchmark of such a run is not buy and hold (a spread has no return):
+it is the P&L of **holding one unit** on the initial equity, an additive
+curve on an arbitrary scale. Its Sharpe, beta, correlation and information
+ratio are scale-free and read as before; its CAGR and drawdown are not. The
+exposure lines of the walk-forward and the dashboard (units x price) are
+marks, not exposures, on an instrument that crosses zero. The ETF dashboard's
+futures mapping (`--futures`) is for ETF-signalled contracts and is unrelated.
 
 ### The `hedge` channel: an online-learned alternative to fitted lookbacks
 
@@ -766,9 +827,10 @@ bootstrap p-value is 0, and the nested portfolio keeps a Sharpe near 1.
 ## Caveats
 
 This is a research framework, not a production trading system. The
-cost model is a flat bps charge, position sizing is fixed-fractional on
-an ATR stop (or, with `--vol-target`, a constant-volatility notional
-fixed at entry and never rebalanced), and the synthetic data is a toy
+cost model is a flat bps charge plus a flat charge per unit, position
+sizing is fixed-fractional on an ATR stop (or, with `--vol-target`, a
+constant dollar volatility fixed at entry and never rebalanced), and the
+synthetic data is a toy
 regime-switching random walk. Results on synthetic data are a pipeline check. Real conclusions
 need real data, realistic costs for the instrument, and -- as the
 Reality Check numbers make painfully clear -- a lot more history than

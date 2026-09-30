@@ -20,6 +20,7 @@ Run with:  python -m unittest discover -s tests -v
 from __future__ import annotations
 import contextlib
 import io
+import json
 import os
 import pickle
 import shutil
@@ -536,3 +537,100 @@ class SharedPipelineTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class InstrumentSettingsTests(unittest.TestCase):
+    def test_defaults_are_the_engine_defaults(self):
+        a = M.parse_args([])
+        tpl = S.StrategyTemplate(name="x")
+        self.assertEqual((a.point_value, a.cost_per_unit, a.margin_per_unit),
+                         (tpl.point_value, tpl.cost_per_unit, tpl.margin_per_unit))
+        self.assertIsNone(a.csv)
+
+    def test_real_and_csv_are_exclusive(self):
+        with self.assertRaises(SystemExit):
+            M.parse_args(["--real", "SPY", "--csv", "x.csv"])
+
+    def test_instrument_reaches_the_templates_and_old_configs_still_do(self):
+        cfg = _cfg(point_value=1000.0, cost_per_unit=15.0, margin_per_unit=3000.0, cost_bps=0.0)
+        tpl = P._costed(generate_templates("quick", max_templates=1)[0], cfg)
+        self.assertEqual((tpl.point_value, tpl.cost_per_unit, tpl.margin_per_unit, tpl.cost_bps), (1000.0, 15.0, 3000.0, 0.0))
+        old = dict(cost_bps=5.0, risk_pct=0.01, max_leverage=2.0, vol_target=0.0, vol_target_n=60)   # a pre-feature run.json
+        tpl = P._costed(generate_templates("quick", max_templates=1)[0], old)
+        self.assertEqual((tpl.point_value, tpl.cost_per_unit, tpl.margin_per_unit), (1.0, 0.0, 0.0))
+
+    def test_sizing_text_names_a_non_default_instrument_only(self):
+        self.assertNotIn("instrument", P.sizing_text(dict(risk_pct=0.01)))
+        text = P.sizing_text(dict(risk_pct=0.01, point_value=1000.0, cost_per_unit=15.0, margin_per_unit=3000.0))
+        self.assertIn("point value 1000", text)
+        self.assertIn("margin 3000", text)
+
+    def test_benchmark_kind_follows_the_prices(self):
+        df = synthetic_ohlc(300, seed=2)
+        kind, r = P.benchmark_returns(df)
+        self.assertEqual(kind, P.BENCH_BUY_HOLD)
+        pd.testing.assert_series_equal(r, df["Close"].pct_change())
+        neg = df.assign(**{c: df[c] - 500.0 for c in ("Open", "High", "Low", "Close")})
+        kind, r = P.benchmark_returns(neg, point_value=1000.0, initial_equity=100_000.0)
+        self.assertEqual(kind, P.BENCH_ONE_UNIT)
+        pd.testing.assert_series_equal(r, 1000.0 * neg["Close"].diff() / 100_000.0)
+        self.assertTrue(np.isfinite(r.iloc[1:]).all())
+        # a series that merely touches zero has no buy-and-hold return either
+        touch = df.assign(**{c: df[c] - float(df["Low"].min()) for c in ("Open", "High", "Low", "Close")})
+        self.assertEqual(P.benchmark_returns(touch)[0], P.BENCH_ONE_UNIT)
+
+
+class SpreadRunTests(unittest.TestCase):
+    """main.py end to end on a spread: a CSV of negative prices, a point
+    value, per-unit costs and a margin, replayed and verified."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.dir = tempfile.mkdtemp()
+        df = synthetic_ohlc(1100, seed=7)
+        shift = float(df["High"].max()) + 5.0
+        cls.df = df.assign(**{c: df[c] - shift for c in ("Open", "High", "Low", "Close")})
+        cls.csv = os.path.join(cls.dir, "brent_z25z26.csv")
+        cls.df.to_csv(cls.csv, float_format="%.17g")
+        cls.argv = ["--csv", cls.csv, "--point-value", "1000", "--margin-per-unit", "3000", "--cost-per-unit", "15",
+                    "--cost-bps", "0", "--max-leverage", "0.5", "--family", "quick", "--max-templates", "4",
+                    "--train", "300", "--test", "100", "--n-boot", "100", "--min-sharpe", "-5", "--jobs", "1",
+                    "--no-matrix", "--replay", "best", "--out", cls.dir]
+        cls.out = _main(cls.argv)
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.dir, ignore_errors=True)
+
+    def test_the_run_completes_and_replays_exactly(self):
+        check = self.out["replay"]["best"]["check"]
+        self.assertTrue(check["ok"], check)
+        trades = pd.read_csv(os.path.join(self.dir, "replay", "best", "trades.csv"))
+        self.assertGreater(len(trades), 0)
+        self.assertTrue((trades["entry_price"] < 0).all())
+        self.assertTrue((trades["cost"] > 0).all())
+        for name, res in self.out["results"].items():
+            self.assertEqual((res["template"].point_value, res["template"].margin_per_unit,
+                              res["template"].cost_per_unit, res["template"].cost_bps), (1000.0, 3000.0, 15.0, 0.0))
+
+    def test_the_manifest_records_the_instrument_and_the_file(self):
+        with open(os.path.join(self.dir, "run.json"), encoding="utf-8") as f:
+            m = json.load(f)
+        self.assertEqual((m["config"]["point_value"], m["config"]["margin_per_unit"], m["config"]["cost_per_unit"]),
+                         (1000.0, 3000.0, 15.0))
+        self.assertEqual((m["data"]["source"], m["data"]["ticker"]), ("csv", "brent_z25z26"))
+        self.assertEqual(m["data"]["path"], self.csv)
+
+    def test_the_report_names_the_instrument_and_the_one_unit_benchmark(self):
+        text = open(os.path.join(self.dir, "report.md"), encoding="utf-8").read()
+        self.assertIn("## Benchmark: hold 1 unit brent_z25z26", text)
+        self.assertIn("point value 1000", text)
+        self.assertIn("csv " + self.csv, text)
+        self.assertEqual(self.out["benchmark"]["kind"], P.BENCH_ONE_UNIT)
+        self.assertTrue(np.isfinite(self.out["benchmark"]["buy_hold"]["sharpe"]))
+
+    def test_a_spread_without_a_margin_fails_before_the_pool(self):
+        argv = [a for a in self.argv if a not in ("--margin-per-unit", "3000")]
+        with self.assertRaises(ValueError) as cm:
+            _main(argv + ["--out", tempfile.mkdtemp()])
+        self.assertIn("margin_per_unit", str(cm.exception))

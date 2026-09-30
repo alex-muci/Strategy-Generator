@@ -246,6 +246,7 @@ def strategy_state(
         atr_mult_stop=float(tpl.atr_mult_stop),
         exit_style=tpl.exit_style,
         equity_slot=float(equity),
+        point_value=float(tpl.point_value),   # currency per point per unit: notional = units x price x this
         position=None if pos is None else pos["side"],
         shares=0.0 if pos is None else pos["shares"],
         entry_price=None if pos is None else pos["entry_price"],
@@ -383,17 +384,23 @@ def _size(equity: float, tpl: StrategyTemplate, ind: dict, n: int, price: float,
     as `strategy._bar_loop`, read off the last closed bar as the engine
     reads bar i-1 on the fill bar."""
     a = float(ind["atr"][n - 1])
-    if not (a > 0) or not (price > 0):
+    pv = float(tpl.point_value)
+    if not (a > 0):
         return 0.0
     if tpl.vol_target > 0:
-        rv = float(ind["rvol"][n - 1])
+        rv = float(ind["rvol"][n - 1])     # per-bar, in price points
         if not (rv > 0):
             return 0.0
-        qty = equity * (tpl.vol_target / np.sqrt(periods_per_year())) / rv / price
+        qty = equity * (tpl.vol_target / np.sqrt(periods_per_year())) / (rv * pv)
     else:
-        qty = equity * tpl.risk_pct / (tpl.atr_mult_stop * a)
+        qty = equity * tpl.risk_pct / (tpl.atr_mult_stop * a * pv)
     qty *= max(float(ind["direction"][n - 1]) * (1.0 if is_trend else -1.0), 0.0)
-    return float(max(min(qty, tpl.max_leverage * equity / price), 0.0))
+    # the cap's basis: the margin when given (a spread has no notional), else
+    # the notional at the level; a price of exactly zero without a margin sizes to nothing
+    basis = tpl.margin_per_unit if tpl.margin_per_unit > 0 else pv * abs(price)
+    if not (basis > 0):
+        return 0.0
+    return float(max(min(qty, tpl.max_leverage * equity / basis), 0.0))
 
 
 def _exit_orders(df, tpl: StrategyTemplate, ind: dict, pos: dict) -> list:
@@ -467,10 +474,11 @@ def portfolio_targets(
         w = float(weights.get(key, 0.0))
         if st["position"] is None or w <= 0:
             continue
+        pv = float(st.get("point_value", 1.0))    # states written before the field existed are shares
         rows.append(dict(
             slot=key, asset=st["asset"], template=st["template"], weight=w,
-            side=st["position"], shares=st["shares"], price=st["last_close"],
-            notional=st["shares"] * st["last_close"] * st["position"],
+            side=st["position"], shares=st["shares"], price=st["last_close"], point_value=pv,
+            notional=st["shares"] * st["last_close"] * pv * st["position"],
             entry_price=st["entry_price"], entry_date=st["entry_date"],
             unrealized=st["unrealized"],
             stop=min((o["level"] for o in st["exit_orders"]
@@ -489,16 +497,16 @@ def portfolio_targets(
 
     if len(legs):
         by_asset = legs.assign(signed=legs["shares"] * legs["side"]).groupby("asset").agg(
-            shares=("signed", "sum"), price=("price", "last"))
-        by_asset["notional"] = by_asset["shares"] * by_asset["price"]
+            shares=("signed", "sum"), price=("price", "last"), point_value=("point_value", "last"))
+        by_asset["notional"] = by_asset["shares"] * by_asset["price"] * by_asset["point_value"]
         by_asset["pct_of_account"] = by_asset["notional"] / account_equity
     else:
-        by_asset = pd.DataFrame(columns=["shares", "price", "notional", "pct_of_account"])
+        by_asset = pd.DataFrame(columns=["shares", "price", "point_value", "notional", "pct_of_account"])
 
     risk = 0.0
     for r in legs.itertuples() if len(legs) else ():
         if r.stop is not None and not np.isnan(r.stop):
-            risk += abs(r.shares) * abs(r.price - r.stop)
+            risk += abs(r.shares) * abs(r.price - r.stop) * r.point_value
     return dict(
         legs=legs, by_asset=by_asset, scale_applied=scale,
         gross_before_scaling=gross,
@@ -552,10 +560,11 @@ def trade_list(by_asset: pd.DataFrame, holdings: dict, lot: float = 1.0) -> pd.D
         delta = target - held
         rounded = np.sign(delta) * (abs(delta) // lot) * lot if lot > 0 else delta
         price = float(by_asset["price"].get(a, np.nan))
+        pv = float(by_asset["point_value"].get(a, 1.0)) if "point_value" in by_asset else 1.0
         rows.append(dict(
             asset=a, held=held, target=round(target, 2), delta=round(delta, 2),
             action="hold" if rounded == 0 else ("BUY" if rounded > 0 else "SELL"),
             order_shares=abs(rounded), price=price,
-            order_notional=abs(rounded) * price if np.isfinite(price) else np.nan,
+            order_notional=abs(rounded) * price * pv if np.isfinite(price) else np.nan,
         ))
     return pd.DataFrame(rows).set_index("asset")

@@ -6,8 +6,14 @@ caveats:
     If your vendor has spread settlements, use those as the close instead of the last trade.
 -   Sign convention. 
     Confirm the exchange's convention (normally front minus back) matches side.
--   Starting equity. 
-    With k0=0 the series is cumulative currency P&L, which is fine for Donchian. Use a large positive k0 if your backtester needs positive prices.
+-   Starting level and units.
+    With k0=0 the series is the cumulative P&L of holding one rolled spread. The engine in this
+    repository handles prices at or below zero (see README, "Futures and spreads"), so there is no
+    need for a positive k0. Run the trick with point_value=1, contracts=1, side=+1 and k0=0: the
+    output then stays in SPREAD POINTS (a pure shift of the listed spread between rolls, with each
+    roll's gap and cost folded in), and the contract multiplier is given to the engine once, as
+    --point-value, so it is not applied twice. Let the engine take the short side (side=-1 swaps
+    High and Low, which the engine does itself). roll_cost is then in points too.
 
 """
 import numpy as np
