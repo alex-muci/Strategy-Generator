@@ -25,7 +25,7 @@ python -m venv env  # assuming 3.12 installed
 ./env/Script/Activate
 pip install -r requirements.txt 
 
-python -m unittest discover -s tests -v      # 301 tests (engine, order log, templates, hedge learner, walk-forward, robustness, selection, data, live signals, replay, both entry points)
+python -m unittest discover -s tests -t . -v # 301 tests (engine, order log, templates, hedge learner, walk-forward, robustness, selection, data, live signals, replay, both entry points)
 # faster (about 1:35 min instead of 4.5): pip install -r requirements-dev.txt, then, with ./env active,
 python -m pytest -n auto --dist loadscope   # same tests in parallel; loadscope keeps a class (and its one-off setup) on one worker
 ```
