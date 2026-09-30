@@ -31,7 +31,7 @@ from data import synthetic_ohlc  # noqa: E402
 from strategy import (  # noqa: E402
     StrategyTemplate, backtest, _compute_indicators, REGIME_INDICATORS,
     DIRECTION_LOGICS, CHANNEL_TYPES, ENTRY_STYLES, EXIT_STYLES, REGIME_FILTERS,
-    VOL_FILTERS, BIAS_FILTERS, SIDES,
+    VOL_FILTERS, BIAS_FILTERS, SIDES, HEDGE_CHANNELS,
 )
 from generator import generate_templates, param_grid_for, FAMILIES  # noqa: E402
 from walkforward import grid_combos  # noqa: E402
@@ -41,8 +41,8 @@ FIELDS = {f.name for f in dataclasses.fields(StrategyTemplate)}
 
 # which numeric parameter is read only under which switch setting
 PARAM_NEEDS = {
-    "n_entry": lambda t: t.channel_type != "hedge",
-    "n_exit": lambda t: t.exit_style == "channel" and t.channel_type != "hedge",
+    "n_entry": lambda t: t.channel_type not in HEDGE_CHANNELS,
+    "n_exit": lambda t: t.exit_style == "channel" and t.channel_type not in HEDGE_CHANNELS,
     "channel_k": lambda t: t.channel_type in ("keltner", "bollinger"),
     "atr_mult_trail": lambda t: t.exit_style == "atr_trail",
     "atr_mult_target": lambda t: t.exit_style == "target_stop",
@@ -151,7 +151,7 @@ class TemplateParamTests(unittest.TestCase):
         for wide in (False, True):
             for t in generate_templates("full"):
                 grid = param_grid_for(t, wide=wide)
-                if t.channel_type != "hedge":
+                if t.channel_type not in HEDGE_CHANNELS:
                     self.assertIn("n_entry", grid, t.name)
                 for k, values in grid.items():
                     self.assertIn(k, FIELDS, f"{t.name}: {k} is not a template field")
@@ -430,21 +430,25 @@ class HedgeWarmupTests(unittest.TestCase):
         from strategy import hedge_weights, hedge_warmup
         from walkforward import window_backtest
         df = synthetic_ohlc(2500, seed=23)
-        wu = hedge_warmup(20)
-        for mode in ("trend", "learned"):
-            full = hedge_weights(df, 20, mode)
-            for k in (1688, 1950):
-                np.testing.assert_allclose(hedge_weights(df.iloc[k - wu:], 20, mode)[wu:], full[k:],
-                                           rtol=0, atol=1e-12, err_msg=f"{mode} {k}")
-        k = 1950
-        for dl in ("trend", "countertrend", "learned"):
-            tpl = StrategyTemplate("t", channel_type="hedge", direction_logic=dl, exit_style="atr_trail")
-            ref = backtest(df, tpl, first_trade_bar=k)
-            win = window_backtest(df, tpl, k, len(df))
-            np.testing.assert_allclose(win["equity"].to_numpy(), ref["equity"].to_numpy()[k:], rtol=1e-12,
-                                       err_msg=dl)
-            self.assertEqual([(t["entry_date"], t["entry_price"]) for t in win["trades"]],
-                             [(t["entry_date"], t["entry_price"]) for t in ref["trades"]], dl)
+        for ladder in HEDGE_CHANNELS:       # the wide ladder's bands are rolling windows for this reason
+            wu = hedge_warmup(20, ladder)
+            for mode in ("trend", "learned"):
+                for sides in ("both", "long_only"):     # the one-sided scoring keeps the contract too
+                    for cost in ((0.0, 5.0) if mode == "learned" else (5.0,)):   # with and without the cost term
+                        full = hedge_weights(df, 20, mode, cost, ladder, sides)
+                        for k in (1688, 1950):
+                            np.testing.assert_allclose(hedge_weights(df.iloc[k - wu:], 20, mode, cost, ladder, sides)[wu:],
+                                                       full[k:], rtol=0, atol=1e-12, err_msg=f"{ladder} {mode} {sides} {cost} {k}")
+            k = 1950
+            for dl in ("trend", "countertrend", "learned"):
+                for sides in ("both", "long_only"):
+                    tpl = StrategyTemplate("t", channel_type=ladder, direction_logic=dl, exit_style="atr_trail", sides=sides)
+                    ref = backtest(df, tpl, first_trade_bar=k)
+                    win = window_backtest(df, tpl, k, len(df))
+                    np.testing.assert_allclose(win["equity"].to_numpy(), ref["equity"].to_numpy()[k:], rtol=1e-12,
+                                               err_msg=f"{ladder} {dl} {sides}")
+                    self.assertEqual([(t["entry_date"], t["entry_price"]) for t in win["trades"]],
+                                     [(t["entry_date"], t["entry_price"]) for t in ref["trades"]], f"{ladder} {dl} {sides}")
 
 
 if __name__ == "__main__":
