@@ -25,7 +25,7 @@ python -m venv env  # assuming 3.12 installed
 ./env/Script/Activate
 pip install -r requirements.txt 
 
-python -m unittest discover -s tests -t . -v # 310 tests (engine, order log, templates, hedge learner and its wide ladder, walk-forward, robustness, selection, data, live signals, replay, both entry points)
+python -m unittest discover -s tests -t . -v # 312 tests (engine, order log, templates, hedge learner and its wide ladder, walk-forward, robustness, selection, data, live signals, replay, both entry points)
 # faster (about 1:35 min instead of 4.5): pip install -r requirements-dev.txt, then, with ./env active,
 python -m pytest -n auto --dist loadscope   # same tests in parallel; loadscope keeps a class (and its one-off setup) on one worker
 ```
@@ -35,9 +35,9 @@ python -m pytest -n auto --dist loadscope   # same tests in parallel; loadscope 
 ```bash
 python main.py --help
 python main.py --family quick                       # 72 templates (Donchian, ER filter)
-python main.py --family default                     # 778 templates, all switches sampled
+python main.py --family default                     # 768 templates, all switches sampled
 python main.py --family online                      # 288 templates on the online-learned channel (no lookback to fit)
-python main.py --family online_wide                 # the same 288 over a wider ladder of experts (bands, regime-gated rungs)
+python main.py --family online_wide                 # 8 templates: the learned direction on a wider ladder, sized by its own position
 python main.py --real SPY --start 2005-01-01 --family default --jobs 8
 python main.py --real SPY --start 2005-01-01 --family quick --sides long_only   # one-sided family (an asset with a drift)
 python main.py --real SPY --start 2005-01-01 --family quick --vol-target 0.1  # use vol-target rather than ATR-stop (see Position sizing section section)
@@ -283,8 +283,8 @@ data.py         Load real data (yfinance) or generate synthetic
 
 strategy.py     Indicators (ATR, Donchian, Keltner, Bollinger, the AdaHedge
                 online-learned channel and direction over a fixed ladder
-                of experts -- Donchian rungs, or those plus bands and
-                regime-gated rungs -- Kaufman ER,
+                of experts -- Donchian rungs, or those plus Keltner bands,
+                sized by the learner's own position -- Kaufman ER,
                 ADX, Ehlers CTI, Choppiness, variance ratio), the
                 StrategyTemplate switches, and a bar-by-bar backtest
                 engine (ATR-stop or volatility-target position sizing,
@@ -350,7 +350,7 @@ A **template** is a fixed combination of categorical switches:
 | switch | values |
 |---|---|
 | `direction_logic` | `trend` (trade with the break) / `countertrend` (fade it) / `learned` (the online learner decides bar by bar, see below) |
-| `channel_type` | `donchian` / `keltner` (EMA +/- k ATR) / `bollinger` (SMA +/- k sd) / `hedge` (online-learned, see below) / `hedge_wide` (the same learner over a wider ladder of experts, see below) |
+| `channel_type` | `donchian` / `keltner` (EMA +/- k ATR) / `bollinger` (SMA +/- k sd) / `hedge` (online-learned, see below) / `hedge_wide` (the same learner over a wider ladder, sized by its own position, see below) |
 | `entry_style` | `stop` (at the level) / `close_confirm` (close beyond, next open) / `pullback` (after the break, a limit k ATR from the level: back inside the channel when following, deeper beyond it when fading) |
 | `exit_style` | `channel` (Turtle exit; midline target for countertrend) / `atr_trail` / `target_stop` / `time_stop` -- a hard ATR stop is always on |
 | `regime_indicator` | `er` Kaufman Efficiency Ratio / `adx` / `cti` Ehlers Correlation Trend / `chop` Choppiness / `vr` variance ratio |
@@ -384,10 +384,10 @@ For a `learned` direction either rule is then scaled by the learner's
 takes, 0 to 1. A bar on which the follow and fade experts are near-tied
 opens a small position, a one-sided book a full one, and a pullback
 limit placed under a logic the learner has abandoned by the time it
-fills opens nothing. A `trend` or `countertrend` template on the
-`hedge_wide` ladder is scaled the same way by its **active weight**, the
-weight on the experts whose regime gate is open (see the wide ladder
-below). The dashboard's share counts carry the same scale.
+fills opens nothing. On the `hedge_wide` ladder the conviction, and the
+size of a `trend` or `countertrend` template too, is the magnitude of
+the learner's own **position** (see the wide ladder below). The
+dashboard's share counts carry the same scale.
 
 Both are capped at `--max-leverage` x equity. Set the target near the
 asset's own volatility and the strategies trade at about 1x notional
@@ -481,90 +481,173 @@ and the walk-forward has nothing left to fit. The `online` family is
 
 The ladder is a list of rules fixed in advance, so anything that is a
 rule can be an expert. `hedge_wide` runs the same learner, loss, memory
-and lifetimes over `HEDGE_LADDERS["hedge_wide"]`, twelve experts per side
-instead of four (`strategy.HedgeExpert` describes one):
+and lifetimes over `HEDGE_LADDERS["hedge_wide"]` (`strategy.HedgeExpert`
+describes one expert):
 
 - **The four Donchian rungs** of `HEDGE_LADDER`, unchanged.
-- **Band experts**: Keltner and Bollinger channels around a 20-bar
-  midline (`HEDGE_WIDE_N`, the ladder's second rung) at the two widths
-  the walk-forward grid offers the fitted templates, 1.5 and 2.5
-  (`HEDGE_WIDE_WIDTHS`), in ATRs and in standard deviations. A break of
-  a band is a move of k volatility units from the mean rather than a new
-  n-bar extreme, so the ladder now spans *shape* as well as period. The
-  Keltner expert uses Keltner's original SMA midline rather than the
+- **A Keltner band at every rung**: SMA(n) +/- 2 ATR for the same four
+  lookbacks (`HEDGE_WIDE_K`, the template default `channel_k`). A break
+  of a band is a move of two volatility units from the mean rather than
+  a new n-bar extreme, so the ladder spans *shape* as well as period:
+  the 10-bar band fades are the fast "two ATRs below the two-week mean"
+  dip buys, the 80-bar band follows are slow thrusts from a quarterly
+  mean. The band uses Keltner's original SMA midline rather than the
   template's EMA: a rolling window is exact once full, so the warm-up
-  contract below still holds to the last bit; an EMA never is. (Both
-  bands reduce their SMA and standard deviation window by window rather
-  than with pandas' running sums, whose last bits depend on where the
-  series started; the fitted `bollinger` template's bands differ from
-  the expert's by that rounding, 1e-11, and no more.)
-- **Regime-gated rungs**: a copy of every Donchian rung that only acts in
-  the regime of its side. The gate is Kaufman's efficiency ratio over 20
-  bars at 0.35, the ER's own default split in `REGIME_INDICATORS`, not a
-  template's fitted threshold: a gated **fade** expert fades breaks only
-  while ER < 0.35 (the range regime), a gated **follow** expert follows
-  them only while ER >= 0.35. Outside its regime the expert is flat and
-  scores the neutral loss, so it is the ladder's *cash* expert for that
-  side: when fading a trend loses, the gated fade rungs collect the fade
-  side's weight and the mixture is no longer rewarding anyone for
-  fading. Stepping aside and back in are sides traded and are charged at
-  `cost_bps` like every other flip, so a gate that flickers pays for it.
-  The bands a gated expert contributes to the channel are its rung's,
-  whether or not its gate is open: the gate is about the stance it is
-  scored on, the channel is where the template trades. **The weight on
-  experts standing aside is weight on cash**: a `trend` or `countertrend`
-  template sizes every entry by its *active weight*, the weight on the
-  experts whose gate is open (`strategy.hedge_active`), exactly as a
-  learned direction is sized by its conviction. Without that the gated
-  rungs would win the weight in the wrong regime and the template would
-  keep trading at full size off a channel that is then a near-uniform
-  average of the rungs (while shut they all score the same neutral loss,
-  so nothing tells them apart): the learner would know and the template
-  would not act on it. On the regime series it is the difference between
-  the wide `trend` template losing 31 % and 4 % through the range, and
-  it turns the gated rungs into what a regime filter is meant to be, one
-  that is learned bar by bar instead of fitted per window.
+  contract below still holds, and an EMA never is. (The SMA is reduced
+  window by window, `strategy._window_mean`, not with pandas' running
+  sum, whose last bits depend on where the series started.)
 
 Everything else carries over: no learning rate, no threshold, no
 lookback or width in the grid (`param_grid_for` is as empty as for
-`hedge`), the same 410-bar warm-up (the 80-bar rung still leads it: a
-band's stance is exact after its window plus its span), and a window
-warmed on `hedge_warmup(atr_n, "hedge_wide")` bars matches a full-history
-run exactly (the test covers both ladders). Two things are specific to
-the wide ladder:
+`hedge`), the same 410-bar warm-up at the default 20-bar ATR (the 80-bar
+rung still leads it: a band's stance is exact after its window, the
+ATR's and its span), and a window warmed on `hedge_warmup(atr_n,
+"hedge_wide")` bars matches a full-history run to 1e-12 (the test covers
+both ladders, two-sided and one-sided; the ATR itself is pandas' running
+mean, so "to the bit" would overstate it). The learner is O(experts) per
+bar: a 16-expert `learned` run costs about twice the 8-expert one.
 
-- In the **learned direction** a gated expert **abstains** while its gate
-  is shut: a fade expert standing aside in a trend is not a vote to fade
-  the next break. Its weight lowers the conviction instead (the same
-  active-weight rule as above), so the position shrinks when the
-  learner's weight sits on experts that would not trade this regime, to
-  nothing when all of it does. The direction still follows the regime
-  series' trends and fades its range, but it flips to fade on about a
-  tenth of a trend's bars where the plain ladder flipped on under one in
-  a hundred: those are the Keltner and Bollinger *fade* experts earning
-  on pullbacks inside the trend, carried by the short-lifetime learners.
-  That is the learner doing its job with mean-reversion experts on the
-  ladder, not a bug, and on that series the learned `hedge_wide`
-  template still ends above the plain learned template; but it is the
-  price of the band experts and a real series may charge it differently.
-- The learner is O(experts) per bar: a 24-expert `learned` run costs
-  about twice the 8-expert one.
+What is different on this ladder is not the experts but **how a template
+is sized**, and it is different because the plain ladder's rule has two
+failures on a real series that only show once a ladder is wide enough to
+hold both kinds of expert:
 
-The `online_wide` family is the `online` family's 288 switch
-combinations over `hedge_wide`, so the two compare template for
-template (`TR-hdw-stop-chan-noreg-noV-noB` against
-`TR-hdg-stop-chan-noreg-noV-noB`, and so on). Whether a wider ladder
-helps is an empirical question the pipeline is built to answer, family
-against family; the learner's regret bound says only that the mixture
-tracks the best expert *on the ladder*, and a wider ladder has a higher
-best and a slower concentration. On the regime series (one synthetic
-series, a pipeline check and no more) the wide `trend` template earns a
-little less than `hedge` in the trends (the mixture includes bands, which
-break earlier and whipsaw more) and loses far less in the range, thanks
-to the active-weight sizing; the learned one ends a little above the
-plain learned template. `hedge_diagnostics(..., ladder="hedge_wide")`
-names the experts `follow_kel20x1.5`, `fade_bol20x2.5`,
-`follow_40:trend`, `fade_40:range`, and so on.
+- **Scoring the legs the template trades.** The experts are scored on
+  the sides the template's `sides` switch lets it take
+  (`strategy.hedge_scored_sides`). A two-sided template scores both legs,
+  as before. A `long_only` one scores the follow experts as "buy new
+  highs" and the fade experts as "buy new lows": the short legs are flat,
+  so a fade expert is no longer dragged by the shorts of new highs the
+  template never sells, and on an asset with a drift that drag was most of
+  its score.
+- **Sized by the committee's own position.** The plain ladder sizes a
+  learned direction by its *net side weight*, follow minus fade. On one
+  leg that is the wrong question: buying new highs and buying dips are two
+  compatible trades, and in a bull market where both pay the net is a
+  near tie and the template opens almost nothing. On the wide ladder every
+  entry, learned or fixed direction, is scaled by the magnitude of the
+  learner's **position** (`strategy.hedge_position`): the stance its
+  weighted committee of experts holds at the close (weight times stance,
+  +1 every expert long, 0 flat or split), times a **trade weight**. The
+  trade weight is one more aggregation of the kind the learner already
+  runs over its lifetimes: the mixture it actually played, scored on its
+  own realised loss, against the neutral loss of cash, unit rate,
+  discounted at the longest lifetime (`strategy._hedge_window`). It is the
+  weight the aggregate puts on trading at all. It is not a cash expert on
+  the ladder: a cash expert with a constant loss loses to the luckiest of
+  sixteen noisy experts most of the time (a winner's curse; on a driftless
+  random walk it held 1-4 % of the weight, and it was tried and dropped),
+  whereas the played mixture's loss is one causal sequence, so on noise
+  the trade weight averages a half (it is a sigmoid of a discounted P&L,
+  so it wanders, sd about 0.25, and at 50 bps of cost it averages 0.35)
+  and it falls only when what the learner played lost to standing aside.
+  The docstring's "0.1 lower loss for 20 bars is 7:1" is the arithmetic,
+  not the typical response: 0.1 of loss is 0.4 ATR a bar, a Sharpe of 6;
+  a realistic edge moves the odds by about one unit over the window
+  against noise of the same size. The unit rate and the longest lifetime
+  are the rule's two conventions, borrowed from the meta learner. What is
+  sized by is the *magnitude* of the position, a measure of how
+  positioned the committee is and whether that has paid lately: near 1
+  when the experts agree and have been paying, near 0 when they are
+  split, flat, or losing to cash. The sign is not used: the template
+  trades a break of its channel, which the committee, by construction, is
+  not yet in (at the entries the committee's sign agrees with the trade's
+  about two thirds of the time on a real series, and no better than a
+  coin on the regime series two-sided), so the regret bound is about the
+  committee's position, not about the trade this sizes. The direction of
+  a `learned` template is still the sign of the net side weight (which
+  break to trade); the position only sets the size, and two-sided that
+  size can be near full on a bar where follow and fade are near-tied (a
+  follow rung in a break and a fade rung flat), so the wide ladder trades
+  a close call bigger than the plain one would. A `trend` or
+  `countertrend` template on this ladder (the `full` family composes
+  them) is sized by the same number: following breaks through a range
+  leaves the committee split and losing to cash, and the template stands
+  mostly aside instead of trading at full size off a channel the learner
+  has given up on, which is what the regime filter is meant to do,
+  learned bar by bar rather than fitted per window. (The previous version
+  of the ladder did that with a copy of every rung gated on the
+  efficiency ratio; the position does it with no indicator, threshold or
+  gate.) The price is paid in the right regime: a fresh break is a bar
+  the committee is not yet in, so entries are sized below the bar
+  average, and on the regime series the wide trend template takes about
+  half of the plain one's gain through the trends for a tenth of its loss
+  through the range.
+
+The plain `hedge` ladder is untouched by all of this: it scores both
+legs whatever the template's `sides`, sizes a learned direction by the
+net side weight and a fixed one at full size, and is bit for bit what it
+was, so the `online` and `online_wide` families compare on the sizing
+rule as much as on the ladder.
+
+**What the evidence is, and what it is not.** Real SPY was not reachable
+from the build box; the real daily OHLC that was are four single stocks
+(AAPL 1984-2008, ORCL and YHOO 1995-2014, GOOG 2004-2013), all NASDAQ
+technology names with overlapping years and pairwise daily correlations
+of 0.3-0.4, i.e. not four independent tests. On them, the `learned`
+template with the `channel` and `atr_trail` exits (8 cells), paired
+against the same template on the plain ladder, mean Sharpe difference
+and cells improved:
+
+| sizing rule on `hedge_wide` | `long_only`: Sharpe vs plain, cells, drawdown, total return, mean size | `both`: Sharpe vs plain, cells, drawdown |
+|---|---|---|
+| position, trade weight x committee stance (shipped) | +0.15, 7/8, 4.3 %, 13 %, 0.33 | +0.01, 6/8, 6.1 % |
+| trade weight alone | +0.15, 7/8, 6.3 %, 18 %, 0.58 | -0.08, 2/8, 9.4 % |
+| committee stance alone | +0.13, 7/8, 7.3 %, 17 %, 0.53 | +0.01, 5/8, 12 % |
+| constant full size | +0.12, 7/8, 11 %, 24 %, 1.00 | -0.08, 1/8, 20 % |
+| net side weight (the plain rule) on this ladder | -0.03, 4/8, 5.4 %, 8 %, 0.62 | -0.12, 1/8, 13 % |
+| the plain `hedge` ladder itself | 0, drawdown 5.2 %, return 9 %, size 0.59 | 0, drawdown 8.8 % |
+
+So, long-only, most of the *Sharpe* lift is "stop shrinking the size in
+a bull market": a constant full size, or either factor of the position
+alone, gets the same +0.12 to +0.15. What the product adds is the
+drawdown and the notional: the same Sharpe at a third of the size, at
+40 % of the constant rule's drawdown, and for half of its total return
+(sizing down costs return; the position keeps the risk-adjusted part).
+Two-sided, where the plain ladder's net side weight already asks the
+right question, the +0.01 over eight correlated cells (the two exits
+share their entries, so nearer four) is noise: the wider ladder is a
+wash on Sharpe and better on drawdown, and the same Keltner rungs under
+the plain rule *cost* 0.12, which is the sizing rule, not the bands. On
+a synthetic long-only bear market the position runs at a quarter of full
+size through the decline and loses 2 % where the plain ladder loses
+4-5 % and a constant size 10 %. Seven sizing rules and five ladders were
+tried on these series before this one, so the numbers above are
+in-sample for the *design* even though no parameter was fitted; the
+pipeline's walk-forward, CPCV and Deflated Sharpe Ratio, run on a series
+the design never saw, are the test that counts, and `--family
+online_wide --sides long_only` on real SPY is the run to make. Two-sided
+single stocks are where this family, like every symmetric template on a
+drifting asset, earns nothing.
+
+**Why the family is eight templates.** The `online_wide` family is the
+`learned` direction over `hedge_wide`, two entries (`stop`,
+`close_confirm`) by four exits, and nothing else: no `trend` or
+`countertrend` direction, no regime filter, no SMA bias filter. The
+learner already carries follow and fade experts and sizes by its own
+position against cash, so a fixed direction on top of it throws away half
+the ladder, a regime gate second-guesses per window what the position
+learns bar by bar, and an SMA bias adds a fitted 200-bar rule to a
+channel that has none. `full` still composes `hedge_wide` with every
+switch, so the fixed-direction and filtered variants are there for
+whoever wants to test the claim. As with every family, `sides` is a
+decision about the asset and is taken on the command line: on an index
+with a drift run it `--sides long_only`. `hedge_diagnostics(...,
+ladder="hedge_wide")` names the experts `follow_10`, `fade_kel20x2`, and
+so on, and adds `trade_weight` and `position`.
+
+**A caveat on conviction, for both ladders.** The learner's weights are
+follow-the-leader until the losses prove that flipping costs something,
+so on pure noise they still concentrate on whichever expert has been
+lucky: on a driftless random walk at zero cost the plain ladder's
+two-sided conviction averages 0.63, not zero. The trade weight is the
+part of the wide ladder's position that does not have this problem (it
+averages a half on noise, though it wanders); the committee's stance
+still does. Conviction measures
+how clearly the committee is positioned and whether that has paid
+lately, not how much evidence there is of an edge; the walk-forward, the
+Deflated Sharpe Ratio and the Reality Check are still what stands between
+a lucky leader and a live position.
 
 Why this and not the other online-learning candidates:
 
@@ -745,16 +828,26 @@ They are listed with the number that would justify reopening each one.
   entry/exit branch in `strategy.backtest`, then list it in
   `generator.FAMILIES`.
 - **More experts for the hedge channel**: done, as `hedge_wide` and the
-  `online_wide` family (Keltner / Bollinger widths and regime-gated
-  rungs, see above). To go further, add a `HedgeExpert` to a ladder in
-  `HEDGE_LADDERS`, or a new ladder under a new channel type: an expert
-  is a pair of bands plus a side and an optional gate, and needs its
-  `formed` / `lead` right so that `hedge_warmup` keeps the warm-up
-  contract (rolling windows only: an EMA-based expert would break the
-  bit-exact match of a warmed window with a full-history run). The
-  mixture stays causal and parameter-free as long as the ladder is fixed
-  in advance; the `test_warm_window_matches_the_full_run` and
-  `WideLadderTests` tests are the checklist.
+  `online_wide` family (a Keltner band per rung, see above). To go
+  further, add a `HedgeExpert` to a ladder in `HEDGE_LADDERS`, or a new
+  ladder under a new channel type (list it in `HEDGE_POSITION_SIZED` to
+  size by the position): an expert is a pair of bands plus a side, and
+  needs its `formed` / `lead` right so that `hedge_warmup` keeps the
+  warm-up contract (rolling windows only: an EMA-based expert would break
+  the match of a warmed window with a full-history run). The mixture
+  stays causal and parameter-free as long as the ladder is fixed in
+  advance; the `test_warm_window_matches_the_full_run` and
+  `WideLadderTests` tests are the checklist. Three things worth trying on
+  an index: an *always-long* expert, so the ladder is measured against
+  the benchmark that matters there and the position can be "hold"; a
+  *1-5 bar fade rung*, the span of an index's short-term reversion, which
+  the 10-80 bar ladder does not reach; and a *volatility-gated* pair
+  (fade only while the ATR sits in the top of its own history, follow
+  only in the bottom: on equity indices reversion lives in high-vol
+  stretches and drift in calm ones). A bigger change for a long-only
+  index is to let a `learned` template rest both orders at once, a stop
+  above and a limit below, each sized by its side's weight, instead of
+  picking one trigger per bar.
 - **Meta-labelling** (AFML ch. 3): use the template signals as primary
   models and train a classifier on the triple-barrier outcome to size
   or veto trades.

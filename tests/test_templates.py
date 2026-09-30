@@ -433,19 +433,22 @@ class HedgeWarmupTests(unittest.TestCase):
         for ladder in HEDGE_CHANNELS:       # the wide ladder's bands are rolling windows for this reason
             wu = hedge_warmup(20, ladder)
             for mode in ("trend", "learned"):
-                full = hedge_weights(df, 20, mode, 5.0, ladder)
-                for k in (1688, 1950):
-                    np.testing.assert_allclose(hedge_weights(df.iloc[k - wu:], 20, mode, 5.0, ladder)[wu:], full[k:],
-                                               rtol=0, atol=1e-12, err_msg=f"{ladder} {mode} {k}")
+                for sides in ("both", "long_only"):     # the one-sided scoring keeps the contract too
+                    for cost in ((0.0, 5.0) if mode == "learned" else (5.0,)):   # with and without the cost term
+                        full = hedge_weights(df, 20, mode, cost, ladder, sides)
+                        for k in (1688, 1950):
+                            np.testing.assert_allclose(hedge_weights(df.iloc[k - wu:], 20, mode, cost, ladder, sides)[wu:],
+                                                       full[k:], rtol=0, atol=1e-12, err_msg=f"{ladder} {mode} {sides} {cost} {k}")
             k = 1950
             for dl in ("trend", "countertrend", "learned"):
-                tpl = StrategyTemplate("t", channel_type=ladder, direction_logic=dl, exit_style="atr_trail")
-                ref = backtest(df, tpl, first_trade_bar=k)
-                win = window_backtest(df, tpl, k, len(df))
-                np.testing.assert_allclose(win["equity"].to_numpy(), ref["equity"].to_numpy()[k:], rtol=1e-12,
-                                           err_msg=f"{ladder} {dl}")
-                self.assertEqual([(t["entry_date"], t["entry_price"]) for t in win["trades"]],
-                                 [(t["entry_date"], t["entry_price"]) for t in ref["trades"]], f"{ladder} {dl}")
+                for sides in ("both", "long_only"):
+                    tpl = StrategyTemplate("t", channel_type=ladder, direction_logic=dl, exit_style="atr_trail", sides=sides)
+                    ref = backtest(df, tpl, first_trade_bar=k)
+                    win = window_backtest(df, tpl, k, len(df))
+                    np.testing.assert_allclose(win["equity"].to_numpy(), ref["equity"].to_numpy()[k:], rtol=1e-12,
+                                               err_msg=f"{ladder} {dl} {sides}")
+                    self.assertEqual([(t["entry_date"], t["entry_price"]) for t in win["trades"]],
+                                     [(t["entry_date"], t["entry_price"]) for t in ref["trades"]], f"{ladder} {dl} {sides}")
 
 
 if __name__ == "__main__":

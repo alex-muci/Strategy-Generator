@@ -14,11 +14,15 @@ Five families are predefined:
                                the 'learned' follow-or-fade direction: no
                                lookback or width in the grid, the walk-forward
                                only re-fits exits / regime thresholds)
-  online_wide 288 templates  (the 'online' switches over the 'hedge_wide'
-                               channel: the same learner on a wider fixed
-                               ladder of experts -- Donchian rungs, Keltner and
-                               Bollinger bands, regime-gated rungs -- so the
-                               two families compare template for template)
+  online_wide   8 templates  (the 'learned' direction on the 'hedge_wide'
+                               channel, two entries by four exits and nothing
+                               else: the learner runs on a wider fixed ladder
+                               -- Donchian rungs and a Keltner band per rung
+                               -- sizes every entry by its own position and
+                               is left to decide when to follow, when to fade
+                               and when to stand aside, so no regime filter,
+                               bias filter or fixed direction is stacked on
+                               top of it)
   full        every combination of every switch (23760; overnight run)
 
 The bigger the family, the more the *selection* step becomes a data
@@ -83,14 +87,18 @@ FAMILIES = {
         sides=["both"],
     ),
     "online_wide": dict(
-        direction_logics=DIRECTION_LOGICS,
+        # the learner is the regime filter, the bias filter and the direction: the
+        # wide ladder carries follow and fade experts and sizes by its own position
+        # against cash, so a fixed direction, an ER / VR / chop gate or an SMA bias
+        # on top of it would only second-guess, per window, what it learns bar by
+        # bar (see strategy.py)
+        direction_logics=["learned"],
         channel_types=["hedge_wide"],
         entry_styles=["stop", "close_confirm"],
         exit_styles=EXIT_STYLES,
-        regimes=[("er", "none"), ("er", "trend_only"), ("er", "range_only"),
-                 ("vr", "trend_only"), ("vr", "range_only"), ("chop", "range_only")],
+        regimes=[("er", "none")],
         vol_filters=[False],
-        bias_filters=["none", "sma"],
+        bias_filters=["none"],
         sides=["both"],
     ),
     "full": dict(
