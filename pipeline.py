@@ -17,7 +17,10 @@ what is left in the entry points is argument parsing, printing and output.
 
 from __future__ import annotations
 from contextlib import contextmanager
-from multiprocessing import Pool
+from multiprocessing import get_context
+import os
+import pickle
+import tempfile
 
 import numpy as np
 import pandas as pd
@@ -102,6 +105,13 @@ def init_worker(data: dict, cfg: dict) -> None:
     set_periods_per_year(cfg["periods_per_year"])
 
 
+def _init_worker_from_file(path: str, cfg: dict) -> None:
+    """Pool initializer: the frames come from a pickle on disk, not from
+    initargs (see worker_pool)."""
+    with open(path, "rb") as f:
+        init_worker(pickle.load(f), cfg)
+
+
 def _costed(tpl, c: dict):
     return tpl.with_params(cost_bps=c["cost_bps"], risk_pct=c["risk_pct"], max_leverage=c["max_leverage"],
                            vol_target=c["vol_target"], vol_target_n=c["vol_target_n"])
@@ -138,24 +148,44 @@ def matrix_cell(job):
 
 
 @contextmanager
-def worker_pool(n_jobs: int, data: dict, cfg: dict):
+def worker_pool(n_jobs: int, data: dict, cfg: dict, *, context=None):
     """Yield a Pool (or None for n_jobs <= 1) whose workers, and this process,
-    are initialised with `data` and `cfg`.
+    are initialised with `data` and `cfg`. `context` is a multiprocessing
+    context (start method); default: the platform's.
+
+    The frames reach the workers through a pickle on disk, and initargs carry
+    only its path. Under the spawn start method (Windows, macOS) initargs are
+    written into a pipe by Process.start(), and the child only drains it after
+    re-importing __main__ -- numba, pandas, sklearn: seconds -- so with the
+    frames in initargs each start() blocked until its child was up, and Pool()
+    took n_jobs times the import time. A path fits in the pipe's buffer, so
+    start() returns at once and the children import in parallel; every worker
+    still gets the full frames, now from the file.
 
     On an error -- a worker exception, Ctrl-C, a SystemExit further down the
     pipeline -- the pool is TERMINATED: close() + join() would first wait for
     every task still queued, i.e. minutes of silence before the traceback."""
-    pool = Pool(n_jobs, initializer=init_worker, initargs=(data, cfg)) if n_jobs > 1 else None
-    init_worker(data, cfg)
-    try:
-        yield pool
-    except BaseException:
-        if pool is not None:
+    if n_jobs <= 1:
+        init_worker(data, cfg)
+        yield None
+        return
+    ctx = get_context() if context is None else context
+    # the file outlives the pool: a worker that dies is replaced by one that
+    # runs the initializer again. ignore_cleanup_errors: a directory Windows
+    # will not delete yet is not worth failing a finished run for.
+    with tempfile.TemporaryDirectory(prefix="strategy-generator-", ignore_cleanup_errors=True) as tmp:
+        path = os.path.join(tmp, "data.pkl")
+        with open(path, "wb") as f:
+            pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+        pool = ctx.Pool(n_jobs, initializer=_init_worker_from_file, initargs=(path, cfg))
+        init_worker(data, cfg)
+        try:
+            yield pool
+        except BaseException:
             pool.terminate()
             pool.join()
-        raise
-    else:
-        if pool is not None:
+            raise
+        else:
             pool.close()
             pool.join()
 
