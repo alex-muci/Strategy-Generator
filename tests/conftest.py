@@ -12,6 +12,11 @@ threads anyway.
 This must run before numpy is imported: pytest loads conftest.py before the
 test modules, and the multiprocessing workers of the pool tests inherit the
 environment. setdefault leaves an explicit setting alone.
+
+The same for matplotlib: the entry points plot to files and pick the Agg
+backend themselves (main.py: matplotlib.use("Agg")), but a test process must
+not depend on that line staying there -- a GUI backend on a headless runner
+is an import error, and on Windows a window per figure.
 """
 
 import os
@@ -19,3 +24,4 @@ import os
 for _var in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS",
              "NUMEXPR_NUM_THREADS", "NUMBA_NUM_THREADS"):
     os.environ.setdefault(_var, "1")
+os.environ.setdefault("MPLBACKEND", "Agg")
