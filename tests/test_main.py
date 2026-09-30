@@ -634,3 +634,41 @@ class SpreadRunTests(unittest.TestCase):
         with self.assertRaises(ValueError) as cm:
             _main(argv + ["--out", tempfile.mkdtemp()])
         self.assertIn("margin_per_unit", str(cm.exception))
+
+
+class AdditiveBenchmarkTests(unittest.TestCase):
+    def test_additive_returns_are_summed_not_compounded(self):
+        r = pd.Series([0.0, 0.5, -0.5, 0.2], index=pd.bdate_range("2024-01-01", periods=4))
+        pd.testing.assert_series_equal(P.benchmark_curve(r, additive=True), 1 + r.cumsum())
+        pd.testing.assert_series_equal(P.benchmark_curve(r, additive=False), (1 + r).cumprod())
+        a, m = P.curve_stats(r, additive=True), P.curve_stats(r, additive=False)
+        self.assertEqual(a["sharpe"], m["sharpe"])                # scale-free either way
+        self.assertAlmostEqual(a["max_dd"], 1.0 / 1.5 - 1.0)       # 1.5 -> 1.0 on the summed curve
+        self.assertNotEqual(a["max_dd"], m["max_dd"])
+        # a one-unit stream with a bar losing more than the initial equity stays a curve
+        r = pd.Series([0.0, -1.5, 0.2, 0.2], index=r.index)
+        self.assertEqual(P.curve_stats(r, additive=True)["cagr"], -1.0)
+        self.assertAlmostEqual(P.benchmark_curve(r, additive=True).iloc[-1], -0.1)
+
+    def test_benchmark_stats_carry_the_additive_flag(self):
+        idx = pd.bdate_range("2020-01-01", periods=300)
+        rng = np.random.default_rng(1)
+        bh = pd.Series(rng.normal(0, 0.01, 300), index=idx)
+        rets = pd.DataFrame({"a": bh * 0.5}, index=idx)
+        port = dict(portfolio_returns=rets["a"])
+        b = P.benchmark_stats(bh, rets, port, port, kind=P.BENCH_ONE_UNIT)
+        self.assertTrue(b["additive"])
+        self.assertEqual(b["buy_hold"], P.curve_stats(bh, additive=True))
+        self.assertFalse(P.benchmark_stats(bh, rets, port, port)["additive"])
+
+    def test_whole_units_and_the_instrument_map_reach_the_templates(self):
+        cfg = _cfg(whole_units=True, point_value=1.0)
+        cfg["instrument_map"] = {"brent": dict(point_value=1000.0, cost_per_unit=15.0, margin_per_unit=3000.0)}
+        base = generate_templates("quick", max_templates=1)[0]
+        spy, brent = P._costed(base, cfg, "SPY"), P._costed(base, cfg, "brent")
+        self.assertEqual((spy.point_value, spy.cost_bps, spy.whole_units), (1.0, 5.0, True))
+        self.assertEqual((brent.point_value, brent.cost_per_unit, brent.margin_per_unit, brent.cost_bps, brent.whole_units),
+                         (1000.0, 15.0, 3000.0, 0.0, True))
+        self.assertEqual(P._costed(base, cfg).point_value, 1.0)      # no asset: the run-wide settings
+        self.assertIn("whole units", P.sizing_text(cfg))
+        self.assertFalse(M.parse_args([]).whole_units)

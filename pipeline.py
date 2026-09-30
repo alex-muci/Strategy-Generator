@@ -78,25 +78,36 @@ def eval_config(args, interval: str) -> dict:
         cost_bps=args.cost_bps, risk_pct=args.risk_pct, max_leverage=args.max_leverage,
         vol_target=args.vol_target, vol_target_n=args.vol_target_n,
         point_value=args.point_value, cost_per_unit=args.cost_per_unit, margin_per_unit=args.margin_per_unit,
+        whole_units=bool(getattr(args, "whole_units", False)),
         cpcv_groups=args.cpcv_groups, cpcv_k=args.cpcv_k,
     )
 
 
-def instrument_of(c: dict) -> dict:
+def instrument_of(c: dict, asset: str | None = None) -> dict:
     """The instrument settings of a research config, with the defaults of a
-    cash share for configs written before they existed."""
-    return dict(point_value=float(c.get("point_value", 1.0) or 1.0),
-                cost_per_unit=float(c.get("cost_per_unit", 0.0) or 0.0),
-                margin_per_unit=float(c.get("margin_per_unit", 0.0) or 0.0))
+    cash share for configs written before they existed; `asset` picks up the
+    per-asset overrides of `instrument_map` (a dashboard book that mixes
+    shares and a future) and, when those give a margin, zero bps costs."""
+    out = dict(point_value=float(c.get("point_value", 1.0) or 1.0),
+               cost_per_unit=float(c.get("cost_per_unit", 0.0) or 0.0),
+               margin_per_unit=float(c.get("margin_per_unit", 0.0) or 0.0),
+               whole_units=bool(c.get("whole_units", False)))
+    over = (c.get("instrument_map") or {}).get(asset) if asset is not None else None
+    if over:
+        out.update({k: (bool(v) if k == "whole_units" else float(v)) for k, v in over.items() if k in out})
+        if out["margin_per_unit"] > 0:
+            out["cost_bps"] = 0.0
+    return out
 
 
 def instrument_text(c: dict) -> str:
     """One phrase describing a non-default instrument, empty for a cash share."""
     ins = instrument_of(c)
-    if ins == dict(point_value=1.0, cost_per_unit=0.0, margin_per_unit=0.0):
+    if ins == dict(point_value=1.0, cost_per_unit=0.0, margin_per_unit=0.0, whole_units=False):
         return ""
     return (f"point value {ins['point_value']:g} per unit, {ins['cost_per_unit']:g} per unit per side, "
-            f"margin {ins['margin_per_unit']:g} per unit")
+            f"margin {ins['margin_per_unit']:g} per unit"
+            + (", whole units" if ins["whole_units"] else ""))
 
 
 def sizing_text(c: dict) -> str:
@@ -133,9 +144,10 @@ def _init_worker_from_file(path: str, cfg: dict) -> None:
         init_worker(pickle.load(f), cfg)
 
 
-def _costed(tpl, c: dict):
-    return tpl.with_params(cost_bps=c["cost_bps"], risk_pct=c["risk_pct"], max_leverage=c["max_leverage"],
-                           vol_target=c["vol_target"], vol_target_n=c["vol_target_n"], **instrument_of(c))
+def _costed(tpl, c: dict, asset: str | None = None):
+    return tpl.with_params(**(dict(cost_bps=c["cost_bps"], risk_pct=c["risk_pct"], max_leverage=c["max_leverage"],
+                                   vol_target=c["vol_target"], vol_target_n=c["vol_target_n"])
+                              | instrument_of(c, asset)))
 
 
 def _wfa_kwargs(c: dict) -> dict:
@@ -148,7 +160,7 @@ def evaluate_slot(job):
     name, asset, tpl = job
     c = _CFG
     df = _DATA[asset]
-    tpl = _costed(tpl, c)
+    tpl = _costed(tpl, c, asset)
     wfa = evaluate_template(
         df, tpl, param_grid_for(tpl, wide=c["wide_grid"]),
         train_bars=c["train_bars"], test_bars=c["test_bars"],
@@ -306,8 +318,12 @@ def finalist_stats(results: dict, selected: list, fam: dict, n_boot: int = 1000)
 # curves against a benchmark
 # --------------------------------------------------------------------------
 
-def curve_stats(r: pd.Series) -> dict:
-    eq = (1 + r).cumprod()
+def curve_stats(r: pd.Series, additive: bool = False) -> dict:
+    """Sharpe, CAGR and max drawdown of a return stream. `additive` returns
+    (the one-unit benchmark's, P&L over a fixed initial equity) add up to
+    their curve; compounding them would describe neither the P&L nor an
+    investment."""
+    eq = benchmark_curve(r, additive)
     n = len(r)
     if n < 2:
         return dict(sharpe=0.0, cagr=0.0, max_dd=0.0, n_bars=n)
@@ -350,6 +366,11 @@ def benchmark_returns(df: pd.DataFrame, point_value: float = 1.0, initial_equity
     return BENCH_ONE_UNIT, float(point_value) * close.diff() / float(initial_equity)
 
 
+def benchmark_curve(r: pd.Series, additive: bool = False) -> pd.Series:
+    """Growth of 1 from per-bar returns: compounded, or summed for an additive stream."""
+    return 1 + r.cumsum() if additive else (1 + r).cumprod()
+
+
 def benchmark_stats(bh_returns: pd.Series, rets: pd.DataFrame, port: dict, nested: dict,
                     kind: str = BENCH_BUY_HOLD) -> dict:
     """Buy-and-hold over the same out-of-sample bars (or, for an instrument
@@ -364,11 +385,13 @@ def benchmark_stats(bh_returns: pd.Series, rets: pd.DataFrame, port: dict, neste
     portfolio is just the asset's own drift, and the information ratio how
     much is left once that is removed."""
     bh = bh_returns.reindex(rets.index).fillna(0.0)
+    additive = kind == BENCH_ONE_UNIT
     tpl_sharpes = rets.apply(annualized_sharpe)
     out = dict(
         kind=kind,
+        additive=additive,
         returns=bh,
-        buy_hold=curve_stats(bh),
+        buy_hold=curve_stats(bh, additive),
         n_templates=int(rets.shape[1]),
         n_templates_beat_bh=int((tpl_sharpes > annualized_sharpe(bh)).sum()),
         static=None, nested=None, buy_hold_nested_period=None,
@@ -379,5 +402,5 @@ def benchmark_stats(bh_returns: pd.Series, rets: pd.DataFrame, port: dict, neste
     nr = nested["portfolio_returns"]
     if len(nr) > 2:
         out["nested"] = curve_stats(nr) | against_benchmark(nr, bh)
-        out["buy_hold_nested_period"] = curve_stats(bh.reindex(nr.index).fillna(0.0))
+        out["buy_hold_nested_period"] = curve_stats(bh.reindex(nr.index).fillna(0.0), additive)
     return out

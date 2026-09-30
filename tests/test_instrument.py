@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from data import synthetic_ohlc  # noqa: E402
 from strategy import (  # noqa: E402
     StrategyTemplate, backtest, validate_instrument, atr, channel, hedge_direction, periods_per_year,
-    REGIME_INDICATORS, REGIME_INDICATOR_NAMES,
+    REGIME_INDICATORS, REGIME_INDICATOR_NAMES, REASONS,
 )
 from generator import generate_templates, param_grid_for  # noqa: E402
 from walkforward import walk_forward  # noqa: E402
@@ -406,6 +406,199 @@ class VolTargetDollarVolTests(unittest.TestCase):
         self.assertGreater(len(a), 5)
         for x, y in zip(a, b):
             self.assertAlmostEqual(x["shares"], y["shares"], delta=1e-9 * x["shares"])
+
+
+
+class RuinTests(unittest.TestCase):
+    """A gap through the stop beyond the margin: the run ends flat at zero,
+    never continues on a negative equity."""
+
+    def _gap(self):
+        n = 200
+        o = np.full(n, 10.0); c = o.copy(); h = o + 0.2; l = o - 0.2
+        c[40] = 10.9; h[40] = 11.0                          # close above the 20-bar high -> long at bar 41's open
+        o[41], h[41], l[41], c[41] = 11.0, 11.2, 10.8, 11.0
+        o[42], h[42], l[42], c[42] = 1.0, 1.0, 0.5, 0.8     # a 10-point gap through the stop
+        o[43:] = 0.8; c[43:] = 0.8; h[43:] = 1.0; l[43:] = 0.6
+        c[80] = 1.3; h[80] = 1.4                            # a later break that must NOT be traded
+        return pd.DataFrame({"Open": o, "High": h, "Low": l, "Close": c}, index=pd.bdate_range("2025-01-01", periods=n))
+
+    def _tpl(self, **kw):
+        # 0.5 x 100k / 3000 = 16.7 lots; a 10-point gap on 1000 bbl each is -167k on 100k of equity
+        base = dict(entry_style="close_confirm", exit_style="time_stop", max_hold_bars=50, n_entry=20,
+                    atr_n=5, atr_mult_stop=2.0, risk_pct=0.5, max_leverage=0.5, point_value=1000.0,
+                    margin_per_unit=3000.0, cost_per_unit=0.0, cost_bps=0.0)
+        return StrategyTemplate("g", **(base | kw))
+
+    def _check_ruined(self, res, df):
+        eq = res["equity"].to_numpy()
+        self.assertGreater(eq[41], 0.0)
+        self.assertTrue((eq[42:] == 0.0).all())
+        self.assertGreaterEqual(float(eq.min()), 0.0)
+        r = res["returns"].to_numpy()
+        self.assertTrue(np.isfinite(r).all())
+        self.assertAlmostEqual(r[42], -1.0)
+        self.assertTrue((r[43:] == 0.0).all())
+        self.assertEqual(int(res["entries"][43:].sum()), 0)   # the later break is not traded
+        self.assertIsNone(res["open_position"])
+        self.assertEqual(res["stats"]["total_return"], -1.0)
+        self.assertEqual(res["stats"]["cagr"], -1.0)
+        self.assertAlmostEqual(res["stats"]["max_drawdown"], -1.0)
+
+    def test_a_stop_filled_beyond_the_equity_leaves_the_run_at_zero(self):
+        """The open gapped through the stop: the stop fills at the open (1.0),
+        the loss exceeds the cash, and the run is ruined from that bar on."""
+        df = self._gap()
+        res = backtest(df, self._tpl(), first_trade_bar=30, log_orders=True)
+        self.assertEqual(len(res["trades"]), 1)
+        t = res["trades"][0]
+        self.assertEqual((t["reason"], t["side"], t["exit_date"]), ("stop", 1, df.index[42]))
+        self.assertAlmostEqual(t["exit_price"], 1.0)
+        self.assertLess(100_000.0 + t["pnl"], 0.0)
+        self._check_ruined(res, df)
+        fills = res["orders"][res["orders"]["kind"] == "exit_fill"]
+        self.assertEqual(list(fills["detail"]), [REASONS.index("stop")])
+
+    def test_a_mark_beyond_the_equity_is_liquidated_at_that_close(self):
+        """With the stop out of reach the position is still open at the
+        close that left nothing: it is closed there, reason 'ruin'."""
+        df = self._gap()
+        # the stop 1e6 ATRs away is never reached; risk_pct is raised so the
+        # ATR rule still asks for more than the margin cap's 16.7 lots
+        res = backtest(df, self._tpl(atr_mult_stop=1e6, risk_pct=1e5), first_trade_bar=30, log_orders=True)
+        self.assertEqual(len(res["trades"]), 1)
+        t = res["trades"][0]
+        self.assertEqual((t["reason"], t["side"], t["exit_date"]), ("ruin", 1, df.index[42]))
+        self.assertAlmostEqual(t["exit_price"], 0.8)          # the close that left nothing
+        self.assertAlmostEqual(t["pnl"], t["shares"] * 1000.0 * (0.8 - 11.0))
+        self._check_ruined(res, df)
+        fills = res["orders"][res["orders"]["kind"] == "exit_fill"]
+        self.assertEqual(list(fills["detail"]), [REASONS.index("ruin")])
+        self.assertEqual(fills.index[0] if fills.index.name == "date" else fills["date"].iloc[0], df.index[42])
+
+    def test_ruin_on_the_last_bar_is_closed_too(self):
+        df = self._gap().iloc[:43]                          # the gap bar is the last bar
+        res = backtest(df, self._tpl(atr_mult_stop=1e6, risk_pct=1e5), first_trade_bar=30)
+        self.assertEqual([t["reason"] for t in res["trades"]], ["ruin"])
+        self.assertIsNone(res["open_position"])
+        self.assertEqual(float(res["equity"].iloc[-1]), 0.0)
+        self.assertAlmostEqual(float(res["returns"].iloc[-1]), -1.0)
+
+    def test_a_survivable_gap_is_not_ruin(self):
+        df = self._gap()
+        res = backtest(df, self._tpl(max_leverage=0.05), first_trade_bar=30)   # 1.7 lots: -17k on 100k
+        self.assertEqual([t["reason"] for t in res["trades"]][:1], ["stop"])
+        self.assertGreater(float(res["equity"].min()), 0.0)
+        self.assertTrue(np.isfinite(res["returns"]).all())
+
+
+class WholeUnitsTests(unittest.TestCase):
+    K = 120
+
+    @classmethod
+    def setUpClass(cls):
+        cls.df = synthetic_ohlc(1000, seed=8)
+
+    def test_units_are_floored_after_the_cap_and_below_one_nothing_opens(self):
+        tpl = StrategyTemplate("t", cost_bps=0.0, point_value=50.0, margin_per_unit=12_000.0, cost_per_unit=2.5,
+                               risk_pct=0.05, max_leverage=0.5)
+        frac = backtest(self.df, tpl, first_trade_bar=self.K)
+        whole = backtest(self.df, tpl.with_params(whole_units=True), first_trade_bar=self.K, log_orders=True)
+        self.assertGreater(len(frac["trades"]), 5)
+        self.assertTrue(all(t["shares"] == np.floor(t["shares"]) and t["shares"] >= 1 for t in whole["trades"]))
+        # every fractional size at or above 1 is floored, every one below 1 is rejected
+        by_date = {t["entry_date"]: t["shares"] for t in frac["trades"]}
+        for t in whole["trades"]:
+            self.assertLessEqual(t["shares"], by_date.get(t["entry_date"], np.inf))
+        rejects = whole["orders"][whole["orders"]["kind"] == "entry_reject"]
+        self.assertTrue(all(q < 1.0 for q in rejects["qty"]))
+        # off is byte-identical
+        np.testing.assert_array_equal(frac["equity"].to_numpy(),
+                                      backtest(self.df, tpl.with_params(whole_units=False), first_trade_bar=self.K)["equity"].to_numpy())
+
+    def test_a_small_account_cannot_trade_a_big_contract(self):
+        tpl = StrategyTemplate("t", cost_bps=0.0, point_value=50.0, margin_per_unit=12_000.0, risk_pct=0.002, whole_units=True)
+        res = backtest(self.df, tpl, initial_equity=20_000.0, first_trade_bar=self.K, log_orders=True)
+        self.assertEqual(len(res["trades"]), 0)
+        self.assertGreater(int((res["orders"]["kind"] == "entry_reject").sum()), 0)
+        np.testing.assert_array_equal(res["equity"].to_numpy(), 20_000.0)
+
+
+class ParentEngineRegressionTests(unittest.TestCase):
+    """Numbers computed once with the engine BEFORE the instrument fields
+    existed (commit 766ad97), on synthetic_ohlc(900, seed=13) from bar 100:
+    final equity, trade count, sum of the equity curve. The ATR rule with
+    default costs must reproduce them to the last digit."""
+
+    CASES = [
+        (dict(), 96199.21803455162, 20, 87169986.55665812),
+        (dict(direction_logic="countertrend", exit_style="channel", channel_type="bollinger"),
+         100562.92699953135, 44, 91280866.8013434),
+        (dict(entry_style="pullback", exit_style="atr_trail", regime_filter="trend_only", regime_indicator="er"),
+         97139.7079619701, 12, 88500537.77155879),
+        (dict(channel_type="hedge", direction_logic="learned", exit_style="target_stop"),
+         99813.97830555258, 13, 90173843.35899201),
+    ]
+
+    def test_cash_engine_is_bit_identical_to_the_parent_commit(self):
+        df = synthetic_ohlc(900, seed=13)
+        for kw, final, n_trades, total in self.CASES:
+            res = backtest(df, StrategyTemplate("t", **kw), first_trade_bar=100)
+            self.assertEqual(float(res["equity"].iloc[-1]), final, kw)
+            self.assertEqual(len(res["trades"]), n_trades, kw)
+            self.assertEqual(float(res["equity"].sum()), total, kw)
+
+
+class NotionalCapAndBpsCostTests(unittest.TestCase):
+    """The cash-style cap and costs with a point value above 1 (an unadjusted
+    future costed in bps): the paths the spread tests never take."""
+    K = 120
+
+    @classmethod
+    def setUpClass(cls):
+        cls.df = synthetic_ohlc(1000, seed=21)
+
+    def test_the_notional_cap_binds_with_a_point_value(self):
+        tpl = StrategyTemplate("t", vol_target=3.0, max_leverage=2.0, cost_bps=0.0, point_value=50.0)
+        res = backtest(self.df, tpl, first_trade_bar=self.K)
+        eq = res["equity"]
+        at_cap = 0
+        for t in res["trades"]:
+            i = self.df.index.get_loc(t["entry_date"])
+            lev = t["shares"] * 50.0 * t["entry_price"] / eq.iloc[i - 1]
+            self.assertLessEqual(lev, 2.0 + 1e-9)
+            at_cap += abs(lev - 2.0) < 1e-6
+        self.assertGreater(at_cap, 5)
+
+    def test_bps_costs_scale_with_the_point_value_and_add_to_the_per_unit_cost(self):
+        tpl = StrategyTemplate("t", cost_bps=5.0, point_value=50.0, cost_per_unit=2.5, entry_style="pullback",
+                               exit_style="atr_trail")
+        res = backtest(self.df, tpl, first_trade_bar=self.K)
+        self.assertGreater(len(res["trades"]), 5)
+        for t in res["trades"]:
+            want = 5e-4 * t["shares"] * 50.0 * (t["entry_price"] + t["exit_price"]) + 2 * 2.5 * t["shares"]
+            self.assertAlmostEqual(t["cost"], want, places=8)
+        # and the same run on pv 1 with the per-unit cost scaled is the same equity
+        alt = backtest(self.df, tpl.with_params(point_value=1.0, cost_per_unit=2.5 / 50.0), first_trade_bar=self.K)
+        np.testing.assert_allclose(res["equity"].to_numpy(), alt["equity"].to_numpy(), rtol=1e-9)
+
+    def test_warnings_name_the_futures_settings_that_run_but_look_wrong(self):
+        from strategy import instrument_warnings
+        self.assertEqual(instrument_warnings(StrategyTemplate("t")), [])
+        self.assertEqual(instrument_warnings(StrategyTemplate("t", point_value=1000.0, margin_per_unit=3000.0,
+                                                              cost_bps=0.0, max_leverage=0.5)), [])
+        w = instrument_warnings(StrategyTemplate("t", point_value=50.0))
+        self.assertEqual(len(w), 2)                       # no margin, and bps costs
+        w = instrument_warnings(StrategyTemplate("t", margin_per_unit=3000.0, max_leverage=2.0, cost_bps=0.0))
+        self.assertEqual(len(w), 1)
+        self.assertIn("margin / equity", w[0])
+
+    def test_validation_reads_every_price_column(self):
+        df = self.df.copy()
+        df.iloc[50, df.columns.get_loc("Open")] = 0.0     # an inconsistent row: Low stays positive
+        with self.assertRaises(ValueError) as cm:
+            validate_instrument(df, StrategyTemplate("t"))
+        self.assertIn("bad print", str(cm.exception))
 
 
 if __name__ == "__main__":

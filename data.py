@@ -66,6 +66,12 @@ def load_yfinance(
         df = df.assign(Volume=np.nan)
     df = df[["Open", "High", "Low", "Close", "Volume"]]
     df = df[df[["Open", "High", "Low", "Close"]].notna().all(axis=1)]
+    # a share cannot trade at or below zero: such a bar is a bad print, and the
+    # engine would refuse the whole series over it (strategy.validate_instrument)
+    bad = (df[["Open", "High", "Low", "Close"]] <= 0).any(axis=1)
+    if bad.any():
+        print(f"  {ticker}: dropped {int(bad.sum())} bar(s) with a price at or below zero (bad prints)")
+        df = df[~bad]
     df = df.set_axis(_naive_index(df.index, interval))
     # a repeated stamp (Yahoo sometimes serves the last bar twice) would be an
     # extra bar to every indicator and survive `drop_forming_bar`; keep the
@@ -80,20 +86,25 @@ def load_yfinance(
     return df
 
 
-def load_csv(path: str, interval: str = "1d", min_bars: int = 200) -> pd.DataFrame:
+def load_csv(path: str, interval: str = "1d", min_bars: int = 200, drop_no_trade_rows: bool = True) -> pd.DataFrame:
     """OHLC(V) bars from a local CSV: the first column is the bar's timestamp,
     the others hold Open, High, Low, Close and optionally Volume (matched by
     name, any case; other columns are dropped).
 
-    Rows with a missing price and rows where every price is exactly 0 (the
-    no-trade days a spread vendor prints) are dropped. Nothing else is: a
-    negative or zero price is a price, on an instrument that has them.
+    Rows with a missing price are dropped, and, with `drop_no_trade_rows`,
+    rows where every price is exactly 0 (the no-trade days a spread vendor
+    prints; turn it off for a spread that can genuinely close a whole session
+    at 0.00). Nothing else is: a negative or zero price is a price, on an
+    instrument that has them, and a share's CSV should not carry one. The
+    file is not stripped of a forming bar: export it after the close.
     The index comes back tz-naive (`_naive_index`), deduplicated (last print
     of a repeated stamp) and sorted, like `load_yfinance`'s.
     """
     raw = pd.read_csv(path, index_col=0, parse_dates=True)
     if not isinstance(raw.index, pd.DatetimeIndex):
-        raw.index = pd.to_datetime(raw.index)
+        # stamps with mixed UTC offsets (a DST change) parse to objects: read
+        # them all as UTC, which `_naive_index` then strips like yfinance's
+        raw.index = pd.to_datetime(raw.index, utc=True)
     by_name = {str(c).strip().lower(): c for c in raw.columns}
     missing = [c for c in ("open", "high", "low", "close") if c not in by_name]
     if missing:
@@ -102,7 +113,10 @@ def load_csv(path: str, interval: str = "1d", min_bars: int = 200) -> pd.DataFra
                        for name in ("Open", "High", "Low", "Close")}, index=raw.index)
     df["Volume"] = pd.to_numeric(raw[by_name["volume"]], errors="coerce") if "volume" in by_name else np.nan
     prices = df[["Open", "High", "Low", "Close"]]
-    df = df[prices.notna().all(axis=1) & ~(prices == 0).all(axis=1)]
+    keep = prices.notna().all(axis=1)
+    if drop_no_trade_rows:
+        keep &= ~(prices == 0).all(axis=1)
+    df = df[keep]
     df = df.set_axis(_naive_index(df.index, interval))
     df = df[~df.index.duplicated(keep="last")].sort_index()
     if len(df) < min_bars:

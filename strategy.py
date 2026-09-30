@@ -1125,6 +1125,7 @@ class StrategyTemplate:
     point_value: float = 1.0     # currency per 1.0 of price per unit (share 1, Brent lot 1000, ES 50)
     cost_per_unit: float = 0.0   # currency per unit per side (commission + slippage in ticks), on top of cost_bps
     margin_per_unit: float = 0.0  # initial margin per unit, the leverage cap's basis; 0 = none (cap on notional)
+    whole_units: bool = False    # floor every size to whole units (contracts); a size below 1 opens nothing
 
     def with_params(self, **kwargs) -> "StrategyTemplate":
         d = asdict(self)
@@ -1302,7 +1303,7 @@ def _compute_indicators(df: pd.DataFrame, tpl: StrategyTemplate, dfkey=None) -> 
 ENTRY_CODES = {"stop": 0, "close_confirm": 1, "pullback": 2}
 EXIT_CODES = {"channel": 0, "atr_trail": 1, "target_stop": 2, "time_stop": 3}
 REGIME_CODES = {"none": 0, "trend_only": 1, "range_only": 2}
-REASONS = ["stop", "channel", "midline", "target", "time", "stop_same_bar"]
+REASONS = ["stop", "channel", "midline", "target", "time", "stop_same_bar", "ruin"]
 
 # The order log (backtest(..., log_orders=True)): what the loop had WORKING on
 # a bar and what it did on it, read out of the loop itself rather than rebuilt
@@ -1351,7 +1352,7 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
               has_vol, vol_low, vol_high, has_bias, allow_long, allow_short,
               atr_mult_stop, atr_mult_target, atr_mult_trail, pullback_atr_mult,
               pullback_valid_bars, max_hold_bars, risk_pct, max_leverage, vol_target_bar, cost_rate,
-              point_value, cost_per_unit, margin_per_unit,
+              point_value, cost_per_unit, margin_per_unit, whole_units,
               initial_equity, first_trade_bar, log_orders):
     """The bar loop. Plain numpy code so numba can compile it unchanged;
     the pure-Python version is used when numba is not installed.
@@ -1368,7 +1369,13 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
     price at or below zero is an ordinary price.
 
     Costs per side: cost_rate * notional + cost_per_unit * units. P&L:
-    side * units * point_value * (price change).
+    side * units * point_value * (price change). `whole_units` floors the
+    size to an integer after the cap (a contract is indivisible).
+
+    Ruin: a close that leaves the equity at or below zero (a gap through the
+    stop beyond the margin) liquidates the position at that close (reason
+    "ruin"), floors the cash at zero and ends the run flat: the equity is 0
+    from there on, never negative, so no return flips sign.
 
     Bars before `first_trade_bar` are indicator warm-up only: nothing is
     entered on them (and no order rests on them), so the walk-forward can
@@ -1419,9 +1426,41 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
     last_a = 0.0
     pos_trend = True      # direction logic the OPEN trade was entered under
     pend_trend = True     # ... and the resting pullback order
+    ruined = False
 
     equity[0] = initial_equity
     for i in range(1, n):
+        # ---- ruin: the previous close left nothing ----
+        if ruined:
+            equity[i] = 0.0
+            continue
+        if equity[i - 1] <= 0.0:
+            if position != 0:
+                # liquidated at that close; the loss beyond the cash is the broker's
+                gross = position * shares * point_value * (close[i - 1] - entry_price)
+                xcost = cost_rate * shares * point_value * abs(close[i - 1]) + cost_per_unit * shares
+                cash += gross - xcost
+                t_entry[n_trades] = entry_bar
+                t_exit[n_trades] = i - 1
+                t_side[n_trades] = position
+                t_entry_px[n_trades] = entry_price
+                t_exit_px[n_trades] = close[i - 1]
+                t_shares[n_trades] = shares
+                t_pnl[n_trades] = gross - xcost - entry_cost
+                t_cost[n_trades] = entry_cost + xcost
+                t_reason[n_trades] = 6
+                if log_orders:
+                    m = _olog(o_i, o_f, m, i - 1, _O_EXIT_FILL, position, 6, close[i - 1], shares, t_pnl[n_trades])
+                n_trades += 1
+                position = 0
+                shares = 0.0
+            cash = 0.0
+            equity[i - 1] = 0.0
+            equity[i] = 0.0
+            pend_active = False
+            ruined = True
+            continue
+
         # direction in force for NEW signals on bar i (constant unless 'learned')
         is_trend = direction[i - 1] > 0.0
         # `a_ok`: every indicator this template uses is fully formed on bar i-1
@@ -1677,6 +1716,8 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
             # (a spread has no notional), else the notional at the fill
             basis = margin_per_unit if margin_per_unit > 0.0 else point_value * abs(fill_px)
             qty = min(qty, max_leverage * cash / basis) if basis > 0.0 else 0.0
+            if whole_units:
+                qty = np.floor(qty)
             if qty > 0:
                 entry_cost = cost_rate * qty * point_value * abs(fill_px) + cost_per_unit * qty
                 cash -= entry_cost
@@ -1758,6 +1799,30 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
         # ---- mark to market at the close of bar i ----
         equity[i] = cash + (position * shares * point_value * (close[i] - entry_price) if position != 0 else 0.0)
 
+    # ---- ruin on the last bar: the loop above would have closed it on the next ----
+    if n > 1 and equity[n - 1] <= 0.0 and not ruined:
+        if position != 0:
+            gross = position * shares * point_value * (close[n - 1] - entry_price)
+            xcost = cost_rate * shares * point_value * abs(close[n - 1]) + cost_per_unit * shares
+            cash += gross - xcost
+            t_entry[n_trades] = entry_bar
+            t_exit[n_trades] = n - 1
+            t_side[n_trades] = position
+            t_entry_px[n_trades] = entry_price
+            t_exit_px[n_trades] = close[n - 1]
+            t_shares[n_trades] = shares
+            t_pnl[n_trades] = gross - xcost - entry_cost
+            t_cost[n_trades] = entry_cost + xcost
+            t_reason[n_trades] = 6
+            if log_orders:
+                m = _olog(o_i, o_f, m, n - 1, _O_EXIT_FILL, position, 6, close[n - 1], shares, t_pnl[n_trades])
+            n_trades += 1
+            position = 0
+            shares = 0.0
+        cash = 0.0
+        equity[n - 1] = 0.0
+        pend_active = False
+
     # the trailing state is returned too, so the live signal layer in live.py can
     # read the CURRENT position and resting order out of the same loop the
     # backtest runs, instead of reimplementing the rules and drifting from them
@@ -1809,21 +1874,40 @@ def validate_instrument(df: pd.DataFrame, tpl: StrategyTemplate) -> None:
     """Refuse a run whose sizing or costs would read a price that is not
     there. An instrument that trades at or below zero anywhere (a calendar
     spread) has no notional: the leverage cap needs `margin_per_unit` and the
-    costs must be per unit (`cost_per_unit`, with `cost_bps` = 0). Cheap (one
-    reduction), so `backtest` runs it every call."""
+    costs must be per unit (`cost_per_unit`, with `cost_bps` = 0). On a share
+    a price at or below zero is a bad print: `data.load_yfinance` drops such
+    bars, a CSV of a cash asset should not carry them. Cheap (one reduction),
+    so `backtest` runs it every call."""
     if not tpl.point_value > 0:
         raise ValueError(f"point_value must be positive, got {tpl.point_value}")
-    low = float(np.nanmin(df["Low"].to_numpy(dtype=float))) if len(df) else 1.0
+    low = float(np.nanmin(df[["Open", "High", "Low", "Close"]].to_numpy(dtype=float))) if len(df) else 1.0
     if low <= 0:
         if not tpl.margin_per_unit > 0:
             raise ValueError(
-                f"prices at or below zero (low {low:g}): a spread has no notional, so the leverage cap "
-                "needs margin_per_unit (initial margin per unit, in currency); size costs with "
-                "cost_per_unit and set cost_bps to 0")
+                f"a price at or below zero (lowest {low:g}). On a share that is a bad print: drop the bar. "
+                "On a spread there is no notional, so the leverage cap needs margin_per_unit (initial "
+                "margin per unit, in currency); size costs with cost_per_unit and set cost_bps to 0")
         if tpl.cost_bps > 0:
             raise ValueError(
-                f"prices at or below zero (low {low:g}) with cost_bps {tpl.cost_bps:g}: a basis-point cost is "
+                f"a price at or below zero (lowest {low:g}) with cost_bps {tpl.cost_bps:g}: a basis-point cost is "
                 "a fraction of a notional this instrument does not have; use cost_per_unit with cost_bps = 0")
+
+
+def instrument_warnings(tpl: StrategyTemplate) -> list:
+    """Settings that run but are probably not what a futures trader means:
+    printed by the entry points before the pool, never raised."""
+    out = []
+    if tpl.margin_per_unit > 0 and tpl.max_leverage > 1:
+        out.append(f"with margin_per_unit the leverage cap is margin / equity, and max_leverage "
+                   f"{tpl.max_leverage:g} lets the margin exceed the equity; 0.5 or less is a realistic cap")
+    if tpl.point_value != 1 and not tpl.margin_per_unit > 0:
+        out.append(f"point_value {tpl.point_value:g} without margin_per_unit: the leverage cap is on the "
+                   "notional at the quoted price, which on a back-adjusted futures series is an artificial "
+                   "level; give the contract's margin")
+    if tpl.point_value != 1 and tpl.cost_bps > 0:
+        out.append(f"point_value {tpl.point_value:g} with cost_bps {tpl.cost_bps:g}: a future is costed per "
+                   "contract (cost_per_unit, cost_bps 0); a basis-point cost on a back-adjusted price is arbitrary")
+    return out
 
 
 def backtest(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: float = 100_000.0,
@@ -1870,7 +1954,7 @@ def backtest(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: float = 10
         float(tpl.atr_mult_stop), float(tpl.atr_mult_target), float(tpl.atr_mult_trail), float(tpl.pullback_atr_mult),
         int(tpl.pullback_valid_bars), int(tpl.max_hold_bars), float(tpl.risk_pct), float(tpl.max_leverage),
         float(vol_target_bar), tpl.cost_bps / 1e4,
-        float(tpl.point_value), float(tpl.cost_per_unit), float(tpl.margin_per_unit),
+        float(tpl.point_value), float(tpl.cost_per_unit), float(tpl.margin_per_unit), bool(tpl.whole_units),
         float(initial_equity), first_trade_bar, bool(log_orders),
     )
     (equity, entries, t_entry, t_exit, t_side, t_entry_px, t_exit_px, t_shares, t_pnl, t_cost,
@@ -1893,7 +1977,9 @@ def backtest(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: float = 10
         for k in range(n_trades)
     ]
     rets = np.zeros(n)
-    rets[1:] = equity[1:] / equity[:-1] - 1.0
+    # a ruined run sits at 0: one -100 % bar, then flat (never 0/0 or a sign flip)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rets[1:] = np.where(equity[:-1] > 0.0, equity[1:] / equity[:-1] - 1.0, 0.0)
     equity_s = pd.Series(equity, index=idx)
     returns = pd.Series(rets, index=idx)
     stats = performance_stats(equity, trades, initial_equity, rets, t_pnl[:n_trades],
@@ -1945,7 +2031,8 @@ def performance_stats(equity, trades: list, initial_equity: float, rets=None, pn
     n_bars = len(eq)
     if rets is None:
         rets = np.zeros(n_bars)
-        rets[1:] = eq[1:] / eq[:-1] - 1.0
+        with np.errstate(divide="ignore", invalid="ignore"):
+            rets[1:] = np.where(eq[:-1] > 0.0, eq[1:] / eq[:-1] - 1.0, 0.0)
     if pnls is None:
         pnls = np.array([t.get("pnl", 0.0) for t in trades], dtype=float)
     if bars_held is None:

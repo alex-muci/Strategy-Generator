@@ -129,6 +129,13 @@ class EtfTrickTests(unittest.TestCase):
         self.assertAlmostEqual(t["pnl"], 1000.0 * (t["exit_price"] - t["entry_price"]) - 2 * 15.0, places=8)
         self.assertAlmostEqual(t["entry_price"], float(df["Open"].iloc[i]))
         self.assertAlmostEqual(t["exit_price"], float(df["Open"].iloc[j]))
+        # tied back to the LISTED spreads: the old one from the entry open to
+        # the roll close, the new one from the roll close to the exit open,
+        # one roll cost, the engine's two per-unit costs, nothing else
+        roll = 141 - 1
+        listed = (float(C["Z25-Z26"].iloc[roll]) - float(O["Z25-Z26"].iloc[i])
+                  + float(O["Z26-Z27"].iloc[j]) - float(C["Z26-Z27"].iloc[roll]))
+        self.assertAlmostEqual(t["pnl"], 1000.0 * (listed - 0.25) - 30.0, places=8)
 
 
 if __name__ == "__main__":

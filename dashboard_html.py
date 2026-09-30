@@ -483,7 +483,7 @@ def _positions_section(states: list) -> str:
             f'<span class="muted">{_e(other[0]["note"]) if other else "hard stop only"}</span>',
         ])
     tbl = _table(
-        ["asset", "side", "shares", "entry", "last", "stop", "room to stop", "unrealized",
+        ["asset", "side", "units", "entry", "last", "stop", "room to stop", "unrealized",
          "bars", "other exit"],
         rows, left_cols=(0, 1, 9), empty="flat – no slot holds a position right now")
     legend = ("" if not rows else
@@ -508,12 +508,13 @@ def _orders_section(states: list) -> str:
                 f'<span class="mono">{_e(o["kind"].replace("_", " "))}{extra}</span>',
                 f'<span class="num">{price}</span>',
                 f'<span class="num">{_n(o["shares"], 1)}</span>',
-                f'<span class="num">{_money(o["shares"] * (level or st["last_close"]))}</span>',
+                # units x |price| x point value (a 0.0 level is a level, not "at the open")
+                f'<span class="num">{_money(o["shares"] * abs(st["last_close"] if level is None else level) * float(st.get("point_value", 1.0)))}</span>',
                 f'<span class="muted">{_e(o["note"])}</span>',
             ])
     blocked = [(st["asset"], st["template"], st["blocked_by"]) for st in states
                if not st["position"] and not st["entry_orders"] and st["blocked_by"]]
-    tbl = _table(["asset", "side", "order type", "level", "shares", "notional", "why"],
+    tbl = _table(["asset", "side", "order type", "level", "units", "notional", "why"],
                  rows, left_cols=(0, 1, 2, 6),
                  empty="no entry order to work on the next bar")
     if blocked:
@@ -716,11 +717,12 @@ def render_dashboard(spec, states, targets, trades, run, path=None,
         ("account equity", _money(run["account_equity"]),
          "what the book is sized on" if scale == 1 else
          f"slots sized on {_money(run['account_equity'] * scale)} (risk scale {_n(scale)})"),
-        ("gross exposure", _pct(targets["gross_exposure"]),
+        (f'gross exposure ({targets.get("exposure_basis", "notional")})', _pct(targets["gross_exposure"]),
          (f'scaled to {_n(targets["scale_applied"])} for the '
           f'{_pct(run["max_gross"])} cap' if targets["scale_applied"] < 1
           else f'cap {_pct(run["max_gross"])}')),
-        ("net exposure", _pct(targets["net_exposure"], sign=True), "long minus short"),
+        (f'net exposure ({targets.get("exposure_basis", "notional")})', _pct(targets["net_exposure"], sign=True),
+         "long minus short"),
         ("risk if all stops hit", _pct(targets["open_risk_pct"], 1),
          _money(targets["open_risk"])),
         ("open positions", f'{n_open} / {len(states)}', "slots holding something"),

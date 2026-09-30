@@ -41,11 +41,12 @@ from generator import generate_templates, FAMILIES
 from pipeline import (
     resolve_interval, load_real, eval_config, worker_pool, evaluate_slots, walk_forward_matrices,
     family_diagnostics, build_portfolios, finalist_stats, benchmark_stats, benchmark_returns, instrument_text,
-    _costed, BENCH_BUY_HOLD,
+    benchmark_curve, _costed, BENCH_BUY_HOLD,
 )
 from portfolio import returns_frame
 from replay import save_run, replay_run, TARGETS as REPLAY_TARGETS
-from strategy import annualized_sharpe, max_drawdown, periods_per_year, BARS_PER_YEAR, SIDES, validate_instrument
+from strategy import (annualized_sharpe, max_drawdown, periods_per_year, BARS_PER_YEAR, SIDES, validate_instrument,
+                      instrument_warnings)
 
 
 def parse_args(argv=None):
@@ -89,6 +90,9 @@ def parse_args(argv=None):
     p.add_argument("--margin-per-unit", type=float, default=0.0,
                    help="initial margin per unit in currency; when given, --max-leverage caps margin / equity "
                         "(so set it at or below 1). Required for prices at or below zero")
+    p.add_argument("--whole-units", action="store_true",
+                   help="floor every size to whole units (contracts); a size below one opens nothing. "
+                        "Recommended for futures: research then trades what the live orders round to")
     p.add_argument("--min-sharpe", type=float, default=0.3)
     p.add_argument("--max-strategies", type=int, default=8)
     p.add_argument("--corr-ceiling", type=float, default=0.6)
@@ -143,9 +147,8 @@ def main(argv=None) -> dict:
     # an instrument the sizing cannot handle (prices at or below zero without
     # a margin, or with bps costs) fails here, not in every window of the pool
     validate_instrument(df, _costed(templates[0], cfg))
-    if args.margin_per_unit > 0 and args.max_leverage > 1:
-        print(f"WARNING: with --margin-per-unit the leverage cap is margin / equity, and --max-leverage "
-              f"{args.max_leverage:g} lets the margin exceed the equity; 0.5 or less is a realistic cap")
+    for w in instrument_warnings(_costed(templates[0], cfg)):
+        print(f"WARNING: {w}")
     with worker_pool(args.jobs, {asset: df}, cfg) as pool:
         out = _run(df, asset, templates, pool, args, cfg)
     print(f"\nTotal runtime {time.time() - t0:.1f}s. Outputs in {os.path.join(args.out, '')}")
@@ -329,7 +332,7 @@ def _report(df, results, port, nested, fam, finalists, bench, args, asset: str |
     # different scale and the unlevered asset gets a secondary axis; so does
     # the one-unit benchmark of a spread, whose scale is arbitrary.
     same_axis = args.vol_target > 0 and bench_kind == BENCH_BUY_HOLD
-    bh_eq = (1 + bench["returns"]).cumprod()
+    bh_eq = benchmark_curve(bench["returns"], bench.get("additive", False))
     bh_label = (f"{bench_kind.upper()} {asset} (Sharpe {bench['buy_hold']['sharpe']:.2f}; "
                 f"unlevered{'' if same_axis else ', right axis'})")
     handles, labels = [], []
@@ -503,9 +506,9 @@ def _report(df, results, port, nested, fam, finalists, bench, args, asset: str |
              "selection bias. ")
     if bench_kind != BENCH_BUY_HOLD:
         L.append(f"It trades at or below zero, so it has no buy-and-hold return: the benchmark is the P&L of "
-                 f"holding one unit (point value {args.point_value:g}) on the initial equity. Its Sharpe, beta, "
-                 "correlation and information ratio are scale-free; its CAGR and drawdown are on that arbitrary "
-                 "scale. ")
+                 f"holding one unit (point value {args.point_value:g}) on the initial equity, an additive "
+                 "curve (summed, not compounded). Its Sharpe, beta, correlation and information ratio are "
+                 "scale-free; its CAGR and drawdown are on that arbitrary scale. ")
     ins = instrument_text(eval_config(args, args.interval))
     if ins:
         L.append(f"Instrument: {ins}. ")
@@ -530,20 +533,21 @@ def _report(df, results, port, nested, fam, finalists, bench, args, asset: str |
         L.append(f"| {bench_kind} | nested period ({bhn['n_bars']}) | {bhn['sharpe']:.2f} | {bhn['cagr']:.1%} | {bhn['max_dd']:.1%} | 1.00 | 1.00 | - |\n")
         L.append(f"| **nested portfolio** | nested period | **{n['sharpe']:.2f}** | {n['cagr']:.1%} | {n['max_dd']:.1%} | "
                  f"{n['beta']:.2f} | {n['corr']:.2f} | **{n['info_ratio']:.2f}** |\n")
-    L.append(f"\n{b['n_templates_beat_bh']} of {b['n_templates']} templates have a higher OOS Sharpe than holding {asset}.\n")
+    hold = "holding" if bench_kind == BENCH_BUY_HOLD else "holding one unit of"
+    L.append(f"\n{b['n_templates_beat_bh']} of {b['n_templates']} templates have a higher OOS Sharpe than {hold} {asset}.\n")
     if b["nested"]:
         n, bhn = b["nested"], b["buy_hold_nested_period"]
         if n["sharpe"] < bhn["sharpe"]:
-            L.append(f"\nThe honest portfolio Sharpe ({n['sharpe']:.2f}) is BELOW buy and hold ({bhn['sharpe']:.2f}) "
+            L.append(f"\nThe honest portfolio Sharpe ({n['sharpe']:.2f}) is BELOW {bench_kind} ({bhn['sharpe']:.2f}) "
                      "over the same bars: the whole search did not beat doing nothing. ")
         else:
-            L.append(f"\nThe honest portfolio Sharpe ({n['sharpe']:.2f}) is above buy and hold ({bhn['sharpe']:.2f}) "
+            L.append(f"\nThe honest portfolio Sharpe ({n['sharpe']:.2f}) is above {bench_kind} ({bhn['sharpe']:.2f}) "
                      "over the same bars. ")
         L.append(f"Beta {n['beta']:.2f} and correlation {n['corr']:.2f} say how much of it is the asset's own drift; "
                  f"the information ratio {n['info_ratio']:.2f} is what is left once that is removed.\n")
 
     L.append("\n## How to read this\n\n")
-    L.append("- Buy & hold: if the nested portfolio's Sharpe is not above it, the search added nothing; "
+    L.append(f"- {bench_kind.capitalize()}: if the nested portfolio's Sharpe is not above it, the search added nothing; "
              "a high beta with a low information ratio means the templates are a costly way to hold the asset.\n")
     L.append("- PBO near 0.5 or above: picking the best parameter set in-sample is no better than a coin toss out-of-sample.\n")
     L.append("- DSR below ~0.95: the best OOS Sharpe is not distinguishable from the best of that many random trials.\n")

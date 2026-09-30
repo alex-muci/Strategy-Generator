@@ -25,7 +25,7 @@ python -m venv env  # assuming 3.12 installed
 ./env/Script/Activate
 pip install -r requirements.txt 
 
-python -m unittest discover -s tests -t . -v # 354 tests (engine, order log, templates, hedge learner and its wide ladder, walk-forward, robustness, selection, data, live signals, replay, both entry points, spreads: shift invariance, point value, per-unit costs, margin cap, the ETF trick)
+python -m unittest discover -s tests -t . -v # 375 tests (engine, order log, templates, hedge learner and its wide ladder, walk-forward, robustness, selection, data, live signals, replay, both entry points, spreads: shift invariance, point value, per-unit costs, margin cap, ruin, whole units, the ETF trick, a mixed cash + spread book)
 # faster (about 1:35 min instead of 4.5): pip install -r requirements-dev.txt, then, with ./env active,
 python -m pytest -n auto --dist loadscope   # same tests in parallel; loadscope keeps a class (and its one-off setup) on one worker
 ```
@@ -430,13 +430,30 @@ size and the costs -- are described in currency instead:
 | `--point-value` | currency per 1.0 of price per unit (lot) | 1000 (1000 bbl) |
 | `--cost-per-unit` | commission + slippage per unit per side, in currency | 15 (a tick plus commission), with `--cost-bps 0` |
 | `--margin-per-unit` | initial margin per unit, the leverage cap's basis | 3000 (check the exchange) |
+| `--whole-units` | floor every size to whole contracts; below one, nothing opens | on, for any future |
 
-`--cost-bps` is a fraction of a notional a spread does not have, so a series
-with a price at or below zero is refused unless `--margin-per-unit` is given
-and `--cost-bps` is 0 (`strategy.validate_instrument`, before any window
-runs). P&L is `side x units x point_value x (price change)` on every bar,
-for a share (point value 1) and a lot alike; `shares` in the trade lists
-are units.
+Give all four for **any future**, not only a spread: a back-adjusted
+continuous contract has positive prices at an artificial level, so a cost in
+basis points of that price and a cap on its notional are both arbitrary
+(both entry points warn when a point value comes without a margin or with
+bps costs). `--cost-bps` is a fraction of a notional a spread does not have,
+so a series with a price at or below zero is refused unless
+`--margin-per-unit` is given and `--cost-bps` is 0
+(`strategy.validate_instrument`, run by both entry points before any window,
+and by every `backtest` call). A share cannot trade at or below zero:
+`load_yfinance` drops such a bar as a bad print. P&L is
+`side x units x point_value x (price change)` on every bar, for a share
+(point value 1) and a lot alike; `shares` in the trade lists are units.
+Research trades fractional units unless `--whole-units` is set; the live
+trade list always rounds to whole units, so a futures research run without
+the flag can book P&L on 0.3 contracts that the live book never holds.
+
+**Ruin.** A close that leaves the equity at or below zero (a gap through the
+stop beyond the margin) liquidates the position at that close (trade reason
+`ruin`), floors the cash at zero and ends the run flat: one -100 % bar, then
+0, never a negative equity whose returns flip sign. A margined future makes
+this reachable, which is why `--max-leverage` should be 0.5 or less in
+margin terms.
 
 The data comes from a file: `--csv PATH`, the first column the date, then
 `Open High Low Close [Volume]` in any case. Rows whose four prices are all
@@ -454,11 +471,28 @@ reading a `long` as a bet on backwardation.
 
 The benchmark of such a run is not buy and hold (a spread has no return):
 it is the P&L of **holding one unit** on the initial equity, an additive
-curve on an arbitrary scale. Its Sharpe, beta, correlation and information
-ratio are scale-free and read as before; its CAGR and drawdown are not. The
-exposure lines of the walk-forward and the dashboard (units x price) are
-marks, not exposures, on an instrument that crosses zero. The ETF dashboard's
-futures mapping (`--futures`) is for ETF-signalled contracts and is unrelated.
+curve (summed, never compounded) on an arbitrary scale. Its Sharpe, beta,
+correlation and information ratio are scale-free and read as before; its
+CAGR and drawdown are on that scale. The exposure statistics of the
+walk-forward (units x price) are marks, not exposures, on an instrument that
+crosses zero; they are reported, never used to select.
+
+**The dashboard.** `etf_dashboard.py research` takes a CSV file among its
+`--assets` (named by its file stem, reloaded from the same path by
+`signals`) and a per-asset instrument with `--instrument-map`, so a book can
+mix shares and a spread:
+
+```bash
+python etf_dashboard.py research --assets SPY TLT brent_z25z26.csv \
+    --instrument-map brent_z25z26=1000,15,3000 --whole-units --max-leverage 0.5 --family quick
+python etf_dashboard.py signals --account-equity 200000
+```
+
+An asset with a margin in the map is costed per unit only (its `cost_bps`
+is 0), and the book measures its exposure in **margin** (units x margin per
+unit) while a share's stays notional; the exposure tiles say which, and
+`--max-gross` caps that measure. The ETF dashboard's futures mapping
+(`--futures`) is the separate ETF-signalled-contract path and is unrelated.
 
 ### The `hedge` channel: an online-learned alternative to fitted lookbacks
 

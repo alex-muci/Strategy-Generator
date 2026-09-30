@@ -654,3 +654,103 @@ class RenderTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SpreadBookTests(unittest.TestCase):
+    """A spread from a CSV through research, signals and the page, and a book
+    that mixes it with a synthetic share under a per-asset instrument."""
+
+    @classmethod
+    def setUpClass(cls):
+        from data import synthetic_ohlc
+        cls.dir = tempfile.mkdtemp(prefix="etfdash-spread-")
+        df = synthetic_ohlc(1100, seed=3)
+        shift = float(df["High"].max()) + 5.0
+        neg = df.assign(**{c: df[c] - shift for c in ("Open", "High", "Low", "Close")})
+        cls.csv = os.path.join(cls.dir, "brent_z25z26.csv")
+        neg.to_csv(cls.csv, float_format="%.17g")
+        cls.common = ["--family", "quick", "--max-templates", "4", "--bars", "1100", "--train", "300", "--test", "100",
+                      "--jobs", "1", "--n-boot", "100", "--min-sharpe", "-5"]
+        # the spread alone: at least its best slot is selected, so signals run on it
+        ED.main(["research", "--synthetic", "--assets", cls.csv, "--instrument-map", "brent_z25z26=1000,15,3000",
+                 "--max-leverage", "0.5", "--whole-units", "--risk-pct", "0.05"] + cls.common + ["--state-dir", cls.dir])
+        cls.out = ED.main(SIGNALS + [cls.dir, "--max-gross", "0.4"])
+        with open(os.path.join(cls.dir, "portfolio.json")) as f:
+            cls.spec = json.load(f)
+        # the mixed book: a share and the spread, each with its own instrument
+        cls.mixed_dir = tempfile.mkdtemp(prefix="etfdash-mixed-")
+        ED.main(["research", "--synthetic", "--assets", "AAA", cls.csv, "--instrument-map",
+                 "brent_z25z26=1000,15,3000", "--max-leverage", "0.5"] + cls.common + ["--state-dir", cls.mixed_dir])
+        with open(os.path.join(cls.mixed_dir, "portfolio.json")) as f:
+            cls.mixed = json.load(f)
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.dir, ignore_errors=True)
+        shutil.rmtree(cls.mixed_dir, ignore_errors=True)
+
+    def test_the_spec_names_the_file_and_the_instrument(self):
+        s = self.spec
+        self.assertEqual(s["assets"], ["brent_z25z26"])
+        self.assertEqual(s["config"]["asset_sources"], {"brent_z25z26": self.csv})
+        self.assertEqual(s["config"]["instrument_map"]["brent_z25z26"]["point_value"], 1000.0)
+        self.assertTrue(s["slots"])
+        for slot in s["slots"]:
+            t = slot["template"]
+            self.assertEqual((t["point_value"], t["cost_per_unit"], t["margin_per_unit"], t["cost_bps"], t["whole_units"]),
+                             (1000.0, 15.0, 3000.0, 0.0, True))
+        # the chart's holding curve is one unit of the spread, additive and finite
+        self.assertTrue(all(np.isfinite(v) for v in s["curves"]["buy_hold"]))
+        text = open(os.path.join(self.dir, "portfolio.json")).read()
+        self.assertNotIn("Infinity", text)     # (an unset regime threshold is NaN there by design)
+
+    def test_signals_reload_the_file_and_size_the_spread_in_whole_lots(self):
+        states = self.out["states"]
+        self.assertTrue(states)
+        for st in states:
+            self.assertEqual(st["asset"], "brent_z25z26")
+            self.assertLess(st["last_close"], 0.0)
+            self.assertEqual((st["point_value"], st["margin_per_unit"]), (1000.0, 3000.0))
+            for o in st["entry_orders"]:
+                self.assertLess(o["level"], 0.0)
+                self.assertEqual(o["shares"], np.floor(o["shares"]))
+        targets = self.out["targets"]
+        if any(st["position"] for st in states):
+            self.assertEqual(targets["exposure_basis"], "margin")
+            self.assertGreater(targets["gross_exposure"], 0.0)
+        page = open(os.path.join(self.dir, "dashboard.html"), encoding="utf-8").read()
+        self.assertIn("brent_z25z26", page)
+        self.assertNotIn("Infinity", page)
+        self.assertIn("units", page)
+        self.assertNotIn("var lo = inf", page)
+
+    def test_a_mixed_book_gives_each_asset_its_own_instrument(self):
+        m = self.mixed
+        self.assertEqual(m["assets"], ["AAA", "brent_z25z26"])
+        self.assertEqual(m["config"]["asset_sources"], {"brent_z25z26": self.csv})
+        self.assertEqual({r["asset"] for r in m["universe"]}, {"AAA", "brent_z25z26"})
+        self.assertTrue(m["slots"])
+        for slot in m["slots"]:
+            t = slot["template"]
+            if slot["asset"] == "brent_z25z26":
+                self.assertEqual((t["point_value"], t["cost_per_unit"], t["margin_per_unit"], t["cost_bps"]),
+                                 (1000.0, 15.0, 3000.0, 0.0))
+            else:
+                self.assertEqual((t["point_value"], t["cost_per_unit"], t["margin_per_unit"], t["cost_bps"]),
+                                 (1.0, 0.0, 0.0, 5.0))
+        self.assertTrue(all(np.isfinite(v) for v in m["curves"]["buy_hold"]))
+        self.assertNotIn("Infinity", open(os.path.join(self.mixed_dir, "portfolio.json")).read())
+
+    def test_a_bad_instrument_map_is_an_error(self):
+        for item in ("nope=1000", "AAA=abc", "AAA=0", "AAA=1,2,3,4"):
+            with self.assertRaises(SystemExit):
+                ED.main(["research", "--synthetic", "--assets", "AAA", "--instrument-map", item,
+                         "--family", "quick", "--max-templates", "1", "--bars", "600", "--train", "300",
+                         "--test", "100", "--jobs", "1", "--state-dir", tempfile.mkdtemp()])
+
+    def test_a_spread_without_a_margin_fails_before_the_pool(self):
+        with self.assertRaises(ValueError) as cm:
+            ED.main(["research", "--synthetic", "--assets", "AAA", self.csv, "--instrument-map",
+                     "brent_z25z26=1000,15", "--family", "quick", "--max-templates", "1", "--bars", "1100",
+                     "--train", "300", "--test", "100", "--jobs", "1", "--state-dir", tempfile.mkdtemp()])
+        self.assertIn("margin_per_unit", str(cm.exception))

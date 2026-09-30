@@ -128,6 +128,18 @@ class LoaderTests(unittest.TestCase):
             self._load(None)
         self.assertIn("no data", str(cm.exception))
 
+    def test_a_bar_at_or_below_zero_is_a_bad_print_and_is_dropped(self):
+        """A share cannot trade at 0: Yahoo's occasional zero print would
+        otherwise make the engine refuse the whole series as a spread."""
+        frame = _frame()
+        frame.iloc[10, frame.columns.get_loc("Low")] = 0.0
+        frame.iloc[20, frame.columns.get_loc("Close")] = -3.0
+        df, _ = self._load(frame)
+        self.assertEqual(len(df), 298)
+        self.assertNotIn(frame.index[10], df.index)
+        self.assertNotIn(frame.index[20], df.index)
+        self.assertTrue((df[["Open", "High", "Low", "Close"]] > 0).all().all())
+
     def test_repeated_and_unordered_bars_are_cleaned(self):
         f = _frame()
         last = f.iloc[[-1]].assign(Close=999.0)             # the later print of the same bar
@@ -214,3 +226,21 @@ class CsvLoaderTests(unittest.TestCase):
         self.assertIn("Low", str(cm.exception))
         with self.assertRaises(ValueError):
             D.load_csv(self.path, min_bars=1000)
+
+    def test_mixed_utc_offsets_and_the_no_trade_switch(self):
+        """Stamps across a DST change carry two offsets; a genuine 0/0/0/0
+        session is kept when asked."""
+        idx = pd.date_range("2024-03-01 15:00", periods=400, freq="h", tz="America/New_York")
+        df = self.df.iloc[:400].set_axis(idx)
+        df.iloc[7, :4] = 0.0
+        p = os.path.join(self.dir, "dst.csv")
+        df.to_csv(p)
+        out = D.load_csv(p, interval="1h")
+        self.assertIsInstance(out.index, pd.DatetimeIndex)
+        self.assertIsNone(out.index.tz)
+        self.assertEqual(out.index[0], pd.Timestamp("2024-03-01 20:00"))     # naive UTC, like yfinance's
+        self.assertEqual(len(out), 399)
+        kept = D.load_csv(p, interval="1h", drop_no_trade_rows=False)
+        self.assertEqual(len(kept), 400)
+        self.assertEqual(float(kept["Close"].iloc[7]), 0.0)
+
