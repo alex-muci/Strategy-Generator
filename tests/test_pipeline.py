@@ -1141,6 +1141,45 @@ class RobustnessTests(unittest.TestCase):
         self.assertLess(w["f"], w["c"])
 
 
+class StanceEntryTests(unittest.TestCase):
+    """entry_style 'stance': the template holds the side of the learner's
+    committee (hedge_stance), in quarters of a full size, ordered at the
+    next open."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.df = synthetic_ohlc(1500, seed=5)
+
+    def _tpl(self, **kw):
+        return StrategyTemplate("st", direction_logic="learned", channel_type="hedge_slow", entry_style="stance", **kw)
+
+    def test_causal_and_accounted(self):
+        tpl = self._tpl()
+        full = backtest(self.df, tpl, fixed_capital=True)
+        part = backtest(self.df.iloc[:1200], tpl, fixed_capital=True)
+        # nothing on bar t depends on a later bar
+        np.testing.assert_allclose(full["equity"].to_numpy()[:1200], part["equity"].to_numpy(), atol=1e-8)
+        self.assertGreater(len(full["trades"]), 5)
+        # the closed trades and the open one are the whole P&L
+        pnl = sum(t["pnl"] for t in full["trades"])
+        op = full["open_position"]
+        if op is not None:
+            pnl += op["unrealized"] - op["entry_cost"]
+        self.assertAlmostEqual(full["equity"].iloc[-1] - 100_000.0, pnl, places=6)
+        # sizes follow the stance in quarters, and the exit rule is inert
+        st = backtest(self.df, tpl.with_params(exit_style="time_stop", max_hold_bars=3), fixed_capital=True)
+        np.testing.assert_array_equal(full["equity"].to_numpy(), st["equity"].to_numpy())
+
+    def test_sides_and_warmup(self):
+        tpl = self._tpl(sides="long_only")
+        res = backtest(self.df, tpl)
+        self.assertTrue(all(t["side"] == 1 for t in res["trades"]))
+        warm = hedge_warmup(20, "hedge_slow")
+        self.assertTrue(all(self.df.index.get_loc(t["entry_date"]) > warm for t in res["trades"]))
+        res = backtest(self.df, tpl, first_trade_bar=1300)
+        self.assertTrue(all(self.df.index.get_loc(t["entry_date"]) >= 1300 for t in res["trades"]))
+
+
 class PortfolioTests(unittest.TestCase):
     def _fake_results(self, n_tpl=6, T=1200, seed=0):
         rng = np.random.default_rng(seed)
