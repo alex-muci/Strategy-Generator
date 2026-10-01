@@ -437,5 +437,8 @@ def translate_orders(states: list, conversions: dict) -> pd.DataFrame:
                     rows.append(row("exit", o["side"], o["kind"], o["level"], st["shares"]))
         for o in st["entry_orders"]:
             rows.append(row("entry", o["side"], o["kind"], o.get("level"), o["shares"], o.get("limit")))
+            if o.get("target") is not None:
+                # the target bracketed with the entry (live._entry_orders): a limit on the other side
+                rows.append(row("entry_target", -o["side"], "limit", o["target"], o["shares"]))
     return pd.DataFrame(rows, columns=["asset", "root", "slot", "what", "side", "kind", "etf_level",
                                        "fut_level", "fut_limit", "contracts_raw", "contracts"])

@@ -31,7 +31,7 @@ import pandas as pd
 from scipy.cluster.hierarchy import linkage, fcluster
 from scipy.spatial.distance import squareform
 
-from strategy import annualized_sharpe
+from strategy import annualized_sharpe, compound
 from robustness import hrp_weights
 from walkforward import summarize_walk_forward
 
@@ -176,7 +176,7 @@ def select_portfolio(
         weights=weights,
         corr_matrix=rets[qualifying].corr(),
         portfolio_returns=port_rets,
-        portfolio_equity=initial_equity * (1 + port_rets).cumprod(),
+        portfolio_equity=pd.Series(initial_equity * compound(port_rets.to_numpy()), index=port_rets.index),
         candidate_stats=table,
         qualifying=qualifying,
     )
@@ -280,7 +280,8 @@ def walk_forward_portfolio(
     port = pd.concat(parts) if parts else pd.Series(dtype=float)
     return dict(
         portfolio_returns=port,
-        portfolio_equity=initial_equity * (1 + port).cumprod() if len(port) else pd.Series(dtype=float),
+        portfolio_equity=(pd.Series(initial_equity * compound(port.to_numpy()), index=port.index)
+                          if len(port) else pd.Series(dtype=float)),
         selections=log,
         sharpe=annualized_sharpe(port) if len(port) > 2 else 0.0,
     )

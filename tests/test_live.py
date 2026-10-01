@@ -46,6 +46,11 @@ def _fill_price_for(order, open_, level):
 
 
 class LiveOrderTests(unittest.TestCase):
+    # minutes of sweeps (the hedge_wide templates of the sample above all):
+    # pytest skips the class unless run with -m slow (tests/conftest.py);
+    # unittest runs it
+    slow = True
+
     @classmethod
     def setUpClass(cls):
         cls.df = synthetic_ohlc(1400, seed=17)
@@ -610,3 +615,29 @@ class SpreadSizingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BracketTargetTests(unittest.TestCase):
+    """The engine takes a target on the entry bar when the bar's prices beyond
+    the fill certainly came after it, so the published entry carries the
+    target as a bracket, working from the fill."""
+
+    def test_entry_orders_carry_the_target(self):
+        df = synthetic_ohlc(900, seed=5)
+        found = 0
+        for exit_style, logic in (("target_stop", "trend"), ("channel", "countertrend")):
+            tpl = StrategyTemplate("b", exit_style=exit_style, direction_logic=logic, cost_bps=0.0)
+            for t in range(400, 900, 25):
+                st = strategy_state(df.iloc[:t], tpl, equity=100_000.0, lookback_bars=LOOKBACK)
+                for o in st["entry_orders"]:
+                    self.assertIn("bracket", o["note"])
+                    if exit_style == "target_stop":
+                        self.assertAlmostEqual(o["target"], o["level"] + o["side"] * tpl.atr_mult_target * st["atr"])
+                    else:
+                        self.assertEqual(-o["side"] * (o["target"] - o["level"]) <= 0, True)   # the midline is inside
+                    found += 1
+        self.assertGreater(found, 0)
+        plain = StrategyTemplate("p", exit_style="atr_trail", cost_bps=0.0)
+        for t in range(400, 900, 25):
+            for o in strategy_state(df.iloc[:t], plain, lookback_bars=LOOKBACK)["entry_orders"]:
+                self.assertNotIn("target", o)

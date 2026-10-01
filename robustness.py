@@ -34,7 +34,7 @@ from scipy.stats import norm, skew as _skew, kurtosis as _kurtosis
 from scipy.cluster.hierarchy import linkage, leaves_list
 from scipy.spatial.distance import squareform
 
-from strategy import backtest, periods_per_year
+from strategy import backtest, periods_per_year, compound
 from walkforward import smooth_scores, walk_forward, grid_combos, score_stats, warmup_bars
 
 EULER_GAMMA = 0.5772156649015329
@@ -46,7 +46,7 @@ EULER_GAMMA = 0.5772156649015329
 
 def trial_returns(df: pd.DataFrame, tpl, combos: list, initial_equity: float = 100_000.0,
                   with_trades: bool = False):
-    """Backtest every param combo over the FULL history.
+    """Backtest every param combo over the FULL history, on FIXED capital.
     Returns (R, E): float array T x N of per-bar returns and int8 array
     T x N flagging bars on which a trade was opened. With `with_trades=True`
     also P, float T x N holding each closed trade's P&L on its exit bar (what
@@ -56,14 +56,25 @@ def trial_returns(df: pd.DataFrame, tpl, combos: list, initial_equity: float = 1
 
     The strategy is path-dependent, so a block cut out of R can start in the
     middle of a trade. That is serial dependence, not look-ahead; see the
-    README ("Known approximations") for why cpcv's `purge_bars` stays at 0."""
+    README ("Known approximations") for why cpcv's `purge_bars` stays at 0.
+
+    Fixed capital (`backtest(..., fixed_capital=True)`): every entry is sized
+    on `initial_equity`, never on the equity the run has reached, and a
+    bar's return is its P&L over `initial_equity`. On a compounding account
+    the P&L of a held-out test block would change every later size -- with
+    whole units, every later contract count, indefinitely, far beyond any
+    embargo -- so the "training" returns after it would carry the test
+    block's prices. At fixed capital a return depends on the prices of the
+    trade it belongs to and nothing else: the embargo (`cpcv_embargo`,
+    `train_masks`) then covers every way a test bar can reach a training
+    one. Ruin is off for the same reason (it is an account state too)."""
     T, N = len(df), len(combos)
     R = np.zeros((T, N))
     E = np.zeros((T, N), dtype=np.int8)
     P = np.zeros((T, N)) if with_trades else None
     X = np.zeros((T, N), dtype=np.int8) if with_trades else None
     for j, params in enumerate(combos):
-        res = backtest(df, tpl.with_params(**params), initial_equity=initial_equity)
+        res = backtest(df, tpl.with_params(**params), initial_equity=initial_equity, fixed_capital=True)
         R[:, j] = res["returns"].to_numpy()
         E[:, j] = res["entries"]
         if with_trades:
@@ -123,7 +134,7 @@ def evaluate_template(
     # CPCV stresses the SAME selection rule the walk-forward used
     cp = cpcv(R, E, idx, n_groups=cpcv_groups, k_test=cpcv_k,
               embargo_bars=cpcv_embargo(tpl, combos), selection=selection,
-              metric=metric, min_trades=wfa_kwargs.get("min_trades", 5), P=P, X=X)
+              metric=metric, min_trades=wfa_kwargs.get("min_trades", 5), P=P, X=X, additive=True)
     wfa["cpcv"] = {k: v for k, v in cp.items()
                    if k in ("path_sharpes", "path_max_dd", "n_paths", "sharpe_mean",
                             "sharpe_std", "sharpe_min", "prob_sharpe_negative",
@@ -212,21 +223,36 @@ def train_masks(T: int, bounds, test_groups, embargo_bars: int, purge_bars: int 
     return M
 
 
-def _score_cols(R: np.ndarray, E, P, mask: np.ndarray, metric: str, min_trades: int) -> np.ndarray:
+def _equity_cols(R: np.ndarray, additive: bool) -> np.ndarray:
+    """Growth of 1 of each column of R: summed for additive returns (P&L over
+    a fixed capital, `trial_returns`), else compounded (`strategy.compound`)."""
+    return 1.0 + np.cumsum(R, axis=0) if additive else compound(R)
+
+
+def _drawdown_cols(eq: np.ndarray, additive: bool) -> np.ndarray:
+    """Deepest fall from a running peak of each column: in units of the fixed
+    capital for an additive curve (it can cross zero), else relative to the peak."""
+    peak = np.maximum.accumulate(eq, axis=0)
+    return (eq - peak).min(axis=0) if additive else (eq / peak - 1).min(axis=0)
+
+
+def _score_cols(R: np.ndarray, E, P, mask: np.ndarray, metric: str, min_trades: int,
+                additive: bool = False) -> np.ndarray:
     """Walk-forward objective (walkforward.score_stats, incl. its min-trades
     rule) of each column of R over the rows selected by mask (T, or T x N for
     one mask per column). The rows are treated as one concatenated track
-    record. Without E every column counts as having traded enough;
-    profit_factor needs P (trade P&L on exit bars)."""
+    record (summed when `additive`, else compounded). Without E every column
+    counts as having traded enough; profit_factor needs P (trade P&L on exit
+    bars)."""
     N = R.shape[1]
     M = _as_cols(mask, N)
     n_tr = np.where(M, E, 0).sum(axis=0) if E is not None else np.full(N, max(min_trades, 0))
     sharpe = _sharpe_cols(R, M)
     # rows left out earn 0: the concatenated track record's total and drawdown
     Xr = np.where(M, R, 0.0)
-    eq = np.vstack([np.ones((1, N)), np.cumprod(1 + Xr, axis=0)])
+    eq = np.vstack([np.ones((1, N)), _equity_cols(Xr, additive)])
     total = eq[-1] - 1
-    dd = (eq / np.maximum.accumulate(eq, axis=0) - 1).min(axis=0)
+    dd = _drawdown_cols(eq, additive)
     if metric == "profit_factor":
         if P is None:
             raise ValueError("cpcv(metric='profit_factor') needs P (trial_returns(..., with_trades=True))")
@@ -276,6 +302,7 @@ def cpcv(
     metric: str = "sharpe",
     P: np.ndarray | None = None,
     X: np.ndarray | None = None,
+    additive: bool = False,
 ) -> dict:
     """Combinatorial purged CV of the parameter selection.
 
@@ -286,6 +313,8 @@ def cpcv(
     P : T x N closed-trade P&L on exit bars; needed for metric='profit_factor'
     X : T x N exit flags; with E, the embargo after a test group runs on,
         per trial, until the trade open at its end has closed (train_masks)
+    additive : R is P&L over a fixed capital (`trial_returns`): track records
+        and paths are summed, not compounded
 
     The T bars are cut into n_groups contiguous groups. For every choice
     of k_test groups as the test set, the remaining groups (minus an
@@ -307,7 +336,7 @@ def cpcv(
 
     for c, test_groups in enumerate(combos):
         train_mask = train_masks(T, bounds, test_groups, embargo_bars, purge_bars, E, X)
-        scores = _score_cols(R, E, P, train_mask, metric, min_trades)
+        scores = _score_cols(R, E, P, train_mask, metric, min_trades, additive)
         if not np.isfinite(scores).any():
             # nothing traded enough in training: flat, as walk_forward does
             chosen[c] = -1
@@ -325,8 +354,7 @@ def cpcv(
 
     assert not np.isnan(path_returns).any(), "CPCV paths not fully covered"
     sr = np.array([_sharpe_cols(path_returns[:, [p]], np.ones(T, bool))[0] for p in range(n_paths)])
-    eq = np.cumprod(1 + path_returns, axis=0)
-    max_dd = (eq / np.maximum.accumulate(eq, axis=0) - 1).min(axis=0)
+    max_dd = _drawdown_cols(np.vstack([np.ones((1, n_paths)), _equity_cols(path_returns, additive)]), additive)
     return dict(
         path_returns=path_returns,
         path_sharpes=sr,

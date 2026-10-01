@@ -410,8 +410,10 @@ class VolTargetDollarVolTests(unittest.TestCase):
 
 
 class RuinTests(unittest.TestCase):
-    """A gap through the stop beyond the margin: the run ends flat at zero,
-    never continues on a negative equity."""
+    """A gap through the stop beyond the margin: the account is closed at
+    what the liquidation left. A futures account OWES a loss beyond its cash,
+    so the equity stays at that deficit (never floored at zero: that would be
+    limited liability), and nothing trades after it."""
 
     def _gap(self):
         n = 200
@@ -432,18 +434,20 @@ class RuinTests(unittest.TestCase):
 
     def _check_ruined(self, res, df):
         eq = res["equity"].to_numpy()
+        deficit = 100_000.0 + sum(t["pnl"] for t in res["trades"])
+        self.assertLess(deficit, 0.0)
         self.assertGreater(eq[41], 0.0)
-        self.assertTrue((eq[42:] == 0.0).all())
-        self.assertGreaterEqual(float(eq.min()), 0.0)
+        np.testing.assert_allclose(eq[42:], deficit)        # owed, and frozen there
         r = res["returns"].to_numpy()
         self.assertTrue(np.isfinite(r).all())
-        self.assertAlmostEqual(r[42], -1.0)
-        self.assertTrue((r[43:] == 0.0).all())
+        self.assertAlmostEqual(r[42], deficit / eq[41] - 1.0)
+        self.assertLess(r[42], -1.0)                          # beyond -100 %: the account owes money
+        self.assertTrue((r[43:] == 0.0).all())                # no ratio of negative equities, no sign flip
         self.assertEqual(int(res["entries"][43:].sum()), 0)   # the later break is not traded
         self.assertIsNone(res["open_position"])
-        self.assertEqual(res["stats"]["total_return"], -1.0)
+        self.assertAlmostEqual(res["stats"]["total_return"], deficit / 100_000.0 - 1.0)
         self.assertEqual(res["stats"]["cagr"], -1.0)
-        self.assertAlmostEqual(res["stats"]["max_drawdown"], -1.0)
+        self.assertAlmostEqual(res["stats"]["max_drawdown"], deficit / 100_000.0 - 1.0)
 
     def test_a_stop_filled_beyond_the_equity_leaves_the_run_at_zero(self):
         """The open gapped through the stop: the stop fills at the open (1.0),
@@ -481,8 +485,36 @@ class RuinTests(unittest.TestCase):
         res = backtest(df, self._tpl(atr_mult_stop=1e6, risk_pct=1e5), first_trade_bar=30)
         self.assertEqual([t["reason"] for t in res["trades"]], ["ruin"])
         self.assertIsNone(res["open_position"])
-        self.assertEqual(float(res["equity"].iloc[-1]), 0.0)
-        self.assertAlmostEqual(float(res["returns"].iloc[-1]), -1.0)
+        deficit = 100_000.0 + res["trades"][0]["pnl"]
+        self.assertAlmostEqual(float(res["equity"].iloc[-1]), deficit)
+        self.assertLess(float(res["returns"].iloc[-1]), -1.0)
+
+    def test_the_issue_fixture_owes_its_deficit(self):
+        """The reported case: -166,667 of trade P&L on 100,000 leaves an
+        equity of -66,667, not 0."""
+        df = self._gap()
+        res = backtest(df, self._tpl(atr_mult_stop=1e6, risk_pct=1e5, cost_per_unit=0.0), first_trade_bar=30)
+        t = res["trades"][0]
+        self.assertAlmostEqual(t["shares"], 50_000.0 / 3000.0)
+        self.assertAlmostEqual(t["pnl"], -170_000.0, delta=1.0)    # 16.7 lots x 1000 x (0.8 - 11.0)
+        self.assertAlmostEqual(float(res["equity"].iloc[-1]), 100_000.0 + t["pnl"])
+
+    def test_a_ruined_window_is_not_refunded(self):
+        """The walk-forward is one account: after a window ends at or below
+        zero, every later window is flat, never restarted on fresh capital."""
+        from walkforward import walk_forward
+        df = pd.concat([self._gap()] * 4)
+        df.index = pd.bdate_range("2025-01-01", periods=len(df))
+        res = walk_forward(df, self._tpl(atr_mult_stop=1e6, risk_pct=1e5), {"n_entry": [20]},
+                           train_bars=60, test_bars=60, min_trades=0)
+        eq = res["oos_equity"].to_numpy()
+        dead = np.flatnonzero(eq <= 0.0)
+        self.assertGreater(len(dead), 0)
+        self.assertTrue((eq[dead[0]:] == eq[dead[0]]).all())     # frozen at the deficit
+        self.assertLess(eq[-1], 0.0)
+        after = [w for w in res["windows"] if w["test_start"] > res["oos_equity"].index[dead[0]]]
+        self.assertGreater(len(after), 0)
+        self.assertTrue(all(w.get("ruined") for w in after))
 
     def test_a_survivable_gap_is_not_ruin(self):
         df = self._gap()

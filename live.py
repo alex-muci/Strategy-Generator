@@ -333,6 +333,22 @@ def _entry_orders(df, tpl: StrategyTemplate, ind: dict, pending, equity: float) 
     # which channel edge opens a long, and which opens a short
     long_level, short_level = (upper, lower) if is_trend else (lower, upper)
     out = []
+    a = float(ind["atr"][n - 1])
+
+    def bracket(o: dict, fill: float | None) -> dict:
+        """The target that works from the fill, as one bracket with the entry:
+        the engine takes it on the entry bar itself when the bar's prices
+        beyond the fill certainly came after it (strategy._bar_loop), so it
+        must be working the moment the entry fills. `fill` None: at the open."""
+        if tpl.exit_style == "target_stop":
+            dist = tpl.atr_mult_target * a
+            o["target"] = None if fill is None else fill + o["side"] * dist
+            o["note"] += (f"; bracket a target {tpl.atr_mult_target:g} ATR ({dist:.2f}) from the fill"
+                          + ("" if fill is None else f" ({o['target']:.2f} at the level)"))
+        elif tpl.exit_style == "channel" and not is_trend:
+            o["target"] = float(ind["mid_x"][n - 1])
+            o["note"] += f"; bracket the channel midline {o['target']:.2f} as its target"
+        return o
 
     if tpl.entry_style == "close_confirm":
         # the break is already decided by the last close: this is a market
@@ -345,18 +361,17 @@ def _entry_orders(df, tpl: StrategyTemplate, ind: dict, pending, equity: float) 
         take_long = (broke_up if is_trend else broke_down) and long_ok
         take_short = (broke_down if is_trend else broke_up) and short_ok
         if take_long:
-            out.append(dict(kind="market_on_open", side=1, level=None,
-                            shares=_size(equity, tpl, ind, n, float(df["Close"].iloc[-1]), is_trend),
-                            note="close confirmed beyond the channel"))
+            out.append(bracket(dict(kind="market_on_open", side=1, level=None,
+                                    shares=_size(equity, tpl, ind, n, float(df["Close"].iloc[-1]), is_trend),
+                                    note="close confirmed beyond the channel"), None))
         elif take_short:
-            out.append(dict(kind="market_on_open", side=-1, level=None,
-                            shares=_size(equity, tpl, ind, n, float(df["Close"].iloc[-1]), is_trend),
-                            note="close confirmed beyond the channel"))
+            out.append(bracket(dict(kind="market_on_open", side=-1, level=None,
+                                    shares=_size(equity, tpl, ind, n, float(df["Close"].iloc[-1]), is_trend),
+                                    note="close confirmed beyond the channel"), None))
         return out
 
     # 'stop' fills AT the channel edge; 'pullback' waits for the break, then
     # places a limit that far inside it
-    a = float(ind["atr"][n - 1])
     for side, level, ok in ((1, long_level, long_ok), (-1, short_level, short_ok)):
         if not ok:
             continue
@@ -371,9 +386,9 @@ def _entry_orders(df, tpl: StrategyTemplate, ind: dict, pending, equity: float) 
         else:
             # a trend break is a stop order (fills as price runs through the
             # level); fading it is a limit order (fills as price reaches it)
-            out.append(dict(kind="stop" if is_trend else "limit", side=side, level=level,
-                            shares=_size(equity, tpl, ind, n, level, is_trend),
-                            note="breakout" if is_trend else "fade the break"))
+            out.append(bracket(dict(kind="stop" if is_trend else "limit", side=side, level=level,
+                                    shares=_size(equity, tpl, ind, n, level, is_trend),
+                                    note="breakout" if is_trend else "fade the break"), level))
     return out
 
 

@@ -94,8 +94,11 @@ def load_yfinance(
 
 def load_csv(path: str, interval: str = "1d", min_bars: int = 200, drop_no_trade_rows: bool = True) -> pd.DataFrame:
     """OHLC(V) bars from a local CSV: the first column is the bar's timestamp,
-    the others hold Open, High, Low, Close and optionally Volume (matched by
-    name, any case; other columns are dropped).
+    the others hold Open, High, Low, Close and optionally Volume and Roll
+    (matched by name, any case; other columns are dropped). Roll is 1 (or
+    true) on a bar at whose close the series rolled from one contract into
+    the next, as `extra_utils/ETF_trick_spreads.py` writes it: the engine
+    charges `--roll-cost-per-unit` there to whatever is held.
 
     Rows with a missing price are dropped, and, with `drop_no_trade_rows`,
     rows where every price is exactly 0 (the no-trade days a spread vendor
@@ -118,10 +121,19 @@ def load_csv(path: str, interval: str = "1d", min_bars: int = 200, drop_no_trade
     df = pd.DataFrame({name: pd.to_numeric(raw[by_name[name.lower()]], errors="coerce")
                        for name in ("Open", "High", "Low", "Close")}, index=raw.index)
     df["Volume"] = pd.to_numeric(raw[by_name["volume"]], errors="coerce") if "volume" in by_name else np.nan
+    if "roll" in by_name:
+        col = raw[by_name["roll"]]
+        if col.dtype == object:   # 'True' / 'False' as text
+            col = col.astype(str).str.strip().str.lower().map({"true": 1.0, "false": 0.0}).fillna(col)
+        df["Roll"] = (pd.to_numeric(col, errors="coerce").fillna(0.0) != 0).astype(float)
     prices = df[["Open", "High", "Low", "Close"]]
     keep = prices.notna().all(axis=1)
     if drop_no_trade_rows:
         keep &= ~(prices == 0).all(axis=1)
+    if "Roll" in df.columns:
+        # a roll on a dropped row (a no-trade day) happened all the same: it
+        # moves to the last kept bar before it, whose close the position held
+        df["Roll"] = align_rolls(df["Roll"], df.index[keep])
     df = df[keep]
     df = df.set_axis(_naive_index(df.index, interval))
     df = df[~df.index.duplicated(keep="last")].sort_index()
@@ -136,6 +148,26 @@ def load_csv(path: str, interval: str = "1d", min_bars: int = 200, drop_no_trade
 # margin each, since Yahoo counts from its own clock.
 YAHOO_INTRADAY_DAYS = {"1h": 729, "60m": 729}
 YAHOO_FINE_DAYS = 59
+
+
+def align_rolls(roll: pd.Series, keep: pd.Index) -> pd.Series:
+    """`roll` (1 on the bars at whose close a contract rolled) on the bars
+    `keep`, a subset of its index: a roll on a bar that is not kept moves to
+    the last kept bar before it (a position held at that close was still
+    held when the roll happened, unless it exited in between, which a bar
+    that is not there cannot show), or to the first kept bar when none is
+    earlier. The result is indexed like `roll` (0 off `keep`), so it can be
+    assigned back before the rows are dropped."""
+    r = roll.fillna(0.0).astype(float)
+    kept = r.index.isin(keep)
+    if kept.all() or not kept.any():
+        return r.where(kept, 0.0)
+    # the kept bar each row's roll lands on: the last kept bar at or before it
+    pos = np.arange(len(r))
+    last_kept = pd.Series(np.where(kept, pos, np.nan)).ffill().bfill().to_numpy().astype(int)
+    out = np.zeros(len(r))
+    np.add.at(out, last_kept, r.to_numpy())
+    return pd.Series(np.minimum(out, 1.0), index=r.index)
 
 
 def yahoo_earliest_start(interval: str, now: pd.Timestamp | None = None) -> pd.Timestamp | None:

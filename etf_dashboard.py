@@ -64,7 +64,7 @@ from dataclasses import asdict
 import numpy as np
 import pandas as pd
 
-from data import synthetic_ohlc, yahoo_earliest_start, load_csv
+from data import synthetic_ohlc, yahoo_earliest_start, load_csv, align_rolls
 from generator import generate_templates, param_grid_for, FAMILIES
 from live import (
     refit_params, due_for_refit, strategy_state, bars_since,
@@ -74,6 +74,7 @@ from pipeline import (
     resolve_interval, load_real, eval_config, worker_pool, evaluate_slots,
     family_diagnostics, build_portfolios, finalist_stats, sizing_text,
     benchmark_returns, benchmark_curve, instrument_of, _costed, BENCH_ONE_UNIT,
+    add_research_args, parse_instrument_map,
 )
 from portfolio import returns_frame
 from strategy import (
@@ -111,14 +112,11 @@ def parse_args(argv=None):
     common.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) - 1))
 
     r = sub.add_parser("research", parents=[common], help="decide what to trade (slow)")
+    # the research flags main.py takes too, defined once (pipeline.add_research_args)
+    add_research_args(r, start="2010-01-01")
     r.add_argument("--assets", nargs="+", default=["SPY", "TLT", "GLD", "QQQ"],
                    help="Yahoo tickers, or paths to OHLCV CSV files (a spread; see main.py --csv), "
                         "named by their file stem")
-    r.add_argument("--start", default="2010-01-01")
-    r.add_argument("--family", default="quick", choices=list(FAMILIES))
-    r.add_argument("--max-templates", type=int, default=None)
-    r.add_argument("--sides", nargs="+", default=None, choices=SIDES,
-                   help="restrict every template to these sides (default: the family's own list)")
     r.add_argument("--sides-map", nargs="+", default=None, metavar="ASSET=SIDE",
                    help="sides per asset, e.g. SPY=long_only QQQ=long_only; the others keep --sides. "
                         "Whether an asset drifts is a fact about the asset: decide it BEFORE the run")
@@ -126,41 +124,6 @@ def parse_args(argv=None):
                    help="annualized volatility the whole book is scaled to (e.g. 0.15), from the "
                         "realized vol of the nested walk-forward curve; 0 = no scaling. Frozen in "
                         "portfolio.json, never re-estimated by the signals phase")
-    r.add_argument("--train", type=int, default=500, help="training window (bars)")
-    r.add_argument("--test", type=int, default=125, help="test window (bars)")
-    r.add_argument("--anchored", action="store_true", help="expanding training window")
-    r.add_argument("--metric", default="sharpe", choices=["sharpe", "return_over_dd", "profit_factor"])
-    r.add_argument("--selection", default="plateau", choices=["plateau", "best"])
-    r.add_argument("--wide-grid", action="store_true")
-    r.add_argument("--cost-bps", type=float, default=5.0, help="commission+slippage per side")
-    r.add_argument("--risk-pct", type=float, default=0.01, help="equity risked per trade, per slot")
-    r.add_argument("--max-leverage", type=float, default=2.0)
-    r.add_argument("--vol-target", type=float, default=0.0,
-                   help="annualized volatility each entry is sized to, per slot (e.g. 0.15); "
-                        "0 = risk --risk-pct on the ATR stop. The same target gives every asset the same risk")
-    r.add_argument("--vol-target-n", type=int, default=60, help="bars of close-to-close changes in the realized-vol estimate")
-    r.add_argument("--point-value", type=float, default=1.0,
-                   help="currency per 1.0 of price per unit (1 for a share); the same for every asset of the run")
-    r.add_argument("--cost-per-unit", type=float, default=0.0, help="commission+slippage per unit per side, in currency")
-    r.add_argument("--margin-per-unit", type=float, default=0.0,
-                   help="initial margin per unit; when given, --max-leverage caps margin / equity")
-    r.add_argument("--whole-units", action="store_true",
-                   help="floor every size to whole units (contracts); recommended for futures")
-    r.add_argument("--instrument-map", nargs="+", default=None, metavar="ASSET=PV[,COST[,MARGIN]]",
-                   help="per-asset instrument: point value, cost per unit per side, margin per unit, e.g. "
-                        "brent_z25z26=1000,15,3000; the others keep the run-wide flags. A mapped asset takes only "
-                        "what is given here (a cost or margin left out is 0, e.g. SPY=1 is a plain share); one "
-                        "given a margin is costed per unit only (cost_bps 0)")
-    r.add_argument("--min-sharpe", type=float, default=0.3)
-    r.add_argument("--max-strategies", type=int, default=8)
-    r.add_argument("--corr-ceiling", type=float, default=0.6)
-    r.add_argument("--require-pardo", action="store_true")
-    r.add_argument("--select-method", default="greedy", choices=["greedy", "cluster"])
-    r.add_argument("--weighting", default="equal", choices=["equal", "hrp"])
-    r.add_argument("--cpcv-groups", type=int, default=8)
-    r.add_argument("--cpcv-k", type=int, default=2)
-    r.add_argument("--n-boot", type=int, default=1000)
-    r.add_argument("--bars", type=int, default=3000, help="synthetic bars per asset")
 
     s = sub.add_parser("signals", parents=[common], help="today's positions and orders (fast)")
     s.add_argument("--account-equity", type=float, default=100_000.0,
@@ -245,6 +208,11 @@ def load_assets(assets, *, interval, start, synthetic, bars, now=None, quiet=Fal
     dropped = {a: len(raw[a]) - len(common) for a in assets}
     if not quiet and any(dropped.values()):
         print(f"  aligned on {len(common)} shared bars (dropped {dropped})")
+    for a in assets:
+        if "Roll" in raw[a].columns:
+            # a contract roll on a bar another asset does not share still
+            # happened: it moves to the last shared bar before it
+            raw[a] = raw[a].assign(Roll=align_rolls(raw[a]["Roll"], common))
     return {a: raw[a].loc[common] for a in assets}
 
 
@@ -295,7 +263,14 @@ def research(args) -> dict:
     interval = resolve_interval(args.interval, args.synthetic)
     if interval != args.interval:
         print(f"NOTE: --interval {args.interval} ignored, the synthetic series is {interval} bars")
+    if args.synthetic and args.bars_per_day is not None:
+        print(f"NOTE: --bars-per-day {args.bars_per_day:g} ignored, the synthetic series is {interval} bars")
+        args.bars_per_day = None
     args.interval = interval
+    try:
+        periods_per_year_for_interval(interval, args.bars_per_day)
+    except ValueError as e:
+        raise SystemExit(f"--bars-per-day: {e}")
 
     print(f"Loading {len(args.assets)} assets ({args.interval} bars)"
           f"{' [synthetic]' if args.synthetic else ''}...")
@@ -329,6 +304,9 @@ def research(args) -> dict:
     for a in args.assets:
         tpl = _costed(templates_for(a)[0], cfg, a)
         validate_instrument(data[a], tpl)
+        if tpl.margin_per_unit > 0 and args.cost_bps > 0:
+            print(f"  NOTE {a}: --cost-bps {args.cost_bps:g} not charged: an instrument with a margin is "
+                  f"costed per unit only ({tpl.cost_per_unit:g} per unit per side)")
         for w in instrument_warnings(tpl):
             print(f"  WARNING {a}: {w}")
     jobs = [(f"{a}|{t.name}", a, t) for a in args.assets for t in templates_for(a)]
@@ -360,25 +338,7 @@ def research(args) -> dict:
     return spec
 
 
-def _parse_instrument_map(items, assets) -> dict:
-    """{'brent': {'point_value': 1000.0, 'cost_per_unit': 15.0, 'margin_per_unit': 3000.0}}
-    from ['brent=1000,15,3000']; the cost and the margin may be left out."""
-    out = {}
-    for item in items or []:
-        asset, _, spec = item.partition("=")
-        if asset not in assets:
-            raise SystemExit(f"--instrument-map {item}: {asset!r} is not in --assets")
-        try:
-            vals = [float(v) for v in spec.split(",")]
-        except ValueError:
-            raise SystemExit(f"--instrument-map {item}: expected ASSET=POINT_VALUE[,COST_PER_UNIT[,MARGIN_PER_UNIT]]")
-        if not 1 <= len(vals) <= 3 or vals[0] <= 0 or any(v < 0 for v in vals):
-            raise SystemExit(f"--instrument-map {item}: expected ASSET=POINT_VALUE[,COST_PER_UNIT[,MARGIN_PER_UNIT]]")
-        # a full instrument: what is left out is a cash share's (no per-unit cost,
-        # no margin), never the run-wide futures settings
-        vals += [0.0] * (3 - len(vals))
-        out[asset] = dict(zip(("point_value", "cost_per_unit", "margin_per_unit"), vals))
-    return out
+_parse_instrument_map = parse_instrument_map   # the one main.py uses too (pipeline.py)
 
 
 def _parse_sides_map(items, assets) -> dict:
@@ -830,9 +790,13 @@ def _slot_signal(slot: dict, df: pd.DataFrame, cfg: dict, live: dict, args,
     # the first fit, then once per test window -- also when the last fit found
     # nothing: the walk-forward keeps such a window flat for all of it
     if mem["fitted_on"] is None or (stale and not args.no_refit):
+        # the in-sample fit is sized on the capital the slot trades, as the
+        # walk-forward sizes each window's fit on the account it carries
+        # (with whole units the contract counts, and so the fit, depend on it)
         fit = refit_params(df, base, param_grid_for(base, wide=cfg["wide_grid"]),
                            train_bars=train, metric=cfg["metric"],
-                           selection=cfg["selection"], anchored=cfg["anchored"])
+                           selection=cfg["selection"], anchored=cfg["anchored"],
+                           initial_equity=equity)
         if fit["params"] is None:
             notes.append(f"{key}: nothing traded enough in-sample to fit -- slot stays flat")
             mem["params"], mem["fitted_on"] = None, str(df.index[-1])
@@ -850,6 +814,7 @@ def _slot_signal(slot: dict, df: pd.DataFrame, cfg: dict, live: dict, args,
         st = dict(slot=key, asset=slot["asset"], template=slot["template_name"],
                   as_of=df.index[-1], last_close=float(df["Close"].iloc[-1]), atr=np.nan,
                   equity_slot=equity, position=None, shares=0.0,
+                  point_value=float(base.point_value), margin_per_unit=float(base.margin_per_unit),
                   entry_price=None, entry_date=None, bars_held=0, unrealized=0.0,
                   n_trades_in_window=0, exit_orders=[], entry_orders=[],
                   blocked_by=["no parameter set could be fitted"], params={},

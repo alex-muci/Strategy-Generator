@@ -25,10 +25,18 @@ python -m venv env  # assuming 3.12 installed
 ./env/Script/Activate
 pip install -r requirements.txt 
 
-python -m unittest discover -s tests -t . -v # 384 tests (engine, order log, templates, hedge learner and its wide ladder, walk-forward, robustness, selection, data, live signals, replay, both entry points, spreads: shift invariance, point value, per-unit costs, margin cap, ruin, whole units, the ETF trick, a mixed cash + spread book)
-# faster (about 1:35 min instead of 4.5): pip install -r requirements-dev.txt, then, with ./env active,
-python -m pytest -n auto --dist loadscope   # same tests in parallel; loadscope keeps a class (and its one-off setup) on one worker
+python -m unittest discover -s tests -t . -v # __N_TESTS__ tests (engine, exit ordering, order log, templates, hedge learner and its wide ladder, walk-forward, robustness, selection, data, live signals, replay, both entry points, spreads: shift invariance, point value, per-unit and roll costs, margin cap, ruin, whole units, the ETF trick, a mixed cash + spread book)
+# faster: pip install -r requirements-dev.txt, then, with ./env active,
+python -m pytest -n auto --dist loadscope   # in parallel; loadscope keeps a class (and its one-off setup) on one worker
+python -m pytest -m slow                    # the minutes-long live-order sweeps pytest skips by default
+python -m pytest -m "slow or not slow"      # everything, as unittest runs it
 ```
+
+Under pytest the `LiveOrderTests` sweeps (`tests/test_live.py`: one real bar
+rolled forward across the template family, the `hedge_wide` templates of its
+sample above all) are marked slow and skipped unless `-m slow` selects them
+(`tests/conftest.py`); they were most of the suite's wall-clock time. `unittest`
+still runs every test.
 
 ## Running it
 
@@ -42,11 +50,36 @@ python main.py --real SPY --start 2005-01-01 --family default --jobs 8
 python main.py --real SPY --start 2005-01-01 --family quick --sides long_only   # one-sided family (an asset with a drift)
 python main.py --real SPY --start 2005-01-01 --family quick --vol-target 0.1  # use vol-target rather than ATR-stop (see Position sizing)
 python main.py --real QQQ --start 2010-01-01 --train 500 --test 125   # rolling window (default): each window re-optimizes on the last 500 bars only
-python main.py --real GC=F --train 750 --test 250 --anchored --selection best --point-value 100 --margin-per-unit 10000 --cost-per-unit 5 --cost-bps 0 --max-leverage 0.5 --whole-units   # anchored: training window expands from bar 0; a future, so a margin (see Cash assets vs futures)
-python main.py --csv brent_backadj.csv --point-value 1000 --margin-per-unit 6000 --cost-per-unit 15 --cost-bps 0 --max-leverage 0.5 --whole-units --vol-target 0.15   # an outright Brent future from a back-adjusted file
-python main.py --csv brent_z25z26.csv --point-value 1000 --margin-per-unit 3000 --cost-per-unit 15 --cost-bps 0 --max-leverage 0.5   # a futures spread from a file (prices through zero; see Futures and spreads)
+python main.py --csv mgc_backadj.csv --train 750 --test 250 --anchored --selection best --point-value 10 --margin-per-unit 1500 --cost-per-unit 1.5 --max-leverage 0.5 --whole-units --vol-target 0.1   # anchored: training window expands from bar 0; micro gold (10 oz) from a back-adjusted file, so a margin (see Cash assets vs futures)
+python main.py --csv brent_backadj.csv --point-value 1000 --margin-per-unit 6000 --cost-per-unit 15 --max-leverage 0.5 --vol-target 0.15   # an outright Brent future from a back-adjusted file, in fractional lots (see the warning below)
+python main.py --csv brent_z25z26.csv --point-value 1000 --margin-per-unit 3000 --cost-per-unit 15 --roll-cost-per-unit 30 --max-leverage 0.5   # a futures spread from a file (prices through zero, a Roll column; see Futures and spreads)
+python main.py --csv brent_z25z26.csv --instrument-map brent_z25z26=1000,15,3000,30 --max-leverage 0.5   # the same instrument, named by the file's stem (the dashboard's syntax)
+python main.py --csv es_1h_backadj.csv --interval 1h --bars-per-day 23 --point-value 5 --margin-per-unit 2500 --cost-per-unit 1.25 --max-leverage 0.5   # hourly bars of a ~23 h future (micro S&P): 23 bars a day, not the 7 of a US equity session
 python main.py --trend-prob 0.8 --trend-drift 0.002  # synthetic data with a KNOWN trend edge
 ```
+
+Two warnings for futures, both learned the hard way:
+
+- **Do not research a future on Yahoo's `--real GC=F`** (or any `=F` ticker).
+  It is an unadjusted splice of successive contracts: every roll is a price gap
+  (contango or backwardation between the expiring and the next contract) that a
+  breakout system trades as if the market had moved, so the gaps become fake
+  breakouts and fake P&L. Use a **back-adjusted** continuous series from your
+  data vendor, or build one (`extra_utils/ETF_trick_spreads.py` for spreads),
+  and load it with `--csv`; give the cost of each roll to the engine with
+  `--roll-cost-per-unit` and a `Roll` column, never inside the prices (see
+  Futures and spreads). The `=F` series are fine for what `futures_map.py`
+  uses them for: today's price of a contract.
+- **`--whole-units` can leave every template flat.** It floors every entry to
+  whole contracts, and on the 100,000 the research sizes on a full-size
+  contract is often less than one. Full-size gold (GC, 100 oz) moving about
+  $30 a day is $3,000 a day per lot; a 10 % vol target on 100,000 wants
+  0.10 / sqrt(252) x 100,000 = $630 a day, i.e. 0.21 lots, floored to **0**,
+  and the 1 % ATR rule (3 ATR stop) wants about 0.1. Brent at a 15 % target is
+  about 0.6 lots. `main.py` prints a warning with the typical size before the
+  run. Trade the micro contract (MGC, 10 oz: about 2 lots at 10 %), raise
+  `--vol-target` / `--risk-pct`, or research in fractional lots (drop
+  `--whole-units`; the live book then rounds what the research did not).
 
 Outputs land in `./outputs/` (or `--out DIR`):
 
@@ -99,8 +132,16 @@ The order log is read out of the engine's own bar loop
 rebuilt from the rules, so it cannot drift from what the engine did. The
 fills follow the engine's conventions: a stop or limit fills at its level, or
 at the open when the bar gapped through it; a `close_confirm` entry and a
-time exit are orders at the open; every stop is already working on the entry
-bar. What the portfolios trade is exactly the trades of their selected
+time exit are orders at the open; every stop, and the target, is already
+working on the entry bar. When the open is already through an exit order it
+fills there first, stop or target alike (the open is the bar's first price):
+a long whose target is 105 and whose next bar opens at 110 exits at 110 even
+if that bar later trades through the stop. Only when a stop and a target are
+both reached *inside* a bar, whose path is unknown, does the stop go first. On
+the entry bar the target is taken when the bar's prices beyond the fill
+certainly came after it: a fill at the open, or a stop entry (price ran up
+through a buy stop, so a higher high is later). A limit entry's bar is
+ambiguous (its high may come before the fill) and its target waits a bar. What the portfolios trade is exactly the trades of their selected
 templates in the windows they were selected for, scaled by the weights: a
 nested period is one walk-forward window, so its trades are those windows'.
 
@@ -139,7 +180,11 @@ daily bar counts as closed 15 minutes after the 16:00 New York bell
 bars, so the European morning works as well.
 
 Add `--interval 1h` to both phases for hourly bars; every annualized statistic
-follows the bar frequency (`strategy.BARS_PER_YEAR`).
+follows the bar frequency (`strategy.BARS_PER_YEAR`). Its intraday counts are a
+US equity session's (6.5 h: seven `1h` bars a day). A future trading about 23
+hours a day has 23 of them: give research `--bars-per-day 23` (annualized at
+252 x 23 bars a year; the signals phase reads it back from `portfolio.json`).
+At 7 a day its Sharpe ratios would read sqrt(23/7), about 1.8 times too low.
 
 What the dashboard shows, in the order you need it:
 
@@ -422,6 +467,63 @@ wants. Two things keep a strategy's realized vol below the target: time
 spent flat, and the leverage cap, which binds all the time on a quiet
 asset (a 15 % target on a 5 % vol asset asks for 3x).
 
+### Capital from window to window
+
+The walk-forward is **one account traded forward**. Each window, its
+in-sample fit and its out-of-sample run, is sized on the equity the previous
+out-of-sample window ended with, not on a fresh 100,000
+(`walkforward.walk_forward`; each window's `initial_equity` is recorded in
+`run.json` and the replay uses it).
+
+- **Why.** The report compounds the windows' returns into one equity curve,
+  but every window used to be funded with 100,000 whatever that curve said:
+  after the account fell to 92,435 the next window still traded 100,000's
+  contracts, and after a total loss the next window restarted on a fresh
+  100,000, the curve of an account nobody has.
+- **Fractional units: nothing changes.** Every size (`risk_pct` of equity at
+  the stop, or a vol target on equity), the leverage cap and every cost are
+  linear in the equity, so a window's returns are the same on any capital
+  (`tests/test_walkforward.py::OneAccountTests`, to 1e-12).
+- **Whole units: the counts follow the account.** On 92,435 a 1.04-lot entry
+  floors to 0, on 100,000 to 1. One lot is also a larger share of a smaller
+  account, so the risk per trade drifts up as equity falls until the floor
+  sends it to zero. That is what a small futures account is, and the
+  research now shows it instead of hiding it behind a fresh 100,000.
+- **Ruin ends it.** An account at or below zero (a deficit included, see
+  Ruin) is closed: every later window is flat and marked `ruined`.
+
+**Should the size grow when the account grows?** The sizing rules already say
+yes: a fraction of *current* equity (fixed-fractional, "anti-martingale").
+That is the rule growth-optimal betting gives (Kelly 1956; Breiman 1961;
+Thorp, "The Kelly Criterion in Blackjack, Sports Betting and the Stock
+Market"): a constant fraction of current wealth maximizes long-run growth,
+and a fraction below Kelly's trades growth for smaller drawdowns. It is also
+the only rule under which per-bar returns are stationary, so a Sharpe ratio
+of the compounded curve means something. Vince ("The Mathematics of Money
+Management") shows the cost of overdoing it: above the optimal fraction,
+risking more as you win raises drawdowns without raising growth. Two
+deliberate departures are common and both are fine, as long as the report
+says which one was run:
+
+- **Fixed capital**: size on a constant capital and sweep the profits. Risk
+  then *rises* as a share of equity after losses, the opposite of what you
+  want, and the P&L is additive. `backtest(..., fixed_capital=True)` is this
+  account; CPCV uses it to measure a rule's edge without an account's path
+  (see below).
+- **Half compounding** (Rob Carver, [Capital correction
+  (pysystemtrade)](https://qoppac.blogspot.com/2016/06/capital-correction-pysystemtrade.html)):
+  losses reduce the capital you size on, gains only restore it up to the
+  starting capital, and profits above the high-water mark are taken out
+  rather than risked. The maximum loss is the starting capital and the upside
+  is not leveraged up. If the honest answer to "shall I really risk more?" is
+  no, this is the policy, applied by withdrawing profits from the live
+  account; Ryan Jones' "fixed ratio" sizing is a slower-than-proportional
+  middle way.
+
+What no policy fixes is the floor: with whole contracts the fraction is
+quantized, so a small account cannot cut its risk below one contract. The
+warning under "Running it" and `main.py`'s pre-run check are about that.
+
 ### Cash assets vs futures and spreads
 
 The engine runs two kinds of instrument, and **`--margin-per-unit` is the
@@ -430,9 +532,9 @@ and the series is a future (or a futures spread).
 
 | | cash asset (SPY, QQQ, GLD, a stock) | future or spread (Brent, ES, a calendar spread) |
 |---|---|---|
-| how to run it | `--real SPY` (defaults) | `--point-value`, **`--margin-per-unit`**, `--cost-per-unit`, `--cost-bps 0`, `--whole-units` |
+| how to run it | `--real SPY` (defaults) | `--csv` (back-adjusted), `--point-value`, **`--margin-per-unit`**, `--cost-per-unit`, `--roll-cost-per-unit`, `--whole-units` |
 | a unit | one share (`--point-value 1`) | one lot (`--point-value 1000` for Brent: $1000 per $1/bbl) |
-| costs | `--cost-bps` of the traded notional | `--cost-per-unit` per lot per side |
+| costs | `--cost-bps` of the traded notional | `--cost-per-unit` per lot per side (`--cost-bps` is not charged), `--roll-cost-per-unit` per lot held through a roll |
 | leverage cap (`--max-leverage`) | on **notional**: units x price / equity (2 = 2x long the index) | on **margin**: lots x margin / equity (0.5 = half the account posted as margin) |
 | vol-target sizing | on **% returns** (pct vol x price) | on **price changes** (point vol x point value) |
 | `vr` regime filter (variance ratio) | on **log returns** | on **price changes** |
@@ -497,18 +599,22 @@ price level -- the leverage cap, the volatility-target size and the costs
 | flag | meaning | Brent spread example |
 |---|---|---|
 | `--point-value` | currency per 1.0 of price per unit (lot) | 1000 (1000 bbl) |
-| `--cost-per-unit` | commission + slippage per unit per side, in currency | 15 (a tick plus commission), with `--cost-bps 0` |
+| `--cost-per-unit` | commission + slippage per unit per side, in currency | 15 (a tick plus commission) |
 | `--margin-per-unit` | initial margin per unit, the leverage cap's basis | 3000 (check the exchange) |
-| `--whole-units` | floor every size to whole contracts; below one, nothing opens | on, for any future |
+| `--roll-cost-per-unit` | currency per unit held through a roll (needs a `Roll` column) | 30 (0.03 points of slippage on the roll) |
+| `--whole-units` | floor every size to whole contracts; below one, nothing opens | on, for any future (but see the warning under Running it) |
 
-Give all four for **any future**, not only a spread (the margin is what
+Give them for **any future**, not only a spread (the margin is what
 makes the engine treat the series as a future): a back-adjusted
 continuous contract has positive prices at an artificial level, so a cost in
 basis points of that price and a cap on its notional are both arbitrary
-(both entry points warn when a point value comes without a margin or with
-bps costs). `--cost-bps` is a fraction of a notional a spread does not have,
-so a series with a price at or below zero is refused unless
-`--margin-per-unit` is given and `--cost-bps` is 0
+(both entry points warn when a point value comes without a margin). An
+instrument with a margin is therefore costed **per unit only**: its
+`--cost-bps` is not charged (both entry points print a note when one was
+given, the default 5 included), the same rule for `main.py`, for a run-wide
+margin in the dashboard and for a mapped asset (`pipeline.instrument_of`).
+Called directly, the engine still refuses a series with a price at or below
+zero unless it has a margin and `cost_bps` is 0
 (`strategy.validate_instrument`, run by both entry points before any window,
 and by every `backtest` call). A share cannot trade at or below zero:
 `load_yfinance` drops such a bar as a bad print, except on a `--real`
@@ -526,33 +632,62 @@ small slot can floor to 0 where the research traded one lot.
 
 **Ruin.** A close that leaves the equity at or below zero (a gap through the
 stop beyond the margin) liquidates the position at that close (trade reason
-`ruin`), floors the cash at zero and ends the run flat: one -100 % bar, then
-0, never a negative equity whose returns flip sign. A margined future makes
-this reachable, which is why `--max-leverage` should be 0.5 or less in
-margin terms.
+`ruin`) and closes the account: nothing trades after it, and the equity
+stays at what the liquidation left. When the loss went beyond the cash that
+is a **deficit**, and it is kept: a futures account owes it to the broker
+(16.7 Brent lots gapping 10 points lose $166,667 on $100,000, and the
+equity reads -$66,667, a -167 % bar, not 0 and -100 %). Every later bar
+returns 0 (never a ratio of non-positive equities, whose sign would flip),
+compounded curves stop at the deficit (`strategy.compound`), and a portfolio
+that held the slot loses its weight times 167 %, not times 100 %, so the
+portfolio's tail is not understated. The walk-forward does not re-fund a
+ruined account: every later window is flat (see "Capital from window to
+window" below). A margined future makes this reachable, which is why
+`--max-leverage` should be 0.5 or less in margin terms.
 
 The data comes from a file: `--csv PATH`, the first column the date, then
-`Open High Low Close [Volume]` in any case. Rows whose four prices are all
-exactly 0 (a vendor's no-trade day) are dropped; a real 0.00 close is kept.
+`Open High Low Close [Volume] [Roll]` in any case. Rows whose four prices are all
+exactly 0 (a vendor's no-trade day) are dropped (a roll on such a row moves to
+the bar before it); a real 0.00 close is kept.
 One listed spread has a year or two of liquid history, not enough for a
 walk-forward, so stitch successive spreads (Z24-Z25, Z25-Z26, ...) with the
 ETF trick in `extra_utils/ETF_trick_spreads.py`, run **in points**:
-`point_value=1, contracts=1, side=+1, k0=0`, `roll_cost` in points. The
+`point_value=1, contracts=1, side=+1, k0=0` and **`roll_cost=0`**. The
 output is then the listed spread itself between rolls, shifted by a
-constant (which does not matter), with each roll's gap and cost folded in;
-give the multiplier to the engine once, as `--point-value`, and let the
+constant (which does not matter), with each roll's gap folded in, and a
+`Roll` column marking the bar at whose close the held spread changed; give
+the multiplier to the engine once, as `--point-value`, and let the
 engine take the short side itself. Use settlements as the close when the
 vendor has them, and confirm the sign convention (front minus back) before
 reading a `long` as a bet on backwardation.
+
+**Roll costs go to the position, not into the price.** A cost folded into
+the series (the trick's `roll_cost`) is a price move: it lowers the series,
+which is a loss to a long and a **gain to a short**. With unchanged spreads
+and a one-point roll cost at $1,000 a point, a long lot loses $1,000 and a
+short lot *makes* $1,000 from paying the roll. Execution costs are charged to
+actual holdings: write the series with `roll_cost=0` and its `Roll` column,
+and pass `--roll-cost-per-unit` (currency per lot per roll, `30` for 0.03
+points on a $1,000-a-point spread). The engine charges it to whatever is held
+through a `Roll` bar's close, long or short (`strategy._bar_loop`; the
+order log records it as a `roll` event). `tests/test_etf_trick.py` shows both:
+the long and the short of the same bars pay the roll once each, and the
+folded version hands the short the long's cost. The same applies to any
+back-adjusted future of your own: mark its roll dates.
 
 The benchmark of such a run is not buy and hold (a spread has no return,
 and the percentage change of a back-adjusted future's level is not the
 contract's return): for a series that touches zero, or any run with
 `--margin-per-unit`, it is the P&L of **holding one unit** on the initial
 equity, an additive curve (summed, never compounded) on an arbitrary scale.
-Its Sharpe, beta, correlation and information ratio are scale-free and read
-as before; its CAGR column is the simple annual P&L and its drawdown the
-deepest fall from a peak, both as fractions of the initial equity. A
+Its Sharpe, the correlation to it and the information ratio are scale-free
+and read as before. The **beta is not**: the benchmark's return is point
+value x price change / initial equity, so the beta scales with 1 / point
+value (and with the initial equity). Read it as the number of units the
+portfolio behaves like it holds on that equity (a beta of 2 is two lots'
+exposure on average, not twice the market's). Its CAGR column is the simple
+annual P&L and its drawdown the deepest fall from a peak, both as fractions
+of the initial equity. A
 calendar spread that stays positive over the whole sample and is run
 without a margin still gets a percentage buy and hold: give the margin.
 The walk-forward's exposure statistics measure a unit in margin when one is
@@ -560,8 +695,11 @@ given, else in notional at |price|, and sign it by the side.
 
 **The dashboard.** `etf_dashboard.py research` takes a CSV file among its
 `--assets` (named by its file stem, reloaded from the same path by
-`signals`) and a per-asset instrument with `--instrument-map`, so a book can
-mix shares and a spread:
+`signals`) and a per-asset instrument with `--instrument-map
+ASSET=POINT_VALUE[,COST_PER_UNIT[,MARGIN_PER_UNIT[,ROLL_COST_PER_UNIT]]]`, so a
+book can mix shares and a spread (`main.py` takes the same flag for its one
+asset, the ticker or the CSV's stem: both entry points build their research
+flags with one function, `pipeline.add_research_args`):
 
 ```bash
 python etf_dashboard.py research --assets SPY TLT brent_z25z26.csv \
@@ -963,7 +1101,8 @@ the 72 templates of the `quick` family, once as noise and once with
 `--trend-prob 0.8 --trend-drift 0.002`) and is deliberately NOT changed. 
 They are listed with the number that would justify reopening each one.
 
-- **Every walk-forward window starts flat.** A position still open at the
+- **Every walk-forward window starts flat** (on the account's equity, carried
+  from the window before: see "Capital from window to window"). A position still open at the
   end of test window N is marked to market on its last bar and is gone in
   window N+1, which waits for a new signal (about 40 % of windows end
   with a position open). This is the price of the `first_trade_bar` rule
@@ -994,7 +1133,17 @@ They are listed with the number that would justify reopening each one.
   across templates; it mostly changed results by shrinking the training
   set. The default stays at 0. CSCV cannot be purged by construction;
   its blocks (T/16 bars) are long next to a trade and PBO is a rank
-  statistic with every trial treated alike.
+  statistic with every trial treated alike. The trials matrix is run on
+  **fixed capital** (`trial_returns`: every entry sized on the same 100,000,
+  every return P&L over it, ruin off). On a compounding account a test
+  block's P&L changes every later size, and with `--whole-units` every later
+  contract count, indefinitely: changing one price inside a test block moved
+  over a hundred training returns far past the embargo without ruining
+  either run. At fixed capital a return depends on its own trade's prices
+  only, so the embargo covers every way a test bar reaches training
+  (`tests/test_selection.py`, the whole-units test, shows the compounding
+  run leaking on the same fixture and the fixed one not). CPCV's training
+  records and paths are then summed, not compounded (`cpcv(..., additive=True)`).
 - **`adx()` seeds Wilder's smoothing with the first observation**, not
   with the SMA of the first n as charting platforms do. The two differ
   only while the seed is remembered, and `warmup_bars` already keeps the

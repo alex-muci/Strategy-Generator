@@ -112,6 +112,9 @@ def _window_record(w: dict) -> dict:
         test_start=w["test_start"], test_end=w["test_end"],
         params=w.get("params"), skipped=bool(w.get("skipped", False)),
         n_trades=int(stats.get("n_trades", 0)),
+        # the walk-forward sizes each window on the equity the previous one
+        # ended with (one account, carried forward): the replay must too
+        initial_equity=w.get("initial_equity"),
     )
 
 
@@ -262,8 +265,10 @@ def _jobs_for(run: dict, pairs: list, log_orders: bool) -> list:
         if w["skipped"]:
             continue
         i0, i1 = _window_slice(df, w)
+        # a run saved before the walk-forward carried its equity sized every window on the same capital
+        eq0 = w.get("initial_equity")
         jobs.append((name, k, m["templates"][name]["template"], w["params"], i0, i1,
-                     float(m["initial_equity"]), log_orders))
+                     float(m["initial_equity"] if eq0 is None else eq0), log_orders))
     return jobs
 
 

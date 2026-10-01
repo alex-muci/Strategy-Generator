@@ -671,9 +671,13 @@ class SpreadBookTests(unittest.TestCase):
         neg.to_csv(cls.csv, float_format="%.17g")
         cls.common = ["--family", "quick", "--max-templates", "4", "--bars", "1100", "--train", "300", "--test", "100",
                       "--jobs", "1", "--n-boot", "100", "--min-sharpe", "-5"]
-        # the spread alone: at least its best slot is selected, so signals run on it
+        # the spread alone: at least its best slot is selected, so signals run on it. Sized well
+        # above one lot: the walk-forward carries the account's equity from window to window,
+        # and at 5 % a typical entry is ~1.04 lots on 100,000 -- one losing window and it floors
+        # to 0 (whole units do not scale down), which is the account's reality, not this test's.
+        # At 20 % the slot selected is one the signals phase can fit, so it publishes orders
         ED.main(["research", "--synthetic", "--assets", cls.csv, "--instrument-map", "brent_z25z26=1000,15,3000",
-                 "--max-leverage", "0.5", "--whole-units", "--risk-pct", "0.05"] + cls.common + ["--state-dir", cls.dir])
+                 "--max-leverage", "0.5", "--whole-units", "--risk-pct", "0.2"] + cls.common + ["--state-dir", cls.dir])
         cls.out = ED.main(SIGNALS + [cls.dir, "--max-gross", "0.4"])
         with open(os.path.join(cls.dir, "portfolio.json")) as f:
             cls.spec = json.load(f)
@@ -742,7 +746,9 @@ class SpreadBookTests(unittest.TestCase):
         self.assertNotIn("Infinity", open(os.path.join(self.mixed_dir, "portfolio.json")).read())
 
     def test_a_bad_instrument_map_is_an_error(self):
-        for item in ("nope=1000", "AAA=abc", "AAA=0", "AAA=1,2,3,4"):
+        # four fields are a full instrument (the fourth is the roll cost per unit), five are not
+        self.assertEqual(ED._parse_instrument_map(["AAA=1,2,3,4"], ["AAA"])["AAA"]["roll_cost_per_unit"], 4.0)
+        for item in ("nope=1000", "AAA=abc", "AAA=0", "AAA=1,2,3,4,5", "AAA=1,-2"):
             with self.assertRaises(SystemExit):
                 ED.main(["research", "--synthetic", "--assets", "AAA", "--instrument-map", item,
                          "--family", "quick", "--max-templates", "1", "--bars", "600", "--train", "300",

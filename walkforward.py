@@ -35,7 +35,7 @@ import numpy as np
 import pandas as pd
 
 from strategy import (
-    backtest, annualized_sharpe, max_drawdown, periods_per_year, performance_stats, REGIME_INDICATORS,
+    backtest, annualized_sharpe, max_drawdown, periods_per_year, performance_stats, REGIME_INDICATORS, compound,
     hedge_warmup,
     hedge_ladder_for,
     HEDGE_CHANNELS,
@@ -297,11 +297,25 @@ def walk_forward(
 ) -> dict:
     """Walk-forward optimization of `tpl` over `df`.
 
+    The windows are ONE account traded forward: each window (its in-sample
+    fit and its out-of-sample run) is sized on the equity the previous
+    out-of-sample window ended with, not on a fresh `initial_equity`. Sizes
+    are fractions of that equity (fixed-fractional: risk_pct of it at the
+    stop, or a vol target on it), so a gain is traded with proportionally
+    more and a loss with proportionally less. With fractional units that
+    changes no return at all (every size, cap and cost is linear in the
+    equity); with whole units it is what makes the contract counts the ones
+    the compounded curve implies. An account at or below zero is closed:
+    every later window is flat (`ruined`), never re-funded.
+
     Returns dict with:
       oos_returns : pd.Series of per-bar OOS returns (0 on bars of windows
-                    that could not be optimized -- flat, not missing)
-      oos_equity  : pd.Series, stitched OOS equity (compounded from returns)
-      windows     : list of per-window dicts (dates, chosen params, IS/OOS stats)
+                    that could not be optimized -- flat, not missing -- and
+                    after a ruin)
+      oos_equity  : pd.Series, stitched OOS equity (compounded from returns,
+                    `strategy.compound`: the account's own equity)
+      windows     : list of per-window dicts (dates, chosen params, IS/OOS
+                    stats, `initial_equity` the window was sized on)
       boundaries  : list of test-window start dates (for nested selection)
       summary     : robustness summary incl. Pardo's WFE and criteria
       template    : tpl
@@ -312,6 +326,7 @@ def walk_forward(
     oos_ret_parts = []
     boundaries = []
     prev_params = None
+    equity = float(initial_equity)   # the account, carried from window to window
 
     test_start = train_bars + embargo_bars
     while test_start < n:
@@ -321,9 +336,23 @@ def walk_forward(
         train_end = test_start - embargo_bars
         train_start = 0 if anchored else max(0, train_end - train_bars)
 
-        # ---- optimize on the training window ----
+        if equity <= 0.0:
+            # the account was closed out (a deficit, or exactly nothing left):
+            # nothing is funded again, every later window is flat
+            boundaries.append(df.index[test_start])
+            oos_ret_parts.append(pd.Series(0.0, index=df.index[test_start:test_end]))
+            windows.append(dict(
+                train_start=df.index[train_start], train_end=df.index[train_end - 1],
+                test_start=df.index[test_start], test_end=df.index[test_end - 1],
+                params=None, is_stats=None, oos_stats=None, skipped=True, ruined=True,
+                initial_equity=equity,
+            ))
+            test_start += test_bars
+            continue
+
+        # ---- optimize on the training window, sized on today's account ----
         opt = optimize_window(df, tpl, combos, idx, train_start, train_end, metric=metric,
-                              selection=selection, min_trades=min_trades, initial_equity=initial_equity)
+                              selection=selection, min_trades=min_trades, initial_equity=equity)
         best, scores, stats_list = opt["best"], opt["scores"], opt["stats"]
         train_start = opt["start"]  # report the bars that were scored (see optimize_window)
 
@@ -336,7 +365,7 @@ def walk_forward(
             windows.append(dict(
                 train_start=df.index[train_start], train_end=df.index[train_end - 1],
                 test_start=df.index[test_start], test_end=df.index[test_end - 1],
-                params=None, is_stats=None, oos_stats=None, skipped=True,
+                params=None, is_stats=None, oos_stats=None, skipped=True, initial_equity=equity,
             ))
             test_start += test_bars
             continue
@@ -346,9 +375,11 @@ def walk_forward(
 
         # ---- apply OOS: indicators warmed up before the window, first trade
         # no earlier than its first bar (see window_backtest) ----
-        oos_res = window_backtest(df, chosen, test_start, test_end, initial_equity=initial_equity)
+        window_equity = equity
+        oos_res = window_backtest(df, chosen, test_start, test_end, initial_equity=window_equity)
         oos_rets = oos_res["returns"]
         oos_ret_parts.append(oos_rets)
+        equity = float(oos_res["equity"].iloc[-1])   # what the next window is sized on
 
         oos_stats = dict(
             total_return=float((1 + oos_rets).prod() - 1),
@@ -366,7 +397,7 @@ def walk_forward(
             train_start=df.index[train_start], train_end=df.index[train_end - 1],
             test_start=df.index[test_start], test_end=df.index[test_end - 1],
             params=chosen_params, is_stats=is_stats, oos_stats=oos_stats, skipped=False,
-            is_score=float(scores[best]),
+            initial_equity=window_equity, is_score=float(scores[best]),
             params_changed=(prev_params is not None and chosen_params != prev_params),
             wfe=float(np.clip(oos_ann / is_ann, -10, 10)) if is_ann > 0 else np.nan,
         ))
@@ -379,7 +410,8 @@ def walk_forward(
     else:
         oos_returns = pd.Series(dtype=float)
 
-    oos_equity = initial_equity * (1 + oos_returns).cumprod() if len(oos_returns) else pd.Series(dtype=float)
+    oos_equity = (pd.Series(initial_equity * compound(oos_returns.to_numpy()), index=oos_returns.index)
+                  if len(oos_returns) else pd.Series(dtype=float))
     summary = summarize_walk_forward(windows, oos_returns)
     return {
         "oos_returns": oos_returns,
@@ -401,7 +433,7 @@ def summarize_walk_forward(windows: list, oos_returns: pd.Series) -> dict:
                     oos_is_sharpe_ratio=np.nan, n_trades_oos=0, pardo_pass=False,
                     oos_exposure=0.0, oos_notional=0.0, oos_avg_net_exposure=0.0)
 
-    eq = (1 + oos_returns).cumprod()
+    eq = pd.Series(compound(oos_returns.to_numpy()), index=oos_returns.index)
     total = float(eq.iloc[-1] - 1)
     n_bars = len(oos_returns)
     cagr = float(eq.iloc[-1] ** (periods_per_year() / n_bars) - 1) if eq.iloc[-1] > 0 else -1.0
