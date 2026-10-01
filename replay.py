@@ -56,6 +56,7 @@ import pandas as pd
 import pipeline
 from data import synthetic_ohlc
 from pipeline import worker_pool, pool_map
+from portfolio import close_after_ruin
 from strategy import StrategyTemplate, annualized_sharpe, set_periods_per_year
 from walkforward import window_backtest
 
@@ -110,7 +111,7 @@ def _window_record(w: dict) -> dict:
     return dict(
         train_start=w["train_start"], train_end=w["train_end"],
         test_start=w["test_start"], test_end=w["test_end"],
-        params=w.get("params"), skipped=bool(w.get("skipped", False)),
+        params=w.get("params"), skipped=bool(w.get("skipped", False)), ruined=bool(w.get("ruined", False)),
         n_trades=int(stats.get("n_trades", 0)),
         # the walk-forward sizes each window on the equity the previous one
         # ended with (one account, carried forward): the replay must too
@@ -420,7 +421,11 @@ def replay_target(run: dict, which: str, pool=None, *, template: str | None = No
                 names.append(n)
             parts.append(block)
         stored = stored_port["nested"].dropna() if "nested" in stored_port else pd.Series(dtype=float)
-        res = dict(which=which, names=list(dict.fromkeys(names)), returns=_stitch(parts), stored=stored,
+        # the book is closed once its curve reaches zero or below, as the
+        # research closed it (portfolio.close_after_ruin): the bars after that
+        # within the period are 0, whatever the selected templates earned
+        res = dict(which=which, names=list(dict.fromkeys(names)), returns=close_after_ruin(_stitch(parts)),
+                   stored=stored,
                    trades=_concat(trades), orders=_concat(orders), windows=checks,
                    sharpe_stored=m["nested"]["sharpe"], n_trades_stored=n_stored)
     else:

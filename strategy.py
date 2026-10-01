@@ -1900,23 +1900,31 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
                 m = _olog(o_i, o_f, m, i, _O_STOP_WORKING, position, sb_kind, sb_level, shares, 0.0)
                 if sb_tgt:
                     m = _olog(o_i, o_f, m, i, _O_TARGET_WORKING, position, 0, tgt, shares, 0.0)
-            hit = (position == 1 and low[i] <= sb_level) or (position == -1 and high[i] >= sb_level)
             # every price beyond the fill on the target's side is later than
             # the fill: a fill at the open, or a stop entry (fill_type 1),
             # whose price ran through the level in the trade's direction
             after_fill = fill_px == open_[i] or fill_type == 1
-            tgt_hit = (sb_tgt and after_fill and not hit
+            # the same order as on any later bar (the fill is this bar's
+            # "open" for the position): an order the fill is already through
+            # goes out at the fill, the stop first; then intrabar, the stop
+            # first, then the target
+            stop_at_fill = (position == 1 and fill_px <= sb_level) or (position == -1 and fill_px >= sb_level)
+            tgt_at_fill = (sb_tgt and after_fill
+                           and ((position == 1 and fill_px >= tgt) or (position == -1 and fill_px <= tgt)))
+            hit = (position == 1 and low[i] <= sb_level) or (position == -1 and high[i] >= sb_level)
+            tgt_hit = (sb_tgt and after_fill
                        and ((position == 1 and high[i] >= tgt) or (position == -1 and low[i] <= tgt)))
-            if tgt_hit:
-                # a limit at the target (marketable at once if it sits on the
-                # wrong side of the fill: then it fills at the fill)
-                sb_level = max(fill_px, tgt) if position == 1 else min(fill_px, tgt)
+            if stop_at_fill:
+                sb_px = fill_px
+            elif tgt_at_fill:
+                sb_px = fill_px
                 sb_reason = 3 if exit_style == 2 else 2
-            if hit or tgt_hit:
-                if hit:
-                    sb_px = min(fill_px, sb_level) if position == 1 else max(fill_px, sb_level)
-                else:
-                    sb_px = sb_level
+            elif hit:
+                sb_px = sb_level
+            elif tgt_hit:
+                sb_px = tgt
+                sb_reason = 3 if exit_style == 2 else 2
+            if stop_at_fill or tgt_at_fill or hit or tgt_hit:
                 gross = position * shares * point_value * (sb_px - entry_price)
                 xcost = cost_rate * shares * point_value * abs(sb_px) + cost_per_unit * shares
                 cash += gross - xcost

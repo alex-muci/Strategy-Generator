@@ -123,6 +123,12 @@ def load_csv(path: str, interval: str = "1d", min_bars: int = 200, drop_no_trade
     df["Volume"] = pd.to_numeric(raw[by_name["volume"]], errors="coerce") if "volume" in by_name else np.nan
     if "roll" in by_name:
         df["Roll"] = _roll_flags(raw[by_name["roll"]], path)
+    # in time order first (a file can be newest-first), then one print per
+    # stamp (the last), a roll on any of the duplicates kept with it
+    df = df.set_axis(_naive_index(df.index, interval)).sort_index(kind="stable")
+    if "Roll" in df.columns:
+        df["Roll"] = df["Roll"].groupby(level=0).transform("max")
+    df = df[~df.index.duplicated(keep="last")]
     prices = df[["Open", "High", "Low", "Close"]]
     keep = prices.notna().all(axis=1)
     if drop_no_trade_rows:
@@ -132,8 +138,6 @@ def load_csv(path: str, interval: str = "1d", min_bars: int = 200, drop_no_trade
         # moves to the last kept bar before it, whose close the position held
         df["Roll"] = align_rolls(df["Roll"], df.index[keep])
     df = df[keep]
-    df = df.set_axis(_naive_index(df.index, interval))
-    df = df[~df.index.duplicated(keep="last")].sort_index()
     if len(df) < min_bars:
         raise ValueError(f"{path!r}: only {len(df)} usable bars, need at least {min_bars}.")
     df.index.name = "Date"

@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 import sys
 import unittest
+import numpy as np
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -655,6 +656,40 @@ class BracketTargetTests(unittest.TestCase):
             for o in strategy_state(df.iloc[:t], plain, lookback_bars=LOOKBACK)["entry_orders"]:
                 self.assertFalse({"target", "target_offset"} & set(o))
         self.assertGreater(seen, 0)
+
+
+class FlatAssetTradeListTests(unittest.TestCase):
+    def test_an_asset_the_book_is_flat_in_is_still_priced(self):
+        by_asset = pd.DataFrame(columns=["shares", "price", "point_value", "basis", "notional", "pct_of_account"])
+        t = trade_list(by_asset, {"SPY": 50.0, "spread": -1.0}, prices={"SPY": (400.0, 1.0), "spread": (-1.5, 1000.0)})
+        self.assertEqual(list(t["action"]), ["SELL", "BUY"])
+        self.assertAlmostEqual(float(t.loc["SPY", "order_notional"]), 50 * 400.0)
+        self.assertAlmostEqual(float(t.loc["spread", "order_notional"]), 1.5 * 1000.0)
+        self.assertTrue(np.isnan(trade_list(by_asset, {"X": 1.0}).loc["X", "order_notional"]))
+
+
+class DeadAtrExitLevelTests(unittest.TestCase):
+    def test_the_published_trail_uses_the_atr_the_engine_manages_with(self):
+        """A flat patch drives the ATR to 0 while a chandelier position is
+        open: the engine keeps managing it with the last usable ATR, so the
+        published stop is 3 of THOSE ATRs below the high, not a stop sitting
+        on the high itself."""
+        n = 80
+        o = np.full(n, 100.0); h = o + 1.0; l = o - 1.0; c = o.copy()
+        for i in range(40, 60):                              # a trend: long at the 20-bar high, extreme 119
+            o[i] = c[i] = 100.0 + (i - 39); h[i] = o[i] + 1.0; l[i] = o[i] - 1.0
+        o[60:] = h[60:] = l[60:] = c[60:] = 121.0            # then pinned at the extreme: TR 0, ATR(5) 0
+        df = pd.DataFrame({"Open": o, "High": h, "Low": l, "Close": c}, index=pd.bdate_range("2025-01-01", periods=n))
+        tpl = StrategyTemplate("t", exit_style="atr_trail", n_entry=20, atr_n=5, atr_mult_trail=3.0,
+                               atr_mult_stop=100.0, cost_bps=0.0, sides="long_only")
+        st = strategy_state(df, tpl, equity=100_000.0, lookback_bars=70)
+        self.assertEqual(st["position"], 1)
+        self.assertEqual(st["atr"], 0.0)
+        stop = next(x for x in st["exit_orders"] if x["kind"] == "stop")
+        res = backtest(df.iloc[-70:], tpl, initial_equity=100_000.0)
+        self.assertGreater(res["last_atr"], 0.0)
+        self.assertAlmostEqual(stop["level"], res["open_position"]["trail_extreme"] - 3.0 * res["last_atr"])
+        self.assertLess(stop["level"], 121.0)
 
 
 if __name__ == "__main__":

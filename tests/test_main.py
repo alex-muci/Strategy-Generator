@@ -842,3 +842,39 @@ class TypicalUnitsTests(unittest.TestCase):
         self.assertLess(S.typical_units(df, lot), 1.0)
         self.assertAlmostEqual(S.typical_units(df, tpl.with_params(max_leverage=0.01)),
                                0.01 * 100_000 / float(np.nanmedian(df["Close"])))
+
+
+class PortfolioRuinReplayTests(unittest.TestCase):
+    """A slot selected at full weight goes to a deficit: the nested book is
+    closed at that bar (portfolio.close_after_ruin), the selection log stops
+    picking, and the replay reproduces the closed series exactly."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.dir = tempfile.mkdtemp()
+        df = synthetic_ohlc(1500, seed=7)
+        cols = [df.columns.get_loc(c) for c in ("Open", "High", "Low", "Close")]
+        df.iloc[1030:, cols] *= 0.45                           # a 55 % gap, beyond any margin
+        cls.csv = os.path.join(cls.dir, "crash.csv")
+        df.to_csv(cls.csv, float_format="%.17g")
+        cls.out = _main(["--csv", cls.csv, "--family", "quick", "--max-templates", "12", "--sides", "long_only",
+                         "--train", "400", "--test", "100", "--n-boot", "50", "--jobs", "1", "--no-matrix",
+                         "--max-leverage", "10", "--risk-pct", "0.3", "--min-sharpe", "-2", "--replay", "all",
+                         "--out", cls.dir])
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.dir, ignore_errors=True)
+
+    def test_the_book_is_closed_and_the_replay_matches(self):
+        nested = self.out["nested"]
+        eq = nested["portfolio_equity"].to_numpy()
+        dead = np.flatnonzero(eq <= 0.0)
+        self.assertGreater(len(dead), 0, "the fixture never ruins the nested book")
+        self.assertTrue((nested["portfolio_returns"].to_numpy()[dead[0] + 1:] == 0.0).all())
+        later = [s for s in nested["selections"] if s["period_start"] > nested["portfolio_equity"].index[dead[0]]]
+        self.assertGreater(len(later), 0)
+        self.assertTrue(all(s["selected"] == [] and s.get("ruined") for s in later))
+        for which in ("best", "static", "nested"):
+            check = self.out["replay"][which]["check"]
+            self.assertTrue(check["ok"], (which, check))

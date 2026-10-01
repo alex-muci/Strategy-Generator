@@ -236,9 +236,12 @@ def costs_text(c: dict, assets=None) -> str:
     every asset pays the same, else per asset (a margined one pays 0)."""
     assets = list(assets) if assets else [None]
     bps = {a: cost_bps_of(c, a) for a in assets}
+
+    def one(v):
+        return f"{v:g} bps/side" if v > 0 else "per unit only"
     if len(set(bps.values())) == 1:
-        return f"{next(iter(bps.values())):g} bps/side"
-    return "bps/side " + ", ".join(f"{a} {v:g}" for a, v in bps.items())
+        return one(next(iter(bps.values())))
+    return ", ".join(f"{a} {one(v)}" for a, v in bps.items())
 
 
 def instrument_text(c: dict, asset: str | None = None) -> str:

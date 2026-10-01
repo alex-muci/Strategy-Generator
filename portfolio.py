@@ -279,6 +279,13 @@ def walk_forward_portfolio(
         hist = rets.loc[: start - pd.Timedelta(nanoseconds=1)]
         if len(hist) < 60:
             continue
+        block = rets.loc[start:end] if end is None else rets.loc[start: end - pd.Timedelta(nanoseconds=1)]
+        if parts and compound(pd.concat(parts).to_numpy())[-1] <= 0.0:
+            # the book went to zero or below in an earlier period: it is closed
+            # (close_after_ruin), nothing is selected again
+            parts.append(pd.Series(0.0, index=block.index))
+            log.append(dict(period_start=start, selected=[], weights={}, ruined=True))
+            continue
         sharpes = hist.apply(annualized_sharpe)
         ok = sharpes >= min_sharpe
         if min_trades_proxy > 0:
@@ -287,7 +294,6 @@ def walk_forward_portfolio(
         if windows is not None:
             cands = _causal_filter(cands, hist, windows, start, min_trades, min_windows, require_pardo, min_wfe)
         sel = select_subset(hist, cands, method, max_strategies, corr_ceiling)
-        block = rets.loc[start:end] if end is None else rets.loc[start: end - pd.Timedelta(nanoseconds=1)]
         if not sel or block.empty:
             parts.append(pd.Series(0.0, index=block.index))
             log.append(dict(period_start=start, selected=[], weights={}))

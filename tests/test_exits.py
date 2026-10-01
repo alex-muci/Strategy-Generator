@@ -139,3 +139,23 @@ class TargetOnTheEntryBarTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TargetOnTheWrongSideTests(unittest.TestCase):
+    def test_a_fill_already_through_its_target_exits_at_the_fill_on_the_entry_bar(self):
+        """A countertrend long whose exit midline (a 40-bar channel) sits
+        BELOW the fill at the open: the target is marketable at the fill, as
+        it would be at the open of any later bar, and goes out there as a
+        midline exit, before the intrabar stop."""
+        B = 45
+        o = np.full(70, 100.0); h = o + 1.0; l = o - 1.0; c = o.copy()
+        for i in range(0, 26):                     # an older, lower range: the 40-bar midline sits near 91
+            o[i] = c[i] = 82.0; h[i] = 83.0; l[i] = 81.0
+        for i in range(26, 70):                    # rising lows: no bar touches the 5-bar low before the gap
+            l[i] = 99.0 + 0.01 * (i - 26)
+        o[B], h[B], l[B], c[B] = 95.0, 95.5, 94.0, 94.5     # gap below the 5-bar low (99): long at the open
+        df = pd.DataFrame({"Open": o, "High": h, "Low": l, "Close": c}, index=pd.bdate_range("2025-01-01", periods=70))
+        tpl = _tpl(direction_logic="countertrend", exit_style="channel", n_entry=5, n_exit=40, atr_mult_stop=0.3)
+        t = backtest(df, tpl, first_trade_bar=B - 3)["trades"][0]
+        self.assertEqual((t["side"], t["entry_price"], t["exit_date"]), (1, 95.0, df.index[B]))
+        self.assertEqual((t["reason"], t["exit_price"]), ("midline", 95.0))

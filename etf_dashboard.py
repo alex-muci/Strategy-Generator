@@ -159,7 +159,7 @@ def asset_sources(assets) -> tuple:
     for a in assets:
         if a.lower().endswith(".csv"):
             label = os.path.splitext(os.path.basename(a))[0]
-            sources[label] = a
+            sources[label] = os.path.abspath(a)     # signals may run from another directory
             labels.append(label)
         else:
             labels.append(a)
@@ -184,6 +184,8 @@ def load_assets(assets, *, interval, start, synthetic, bars, now=None, quiet=Fal
     for i, a in enumerate(assets):
         listing = LISTINGS.get(a)
         if a in sources:
+            if not os.path.exists(sources[a]):
+                raise SystemExit(f"{a}: the file research loaded it from is gone: {sources[a]}")
             raw[a] = load_csv(sources[a], interval=interval)
         elif synthetic:
             # a different seed per asset, so the assets are not the same series
@@ -684,7 +686,8 @@ def signals(args) -> dict:
     holdings, holdings_given = _load_holdings(args.state_dir)
     if not holdings_given:
         holdings = {k: float(v) for k, v in live.get("last_targets", {}).items()}
-    trades = trade_list(targets["by_asset"], holdings, lot=args.lot)
+    trades = trade_list(targets["by_asset"], holdings, lot=args.lot,
+                        prices={st["asset"]: (st["last_close"], st.get("point_value", 1.0)) for st in states})
 
     futures = _futures_book(args, spec, data, states, targets, live, interval, now) if args.futures else None
     if futures:
@@ -807,7 +810,8 @@ def _slot_signal(slot: dict, df: pd.DataFrame, cfg: dict, live: dict, args,
                            selection=cfg["selection"], anchored=cfg["anchored"],
                            initial_equity=equity)
         if fit["params"] is None:
-            notes.append(f"{key}: nothing traded enough in-sample to fit -- slot stays flat")
+            notes.append(f"{key}: nothing traded enough in-sample to fit on the slot's {equity:,.0f} "
+                         "-- slot stays flat")
             mem["params"], mem["fitted_on"] = None, str(df.index[-1])
         else:
             mem["params"] = {k: _jsonable(v) for k, v in fit["params"].items()}

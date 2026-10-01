@@ -460,7 +460,8 @@ def _report(df, results, port, nested, fam, finalists, bench, args, asset: str |
              f" annualized at {periods_per_year()} bars/year\n\n")
     L.append(f"Walk-forward: train={args.train} test={args.test} bars, {'anchored' if args.anchored else 'rolling'}, "
              f"parameter selection = {args.selection}, objective = {args.metric}, costs = {args.cost_bps} bps/side"
-             f"{' + ' + str(args.cost_per_unit) + ' per unit/side' if args.cost_per_unit else ''}\n\n")
+             f"{' + ' + str(args.cost_per_unit) + ' per unit/side' if args.cost_per_unit else ''}"
+             f"{' + ' + str(args.roll_cost_per_unit) + ' per unit per roll' if args.roll_cost_per_unit else ''}\n\n")
     L.append(f"Templates generated: {len(results)} (family '{args.family}'); parameter trials: {fam['n_trials']}\n\n")
 
     L.append("## Family-level overfitting diagnostics (Lopez de Prado / White)\n\n")

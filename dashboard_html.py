@@ -663,7 +663,7 @@ def _diagnostics_section(spec: dict) -> str:
            f'{_e(c["interval"])} bars from {_e(c["start"])}, family '
            f'<b>{_e(c["family"])}</b>. Walk-forward train={c["train_bars"]} test='
            f'{c["test_bars"]} {"anchored" if c["anchored"] else "rolling"}, '
-           f'{_e(c["selection"])} parameter selection, {_e(costs_text(c, spec.get("assets")))} costs, '
+           f'{_e(c["selection"])} parameter selection, costs {_e(costs_text(c, spec.get("assets")))}, '
            f'{_e(sizing_text(c))} (per slot), '
            f'{_e(c["weighting"])} weights.')
     return f'<p class="ink2">{cfg}</p>' + _table(["measure", "value", "what it means"],
