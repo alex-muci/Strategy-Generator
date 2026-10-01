@@ -219,7 +219,9 @@ class WalkForwardWindowTests(unittest.TestCase):
 
     def test_refit_chooses_what_the_walk_forward_chose(self):
         """live.refit_params IS the in-sample step: on the history up to a
-        window boundary it must land on the same parameters and score."""
+        window boundary, sized on the same account equity (the walk-forward
+        carries it from window to window), it must land on the same
+        parameters and score."""
         tpl = generate_templates("quick")[3]
         grid = param_grid_for(tpl)
         res = walk_forward(self.df, tpl, grid, train_bars=400, test_bars=100)
@@ -227,7 +229,7 @@ class WalkForwardWindowTests(unittest.TestCase):
         self.assertGreater(len(live), 3)
         for w in live[1:4]:
             ts = self.df.index.get_loc(w["test_start"])
-            fit = refit_params(self.df.iloc[:ts], tpl, grid, train_bars=400)
+            fit = refit_params(self.df.iloc[:ts], tpl, grid, train_bars=400, initial_equity=w["initial_equity"])
             self.assertEqual(fit["params"], w["params"])
             self.assertAlmostEqual(fit["is_score"], w["is_score"])
             self.assertEqual(fit["is_stats"], w["is_stats"])
@@ -431,3 +433,58 @@ class ExposureBasisTests(unittest.TestCase):
         # without a margin: notional at |close|, still signed by the side
         c = exposure_totals(res, close, point_value=1000.0)
         self.assertAlmostEqual(c["net"], c["gross"])
+
+
+class OneAccountTests(unittest.TestCase):
+    """The walk-forward is one account traded forward: each window is sized on
+    the equity the previous one ended with (fixed-fractional sizing on the
+    capital actually there), not on a fresh 100,000."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.df = synthetic_ohlc(1500, seed=11, trend_prob=0.6)
+        cls.tpl = generate_templates("quick")[0]
+        cls.grid = param_grid_for(cls.tpl)
+
+    def _check_chain(self, res):
+        eq = res["oos_equity"]
+        prev_end = 100_000.0
+        for w in res["windows"]:
+            self.assertAlmostEqual(w["initial_equity"], prev_end, delta=1e-6 * prev_end)
+            prev_end = float(eq.loc[w["test_end"]])
+
+    def test_each_window_starts_where_the_last_one_ended(self):
+        self._check_chain(walk_forward(self.df, self.tpl, self.grid, train_bars=400, test_bars=100))
+
+    def test_fractional_sizing_returns_do_not_depend_on_the_capital(self):
+        """Every size, cap and cost is linear in the equity: a window run on
+        the carried equity has the returns of the same window on 100,000."""
+        res = walk_forward(self.df, self.tpl, self.grid, train_bars=400, test_bars=100)
+        live = [w for w in res["windows"] if not w["skipped"]]
+        self.assertGreater(len(live), 3)
+        self.assertNotAlmostEqual(live[-1]["initial_equity"], 100_000.0, places=0)
+        for w in live:
+            i0, i1 = self.df.index.get_loc(w["test_start"]), self.df.index.get_loc(w["test_end"]) + 1
+            fresh = window_backtest(self.df, self.tpl.with_params(**w["params"]), i0, i1)["returns"]
+            np.testing.assert_allclose(res["oos_returns"].loc[fresh.index].to_numpy(), fresh.to_numpy(),
+                                       rtol=0, atol=1e-12)
+
+    def test_whole_units_are_counted_on_the_capital_there(self):
+        """With whole contracts the carried equity changes the counts: after
+        the account grew or shrank, a window's contracts are those its own
+        equity buys, not those of a fresh 100,000."""
+        tpl = self.tpl.with_params(point_value=50.0, margin_per_unit=5000.0, cost_bps=0.0, cost_per_unit=2.5,
+                                   whole_units=True, risk_pct=0.02, max_leverage=0.5)
+        res = walk_forward(self.df, tpl, param_grid_for(tpl), train_bars=400, test_bars=100)
+        self._check_chain(res)
+        differs = 0
+        for w in [w for w in res["windows"] if not w["skipped"]]:
+            i0, i1 = self.df.index.get_loc(w["test_start"]), self.df.index.get_loc(w["test_end"]) + 1
+            chosen = tpl.with_params(**w["params"])
+            carried = window_backtest(self.df, chosen, i0, i1, initial_equity=w["initial_equity"])
+            fresh = window_backtest(self.df, chosen, i0, i1)
+            np.testing.assert_allclose(res["oos_returns"].loc[carried["returns"].index].to_numpy(),
+                                       carried["returns"].to_numpy(), rtol=0, atol=0)
+            differs += int(not np.allclose(carried["returns"].to_numpy(), fresh["returns"].to_numpy(),
+                                           rtol=0, atol=1e-12))
+        self.assertGreater(differs, 0, "the fixture never moves a contract count")

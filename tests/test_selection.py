@@ -476,6 +476,48 @@ class CpcvSelectionRuleTests(unittest.TestCase):
         self.assertGreater(carried_without_extension, 0, "the fixture never carries a trade past the embargo")
         self.assertGreater(short_embargo_leaks, 0, "the fixture cannot tell a too-short embargo")
 
+    def test_whole_unit_trials_carry_no_account_state_past_the_embargo(self):
+        """On a compounding account a held-out block's P&L changes every later
+        size, and with whole units every later contract count: a training
+        return long after the embargo then depends on test-group prices. The
+        trials matrix is run on FIXED capital (trial_returns): every size on
+        the same capital, every return P&L over it, so a training row past the
+        embargo and its carried trade is the same in both runs. The
+        compounding run is shown to leak on the same fixture."""
+        from itertools import combinations
+        from strategy import backtest
+        df = synthetic_ohlc(1600, seed=7, trend_prob=0.6)
+        T = len(df); bounds = np.linspace(0, T, 7).astype(int)
+        tpl = StrategyTemplate("wu", exit_style="target_stop", point_value=50.0, margin_per_unit=5000.0,
+                               cost_bps=0.0, cost_per_unit=2.5, whole_units=True, risk_pct=0.02, max_leverage=0.5)
+        emb = cpcv_embargo(tpl, [{}])
+        R0, E0, P0, X0 = trial_returns(df, tpl, [{}], with_trades=True)
+        np.testing.assert_array_equal(R0[:, 0], backtest(df, tpl, fixed_capital=True)["returns"].to_numpy())
+        rng = np.random.default_rng(1)
+        compounding_leaks = checked = 0
+        for groups in list(combinations(range(6), 2))[::2]:
+            rows = np.concatenate([np.arange(bounds[g], bounds[g + 1]) for g in groups])
+            d1 = df.copy()
+            f = np.exp(np.cumsum(rng.normal(0, 0.01, len(rows))))
+            for c in ("Open", "High", "Low", "Close"):
+                d1.iloc[rows, d1.columns.get_loc(c)] *= f
+            R1, E1, P1, X1 = trial_returns(d1, tpl, [{}], with_trades=True)
+            # training rows in both runs, past the embargo and any carried trade,
+            # whose trade (if any) was entered on the same bar in both
+            m = (robustness.train_masks(T, bounds, groups, emb, 0, E0, X0)[:, 0]
+                 & robustness.train_masks(T, bounds, groups, emb, 0, E1, X1)[:, 0])
+            same_entry = (np.maximum.accumulate(np.where(E0[:, 0] > 0, np.arange(T), -1))
+                          == np.maximum.accumulate(np.where(E1[:, 0] > 0, np.arange(T), -1)))
+            m &= same_entry
+            self.assertGreater(m.sum(), T // 8)
+            np.testing.assert_allclose(R1[m, 0], R0[m, 0], rtol=0, atol=1e-12, err_msg=str(groups))
+            checked += int(m.sum())
+            c0 = backtest(df, tpl)["returns"].to_numpy()
+            c1 = backtest(d1, tpl)["returns"].to_numpy()
+            compounding_leaks += int((np.abs(c1 - c0)[m] > 1e-12).sum())
+        self.assertGreater(checked, 0)
+        self.assertGreater(compounding_leaks, 0, "the fixture cannot show the compounding account's leak")
+
     def test_profit_factor_ignores_trades_that_straddle_a_test_group(self):
         """A trade booked on its exit bar in training but held through a test
         group must not bring the test period's P&L into the training score."""
@@ -572,3 +614,19 @@ class NestedCausalFilterTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RuinedCandidateTests(unittest.TestCase):
+    def test_a_closed_account_is_never_a_candidate_and_ends_the_portfolio(self):
+        import portfolio as PF
+        idx = pd.bdate_range("2024-01-01", periods=6)
+        r = pd.Series([0.1, -1.5, 0.0, 0.0, 0.0, 0.0], index=idx)
+        table = pd.DataFrame(dict(oos_sharpe=[2.0, 0.5], n_live_windows=[5, 5], n_trades_oos=[50, 50],
+                                  pardo_pass=[True, True], wfe=[1.0, 1.0], oos_max_dd=[-1.65, -0.2]),
+                             index=["ruined", "fine"])
+        self.assertEqual(PF._qualifying(table, 0.3, 3, False, None, 10), ["fine"])
+        port = pd.Series([0.1, -1.2, 0.05, 0.02, -0.01, 0.03], index=idx)
+        closed = PF.close_after_ruin(port)
+        self.assertTrue((closed.iloc[2:] == 0.0).all())
+        self.assertEqual(list(closed.iloc[:2]), [0.1, -1.2])
+        pd.testing.assert_series_equal(PF.close_after_ruin(r * 0.1), r * 0.1)

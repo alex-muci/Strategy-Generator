@@ -21,7 +21,13 @@ Usage:
   python main.py                       # synthetic data, 'quick' family (72 templates)
   python main.py --family default      # 768 templates
   python main.py --real SPY --start 2005-01-01 --family default --jobs 8
+  python main.py --csv brent_z25z26.csv --instrument-map brent_z25z26=1000,15,3000,30   # a future, named by its file
   python main.py --help
+
+The research flags are shared with `etf_dashboard.py research`
+(pipeline.add_research_args). On a margined future the benchmark is one
+unit's P&L: its Sharpe, correlation and information ratio are scale-free, its
+beta is not (it scales with 1 / point value: units held on average).
 """
 
 from __future__ import annotations
@@ -37,75 +43,35 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from data import synthetic_ohlc, load_csv
-from generator import generate_templates, FAMILIES
+from generator import generate_templates
 from pipeline import (
     resolve_interval, load_real, eval_config, worker_pool, evaluate_slots, walk_forward_matrices,
     family_diagnostics, build_portfolios, finalist_stats, benchmark_stats, benchmark_returns, instrument_text,
-    benchmark_curve, _costed, BENCH_BUY_HOLD,
+    benchmark_curve, _costed, BENCH_BUY_HOLD, add_research_args, parse_instrument_map, instrument_of,
 )
 from portfolio import returns_frame
 from replay import save_run, replay_run, TARGETS as REPLAY_TARGETS
-from strategy import (annualized_sharpe, max_drawdown, periods_per_year, BARS_PER_YEAR, SIDES, validate_instrument,
+from strategy import (annualized_sharpe, max_drawdown, periods_per_year, BARS_PER_YEAR, validate_instrument,
                       instrument_warnings, typical_units, set_periods_per_year)
 
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description="Ranger-style strategy generator with robust walk-forward evaluation")
-    p.add_argument("--family", default="quick", choices=list(FAMILIES))
-    p.add_argument("--max-templates", type=int, default=None)
-    p.add_argument("--sides", nargs="+", default=None, choices=SIDES,
-                   help="restrict every template to these sides (default: the family's own list, "
-                        "'both' for quick and default). On an asset with a drift, e.g. --sides long_only")
+    # the research flags etf_dashboard.py research takes too (pipeline.add_research_args)
+    add_research_args(p, start="2005-01-01")
     src = p.add_mutually_exclusive_group()
     src.add_argument("--real", metavar="TICKER", default=None, help="use yfinance data for TICKER instead of synthetic")
     src.add_argument("--csv", metavar="PATH", default=None,
                      help="use OHLC(V) bars from a local CSV (first column the date, then Open High Low Close "
-                          "[Volume]); prices may be zero or negative, e.g. a futures calendar spread, which then "
-                          "needs --margin-per-unit and --cost-per-unit with --cost-bps 0")
-    p.add_argument("--start", default="2005-01-01")
+                          "[Volume] [Roll]); prices may be zero or negative, e.g. a futures calendar spread, which "
+                          "then needs --margin-per-unit and --cost-per-unit")
     p.add_argument("--interval", default="1d", choices=sorted(BARS_PER_YEAR),
                    help="bar interval of --real / --csv; also sets the annualization factor (intraday: "
-                        "US-equity session bars per day, so a ~23 h futures session is under-annualized). "
+                        "US-equity session bars per day unless --bars-per-day says otherwise). "
                         "Ignored for the synthetic series, which is daily")
-    p.add_argument("--bars", type=int, default=3000, help="synthetic bars")
     p.add_argument("--seed", type=int, default=7)
     p.add_argument("--trend-prob", type=float, default=0.45, help="synthetic: probability a regime is trending")
     p.add_argument("--trend-drift", type=float, default=0.0009, help="synthetic: daily drift inside trending regimes")
-    p.add_argument("--train", type=int, default=500, help="training window (bars)")
-    p.add_argument("--test", type=int, default=125, help="test window (bars)")
-    p.add_argument("--anchored", action="store_true", help="expanding instead of rolling training window")
-    p.add_argument("--selection", default="plateau", choices=["plateau", "best"])
-    p.add_argument("--metric", default="sharpe", choices=["sharpe", "return_over_dd", "profit_factor"])
-    p.add_argument("--wide-grid", action="store_true")
-    p.add_argument("--cost-bps", type=float, default=5.0, help="commission+slippage per side, bps of notional")
-    p.add_argument("--risk-pct", type=float, default=0.01, help="equity risked per trade")
-    p.add_argument("--max-leverage", type=float, default=2.0)
-    p.add_argument("--vol-target", type=float, default=0.0,
-                   help="annualized volatility each entry is sized to (e.g. 0.15); 0 = risk --risk-pct on the ATR stop. "
-                        "Set it near the asset's own vol to put the strategies on the buy & hold scale")
-    p.add_argument("--vol-target-n", type=int, default=60, help="bars of close-to-close changes in the realized-vol estimate")
-    p.add_argument("--point-value", type=float, default=1.0,
-                   help="currency per 1.0 of price per unit: 1 for a share, 1000 for a Brent lot, 50 for ES")
-    p.add_argument("--cost-per-unit", type=float, default=0.0,
-                   help="commission+slippage per unit per side in currency, on top of --cost-bps")
-    p.add_argument("--margin-per-unit", type=float, default=0.0,
-                   help="initial margin per unit in currency. Give it for every future or spread: it makes the "
-                        "series a future (--max-leverage caps margin / equity, so set it at or below 1; the vol "
-                        "target sizes on price-point changes; the benchmark is one unit's P&L). Without it the "
-                        "series is a cash asset (cap on notional, vol target on %% returns). Required for prices "
-                        "at or below zero")
-    p.add_argument("--whole-units", action="store_true",
-                   help="floor every size to whole units (contracts); a size below one opens nothing. "
-                        "Recommended for futures: research then trades what the live orders round to")
-    p.add_argument("--min-sharpe", type=float, default=0.3)
-    p.add_argument("--max-strategies", type=int, default=8)
-    p.add_argument("--corr-ceiling", type=float, default=0.6)
-    p.add_argument("--require-pardo", action="store_true", help="only candidates passing Pardo's WFA criteria")
-    p.add_argument("--select-method", default="greedy", choices=["greedy", "cluster"])
-    p.add_argument("--weighting", default="equal", choices=["equal", "hrp"])
-    p.add_argument("--cpcv-groups", type=int, default=8)
-    p.add_argument("--cpcv-k", type=int, default=2)
-    p.add_argument("--n-boot", type=int, default=1000)
     p.add_argument("--no-matrix", action="store_true", help="skip Pardo's walk-forward matrix (slow-ish)")
     p.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) - 1))
     p.add_argument("--out", default="outputs")
@@ -115,6 +81,27 @@ def parse_args(argv=None):
     return p.parse_args(argv)
 
 
+def resolve_instrument(args, asset: str) -> dict:
+    """The instrument the run trades, applied to `args` so that every later
+    reader of the flags (the data loader, the config, the report) sees the
+    same one: `--instrument-map ASSET=...` for this run's asset (a ticker or a
+    CSV's stem) replaces the run-wide instrument flags, as it does for a
+    dashboard asset, and an instrument with a margin is costed per unit only
+    (cost_bps 0, `pipeline.instrument_of`). Returns the parsed map, for the
+    run's record."""
+    imap = parse_instrument_map(args.instrument_map, [asset])
+    ins = instrument_of(dict(point_value=args.point_value, cost_per_unit=args.cost_per_unit,
+                             margin_per_unit=args.margin_per_unit, roll_cost_per_unit=args.roll_cost_per_unit,
+                             whole_units=args.whole_units, instrument_map=imap), asset)
+    if ins.get("cost_bps") == 0.0 and args.cost_bps > 0:
+        print(f"NOTE: --cost-bps {args.cost_bps:g} not charged: {asset} has a margin, so it is costed per unit "
+              f"only (--cost-per-unit {ins['cost_per_unit']:g})")
+        args.cost_bps = 0.0
+    args.point_value, args.cost_per_unit = ins["point_value"], ins["cost_per_unit"]
+    args.margin_per_unit, args.roll_cost_per_unit = ins["margin_per_unit"], ins["roll_cost_per_unit"]
+    return imap
+
+
 def main(argv=None) -> dict:
     """Run the pipeline; returns what it computed (results, portfolios,
     diagnostics) so it can be driven from a script or a test."""
@@ -122,11 +109,20 @@ def main(argv=None) -> dict:
     t0 = time.time()
     os.makedirs(args.out, exist_ok=True)
 
-    interval = resolve_interval(args.interval, synthetic=not (args.real or args.csv))
+    synthetic = not (args.real or args.csv)
+    interval = resolve_interval(args.interval, synthetic=synthetic)
     if interval != args.interval:
         print(f"NOTE: --interval {args.interval} ignored, the synthetic series is {interval} bars")
+    if synthetic and args.bars_per_day is not None:
+        print(f"NOTE: --bars-per-day {args.bars_per_day:g} ignored, the synthetic series is {interval} bars")
+        args.bars_per_day = None
     args.interval = interval
-    cfg = eval_config(args, interval)
+    asset = asset_label(args)
+    instrument_map = resolve_instrument(args, asset)
+    try:
+        cfg = eval_config(args, interval) | dict(instrument_map=instrument_map)
+    except ValueError as e:
+        raise SystemExit(f"--bars-per-day: {e}")
     set_periods_per_year(cfg["periods_per_year"])   # before anything here annualizes (the pool re-sets it)
 
     if args.real:
@@ -148,16 +144,16 @@ def main(argv=None) -> dict:
     print(f"Generated {len(templates)} structurally distinct strategy templates (family={args.family}"
           f"{', sides=' + '/'.join(args.sides) if args.sides else ''})")
     print(f"Walk-forward: train={args.train} test={args.test} {'anchored' if args.anchored else 'rolling'}, "
-          f"selection={args.selection}, metric={args.metric}, cost={args.cost_bps}bps/side")
+          f"selection={args.selection}, metric={args.metric}, cost={args.cost_bps}bps/side"
+          + (f" + {args.cost_per_unit:g} per unit/side" if args.cost_per_unit else ""))
 
-    asset = asset_label(args)
     # an instrument the sizing cannot handle (prices at or below zero without
     # a margin, or with bps costs) fails here, not in every window of the pool
-    validate_instrument(df, _costed(templates[0], cfg))
-    for w in instrument_warnings(_costed(templates[0], cfg)):
+    validate_instrument(df, _costed(templates[0], cfg, asset))
+    for w in instrument_warnings(_costed(templates[0], cfg, asset)):
         print(f"WARNING: {w}")
     if args.whole_units:
-        q = typical_units(df, _costed(templates[0], cfg))
+        q = typical_units(df, _costed(templates[0], cfg, asset))
         if q < 1.5:
             print(f"WARNING: --whole-units: a typical entry sizes to {q:.2f} units on the 100,000 the research "
                   "sizes on, floored to " + ("0: most templates will never trade" if q < 1 else
@@ -214,7 +210,8 @@ def _run(df, asset, templates, pool, args, cfg=None) -> dict:
     finalists = finalist_diagnostics(results, port, fam, args, pool)
 
     # ---- the benchmark nobody optimized: holding the asset over the same bars ----
-    kind, bh = benchmark_returns(df, args.point_value, margin_per_unit=args.margin_per_unit)
+    ins = instrument_of(cfg or eval_config(args, args.interval), asset)
+    kind, bh = benchmark_returns(df, ins["point_value"], margin_per_unit=ins["margin_per_unit"])
     bench = benchmark_stats(bh, rets, port, nested, kind=kind)
     _print_benchmark(bench, args, asset)
 
@@ -463,7 +460,8 @@ def _report(df, results, port, nested, fam, finalists, bench, args, asset: str |
              f" annualized at {periods_per_year()} bars/year\n\n")
     L.append(f"Walk-forward: train={args.train} test={args.test} bars, {'anchored' if args.anchored else 'rolling'}, "
              f"parameter selection = {args.selection}, objective = {args.metric}, costs = {args.cost_bps} bps/side"
-             f"{' + ' + str(args.cost_per_unit) + ' per unit/side' if args.cost_per_unit else ''}\n\n")
+             f"{' + ' + str(args.cost_per_unit) + ' per unit/side' if args.cost_per_unit else ''}"
+             f"{' + ' + str(args.roll_cost_per_unit) + ' per unit per roll' if args.roll_cost_per_unit else ''}\n\n")
     L.append(f"Templates generated: {len(results)} (family '{args.family}'); parameter trials: {fam['n_trials']}\n\n")
 
     L.append("## Family-level overfitting diagnostics (Lopez de Prado / White)\n\n")
@@ -524,9 +522,13 @@ def _report(df, results, port, nested, fam, finalists, bench, args, asset: str |
                else "It is a margined future, whose quoted level is not the price of an investment")
         L.append(f"{why}, so it has no buy-and-hold return: the benchmark is the P&L of "
                  f"holding one unit (point value {args.point_value:g}) on the initial equity, an additive "
-                 "curve (summed, not compounded). Its Sharpe, beta, correlation and information ratio are "
-                 "scale-free; its CAGR (here the simple annual P&L) and drawdown (from the peak) are fractions "
-                 "of the initial equity, on that arbitrary scale. ")
+                 "curve (summed, not compounded). Its Sharpe, the correlation to it and the information ratio "
+                 "are scale-free. The beta is NOT: the benchmark's returns are point value / initial equity "
+                 "times the price change, so the beta scales with 1 / point value (and with the initial "
+                 "equity); read it as the number of units the portfolio behaves like it holds on average "
+                 "(a beta of 2 is two units' exposure, not twice the market's). Its CAGR (here the simple "
+                 "annual P&L) and drawdown (from the peak) are fractions of the initial equity, on that "
+                 "arbitrary scale. ")
     ins = instrument_text(eval_config(args, args.interval))
     if ins:
         L.append(f"Instrument: {ins}. ")

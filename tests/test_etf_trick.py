@@ -2,10 +2,12 @@
 extra_utils/ETF_trick_spreads.py: one continuous series out of successive
 listed calendar spreads, and the way it hands off to the engine.
 
-The trick is run in POINTS (point_value=1, contracts=1, side=+1, k0=0): the
-output is then the listed spread itself between rolls, shifted by a constant,
-with each roll's gap and cost folded in, and the engine gets the contract
-multiplier once, as point_value.
+The trick is run in POINTS (point_value=1, contracts=1, side=+1, k0=0,
+roll_cost=0): the output is then the listed spread itself between rolls,
+shifted by a constant, with each roll's gap folded in, and the engine gets the
+contract multiplier once, as point_value. The cost of a roll is charged by the
+engine to what it holds through a Roll bar (roll_cost_per_unit), long or short:
+folded into the price it would be a gain to a short.
 """
 from __future__ import annotations
 import os
@@ -18,6 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from extra_utils.ETF_trick_spreads import etf_trick_listed_spreads  # noqa: E402
 from strategy import StrategyTemplate, backtest  # noqa: E402
+from data import load_csv  # noqa: E402
 
 
 def _spread_ohlc(n: int, seed: int, level: float = -1.0, scale: float = 0.1):
@@ -80,6 +83,8 @@ class EtfTrickTests(unittest.TestCase):
         switch = int(np.argmax((held != held.iloc[0]).to_numpy()))
         self.assertEqual(switch, 150 - 10 + 1)           # rolled at the close of the bar with 10 days left
         self.assertEqual(held.iloc[switch - 1], "Z25-Z26")
+        # the Roll column marks that close, and only it
+        self.assertEqual(list(np.flatnonzero(out["Roll"].to_numpy())), [switch - 1])
         self.assertTrue((held.iloc[switch:] == "Z26-Z27").all())
         d_out = out["Close"].diff().to_numpy()
         d1 = C["Z25-Z26"].diff().to_numpy()
@@ -136,6 +141,87 @@ class EtfTrickTests(unittest.TestCase):
         listed = (float(C["Z25-Z26"].iloc[roll]) - float(O["Z25-Z26"].iloc[i])
                   + float(O["Z26-Z27"].iloc[j]) - float(C["Z26-Z27"].iloc[roll]))
         self.assertAlmostEqual(t["pnl"], 1000.0 * (listed - 0.25) - 30.0, places=8)
+
+
+
+class RollCostTests(unittest.TestCase):
+    """A roll costs the position held through it, whatever its side. The two
+    templates below take the SAME bars on opposite sides: a long that follows
+    the first upside break and a short that fades it, one lot each, held 100
+    bars across the roll. Their P&Ls are mirror images apart from the costs,
+    so long + short = -(every cost both paid)."""
+
+    def setUp(self):
+        self.dates = pd.bdate_range("2024-01-01", periods=300)
+        O, H, L, C = _listed(self.dates, ["Z25-Z26", "Z26-Z27"], seed=3)
+        self.expiry = {"Z25-Z26": str(self.dates[150].date()), "Z26-Z27": "2030-12-18"}
+        self.listed = (O, H, L, C)
+
+    def _pair(self, df, **kw):
+        base = dict(entry_style="close_confirm", exit_style="time_stop", max_hold_bars=100, n_entry=5,
+                    atr_n=5, atr_mult_stop=100.0, point_value=1000.0, cost_per_unit=15.0, cost_bps=0.0,
+                    margin_per_unit=3000.0, risk_pct=0.5, max_leverage=0.03)   # the margin cap: 1 lot
+        out = []
+        for logic, sides in (("trend", "long_only"), ("countertrend", "short_only")):
+            res = backtest(df, StrategyTemplate(logic, direction_logic=logic, sides=sides, **(base | kw)),
+                           first_trade_bar=100)
+            t = [t for t in res["trades"] if t["bars_held"] == 100][0]
+            out.append(t)
+        long_, short_ = out
+        self.assertEqual((long_["side"], short_["side"]), (1, -1))
+        self.assertEqual((long_["entry_date"], long_["exit_date"]), (short_["entry_date"], short_["exit_date"]))
+        i, j = df.index.get_loc(long_["entry_date"]), df.index.get_loc(long_["exit_date"])
+        self.assertTrue(i < 141 <= j, "the trades must straddle the roll bar")
+        return long_, short_
+
+    def test_folded_into_the_price_a_short_collects_the_roll_cost(self):
+        """The issue's probe: the cost inside the series is a price move."""
+        df = etf_trick_listed_spreads(*self.listed, expiry=self.expiry, roll_days=10, roll_cost=1.0)
+        long_, short_ = self._pair(df[["Open", "High", "Low", "Close"]])
+        # long + short pay only the four per-unit fills: the 1,000 roll cost
+        # the long lost, the short gained
+        self.assertAlmostEqual(long_["pnl"] + short_["pnl"], -4 * 15.0, places=6)
+
+    def test_charged_by_the_engine_both_sides_pay_it(self):
+        df = etf_trick_listed_spreads(*self.listed, expiry=self.expiry, roll_days=10)   # no cost in the price
+        self.assertEqual(int(df["Roll"].sum()), 1)
+        long_, short_ = self._pair(df[["Open", "High", "Low", "Close", "Roll"]], roll_cost_per_unit=1000.0)
+        self.assertAlmostEqual(long_["pnl"] + short_["pnl"], -4 * 15.0 - 2 * 1000.0, places=6)
+        for t in (long_, short_):
+            self.assertAlmostEqual(t["cost"], 2 * 15.0 + 1000.0, places=9)
+            self.assertAlmostEqual(t["pnl"], t["side"] * 1000.0 * (t["exit_price"] - t["entry_price"])
+                                   - 2 * 15.0 - 1000.0, places=6)
+        # without the Roll column the cost cannot be charged: refused, not ignored
+        with self.assertRaises(ValueError):
+            backtest(df[["Open", "High", "Low", "Close"]],
+                     StrategyTemplate("t", cost_bps=0.0, margin_per_unit=3000.0, roll_cost_per_unit=1.0))
+
+    def test_flat_through_the_roll_pays_nothing_and_the_log_shows_it(self):
+        df = etf_trick_listed_spreads(*self.listed, expiry=self.expiry, roll_days=10)
+        df = df[["Open", "High", "Low", "Close", "Roll"]]
+        tpl = StrategyTemplate("t", entry_style="close_confirm", exit_style="time_stop", max_hold_bars=5,
+                               n_entry=5, atr_n=5, cost_bps=0.0, margin_per_unit=3000.0, point_value=1000.0,
+                               roll_cost_per_unit=1000.0)
+        res = backtest(df, tpl, first_trade_bar=100, log_orders=True)
+        held_at_roll = [t for t in res["trades"]
+                        if df.index.get_loc(t["entry_date"]) <= 140 < df.index.get_loc(t["exit_date"])]
+        rolls = res["orders"][res["orders"]["kind"] == "roll"]
+        self.assertEqual(len(rolls), len(held_at_roll) + (res["open_position"] is not None
+                                                         and df.index.get_loc(res["open_position"]["entry_date"]) <= 140))
+        for t in res["trades"]:
+            paid = t["cost"] - 0.0
+            self.assertAlmostEqual(paid, 1000.0 * t["shares"] if t in held_at_roll else 0.0, places=6)
+
+    def test_the_roll_column_survives_a_csv(self):
+        import tempfile
+        df = etf_trick_listed_spreads(*self.listed, expiry=self.expiry, roll_days=10)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "spread.csv")
+            df[["Open", "High", "Low", "Close", "Roll"]].to_csv(path)
+            back = load_csv(path)
+        # (the trick's first bar is the all-zero entry bar, which load_csv drops as a no-trade row)
+        np.testing.assert_array_equal(back["Roll"].to_numpy(), df["Roll"].reindex(back.index).to_numpy())
+        self.assertEqual(float(back["Roll"].sum()), 1.0)
 
 
 if __name__ == "__main__":

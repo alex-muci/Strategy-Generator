@@ -405,6 +405,99 @@ class ParseArgsTests(unittest.TestCase):
         self.assertEqual(m, e)
 
 
+class SharedCommandLineTests(unittest.TestCase):
+    """main.py and `etf_dashboard.py research` build their research flags with
+    the same function (pipeline.add_research_args), so a flag cannot mean one
+    thing in one entry point and another in the other."""
+
+    @staticmethod
+    def _options(parser):
+        return {a.dest: (a.default, tuple(a.choices) if a.choices else None)
+                for a in parser._actions if a.option_strings and a.dest != "help"}
+
+    def test_every_research_flag_is_shared_with_the_same_default(self):
+        import argparse
+        shared = self._options(P.add_research_args(argparse.ArgumentParser(add_help=False), start="x"))
+        main = self._options(_parser_of(M.parse_args))
+        research = self._options(_research_parser())
+        for dest, spec in shared.items():
+            if dest == "start":       # the one default the entry points choose differently
+                continue
+            self.assertEqual(main.get(dest), spec, dest)
+            self.assertEqual(research.get(dest), spec, dest)
+
+    def test_the_instrument_map_names_main_s_asset(self):
+        a = M.parse_args(["--csv", "data/brent_z25z26.csv", "--instrument-map", "brent_z25z26=1000,15,3000,30"])
+        with contextlib.redirect_stdout(io.StringIO()):
+            imap = M.resolve_instrument(a, M.asset_label(a))
+        self.assertEqual((a.point_value, a.cost_per_unit, a.margin_per_unit, a.roll_cost_per_unit), (1000.0, 15.0, 3000.0, 30.0))
+        self.assertEqual(a.cost_bps, 0.0)                         # a margin: costed per unit only
+        self.assertEqual(imap["brent_z25z26"]["margin_per_unit"], 3000.0)
+        # a name that is not the run's asset is an error, as in the dashboard
+        b = M.parse_args(["--real", "SPY", "--instrument-map", "QQQ=1"])
+        with self.assertRaises(SystemExit):
+            M.resolve_instrument(b, M.asset_label(b))
+        # a Yahoo futures ticker carries its own '=': the map splits on the last one
+        f = M.parse_args(["--real", "CL=F", "--instrument-map", "CL=F=1000,2.5,6000"])
+        with contextlib.redirect_stdout(io.StringIO()):
+            M.resolve_instrument(f, M.asset_label(f))
+        self.assertEqual((f.point_value, f.margin_per_unit), (1000.0, 6000.0))
+        for bad in (["SPY=nan"], ["SPY=inf"], ["SPY=1", "SPY=2"]):
+            g = M.parse_args(["--real", "SPY", "--instrument-map", *bad])
+            with self.assertRaises(SystemExit):
+                M.resolve_instrument(g, "SPY")
+        # mapped as a plain share: the run-wide futures flags do not leak in
+        c = M.parse_args(["--real", "SPY", "--margin-per-unit", "5000", "--instrument-map", "SPY=1"])
+        M.resolve_instrument(c, "SPY")
+        self.assertEqual((c.point_value, c.margin_per_unit, c.cost_bps), (1.0, 0.0, 5.0))
+
+    def test_a_margin_drops_the_bps_cost_in_both_entry_points(self):
+        """The rule the dashboard applied to a mapped future, now the rule:
+        a margined instrument is costed per unit, whatever --cost-bps says."""
+        cfg = _cfg(point_value=1000.0, cost_per_unit=15.0, margin_per_unit=3000.0, cost_bps=5.0)
+        tpl = P._costed(generate_templates("quick", max_templates=1)[0], cfg)
+        self.assertEqual((tpl.cost_bps, tpl.cost_per_unit), (0.0, 15.0))
+        a = M.parse_args(["--margin-per-unit", "3000", "--cost-per-unit", "15"])
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            M.resolve_instrument(a, "synthetic")
+        self.assertEqual(a.cost_bps, 0.0)
+        self.assertIn("--cost-bps 5 not charged", out.getvalue())
+        share = P._costed(generate_templates("quick", max_templates=1)[0], _cfg(cost_bps=5.0))
+        self.assertEqual(share.cost_bps, 5.0)                      # a cash asset keeps it
+
+    def test_bars_per_day_sets_the_annualization(self):
+        self.assertEqual(P.eval_config(M.parse_args(["--bars-per-day", "23"]), "1h")["periods_per_year"], 252 * 23)
+        self.assertEqual(P.eval_config(ED.parse_args(["research", "--bars-per-day", "23"]), "1h")["periods_per_year"],
+                         252 * 23)
+        self.assertEqual(P.eval_config(M.parse_args([]), "1h")["periods_per_year"], 252 * 7)   # the default session
+        for interval, bpd in (("1d", 1), ("1wk", 1), ("1h", 25), ("30m", 49), ("1h", 0)):
+            with self.assertRaises(ValueError):
+                S.periods_per_year_for_interval(interval, bpd)
+        with self.assertRaises(SystemExit):
+            _main(["--csv", "x.csv", "--interval", "1d", "--bars-per-day", "23"])
+
+
+def _parser_of(parse_args):
+    """The ArgumentParser behind an entry point's parse_args."""
+    import argparse
+    captured = {}
+    real = argparse.ArgumentParser.parse_args
+
+    def grab(self, args=None, namespace=None):
+        captured["p"] = self
+        return real(self, args, namespace)
+    with mock.patch.object(argparse.ArgumentParser, "parse_args", grab):
+        parse_args([])
+    return captured["p"]
+
+
+def _research_parser():
+    import argparse
+    p = _parser_of(lambda argv: ED.parse_args(["research"]))
+    sub = next(a for a in p._actions if isinstance(a, argparse._SubParsersAction))
+    return sub.choices["research"]
+
+
 class BenchmarkMathTests(_RestoresAnnualization):
     def setUp(self):
         super().setUp()
@@ -613,6 +706,22 @@ class SpreadRunTests(unittest.TestCase):
             self.assertEqual((res["template"].point_value, res["template"].margin_per_unit,
                               res["template"].cost_per_unit, res["template"].cost_bps), (1000.0, 3000.0, 15.0, 0.0))
 
+    def test_the_same_instrument_through_the_map_is_the_same_run(self):
+        """--instrument-map on main.py: the CSV's stem names the asset, and the
+        default --cost-bps 5 is not charged on a margined instrument -- the
+        same numbers as the run given the flags with --cost-bps 0."""
+        d = tempfile.mkdtemp()
+        try:
+            argv = ["--csv", self.csv, "--instrument-map", "brent_z25z26=1000,15,3000", "--max-leverage", "0.5",
+                    "--family", "quick", "--max-templates", "4", "--train", "300", "--test", "100",
+                    "--n-boot", "100", "--min-sharpe", "-5", "--jobs", "1", "--no-matrix", "--out", d]
+            other = _main(argv)
+            for name, res in self.out["results"].items():
+                pd.testing.assert_series_equal(other["results"][name]["oos_returns"], res["oos_returns"])
+                self.assertEqual(other["results"][name]["template"], res["template"])
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
     def test_the_manifest_records_the_instrument_and_the_file(self):
         with open(os.path.join(self.dir, "run.json"), encoding="utf-8") as f:
             m = json.load(f)
@@ -733,3 +842,39 @@ class TypicalUnitsTests(unittest.TestCase):
         self.assertLess(S.typical_units(df, lot), 1.0)
         self.assertAlmostEqual(S.typical_units(df, tpl.with_params(max_leverage=0.01)),
                                0.01 * 100_000 / float(np.nanmedian(df["Close"])))
+
+
+class PortfolioRuinReplayTests(unittest.TestCase):
+    """A slot selected at full weight goes to a deficit: the nested book is
+    closed at that bar (portfolio.close_after_ruin), the selection log stops
+    picking, and the replay reproduces the closed series exactly."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.dir = tempfile.mkdtemp()
+        df = synthetic_ohlc(1500, seed=7)
+        cols = [df.columns.get_loc(c) for c in ("Open", "High", "Low", "Close")]
+        df.iloc[1030:, cols] *= 0.45                           # a 55 % gap, beyond any margin
+        cls.csv = os.path.join(cls.dir, "crash.csv")
+        df.to_csv(cls.csv, float_format="%.17g")
+        cls.out = _main(["--csv", cls.csv, "--family", "quick", "--max-templates", "12", "--sides", "long_only",
+                         "--train", "400", "--test", "100", "--n-boot", "50", "--jobs", "1", "--no-matrix",
+                         "--max-leverage", "10", "--risk-pct", "0.3", "--min-sharpe", "-2", "--replay", "all",
+                         "--out", cls.dir])
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.dir, ignore_errors=True)
+
+    def test_the_book_is_closed_and_the_replay_matches(self):
+        nested = self.out["nested"]
+        eq = nested["portfolio_equity"].to_numpy()
+        dead = np.flatnonzero(eq <= 0.0)
+        self.assertGreater(len(dead), 0, "the fixture never ruins the nested book")
+        self.assertTrue((nested["portfolio_returns"].to_numpy()[dead[0] + 1:] == 0.0).all())
+        later = [s for s in nested["selections"] if s["period_start"] > nested["portfolio_equity"].index[dead[0]]]
+        self.assertGreater(len(later), 0)
+        self.assertTrue(all(s["selected"] == [] and s.get("ruined") for s in later))
+        for which in ("best", "static", "nested"):
+            check = self.out["replay"][which]["check"]
+            self.assertTrue(check["ok"], (which, check))

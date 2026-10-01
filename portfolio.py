@@ -31,7 +31,7 @@ import pandas as pd
 from scipy.cluster.hierarchy import linkage, fcluster
 from scipy.spatial.distance import squareform
 
-from strategy import annualized_sharpe
+from strategy import annualized_sharpe, compound
 from robustness import hrp_weights
 from walkforward import summarize_walk_forward
 
@@ -75,7 +75,10 @@ def candidate_table(wfa_results: dict, rets: pd.DataFrame) -> pd.DataFrame:
 def _qualifying(table: pd.DataFrame, min_sharpe, min_windows, require_pardo, min_wfe, min_trades,
                 available=None):
     q = ((table["oos_sharpe"] >= min_sharpe) & (table["n_live_windows"] >= min_windows)
-         & (table["n_trades_oos"] >= min_trades))
+         & (table["n_trades_oos"] >= min_trades)
+         # an account that went to zero or below was closed: its Sharpe, diluted
+         # by the flat bars after it, does not make it a candidate
+         & (table["oos_max_dd"].fillna(0.0) > -1.0))
     if require_pardo:
         q &= table["pardo_pass"]
     if min_wfe is not None:
@@ -141,6 +144,22 @@ def portfolio_weights(rets: pd.DataFrame, weighting: str = "equal") -> pd.Series
     return pd.Series(1.0 / rets.shape[1], index=rets.columns)
 
 
+def close_after_ruin(r: pd.Series) -> pd.Series:
+    """Portfolio returns with every bar after the compounded curve first
+    reaches zero or below set to 0: that account is closed (strategy.compound
+    freezes its curve), so the other slots' later returns are not its returns
+    and must not enter its Sharpe either."""
+    if not len(r):
+        return r
+    eq = compound(r.to_numpy())
+    dead = np.flatnonzero(eq <= 0.0)
+    if not len(dead):
+        return r
+    out = r.copy()
+    out.iloc[dead[0] + 1:] = 0.0
+    return out
+
+
 def select_portfolio(
     wfa_results: dict,
     min_sharpe: float = 0.2,
@@ -170,13 +189,13 @@ def select_portfolio(
                     candidate_stats=table, qualifying=qualifying)
 
     weights = portfolio_weights(rets[selected], weighting)
-    port_rets = (rets[selected] * weights).sum(axis=1)
+    port_rets = close_after_ruin((rets[selected] * weights).sum(axis=1))
     return dict(
         selected=selected,
         weights=weights,
         corr_matrix=rets[qualifying].corr(),
         portfolio_returns=port_rets,
-        portfolio_equity=initial_equity * (1 + port_rets).cumprod(),
+        portfolio_equity=pd.Series(initial_equity * compound(port_rets.to_numpy()), index=port_rets.index),
         candidate_stats=table,
         qualifying=qualifying,
     )
@@ -201,6 +220,8 @@ def _causal_filter(cands: list, hist: pd.DataFrame, windows: dict, start, min_tr
         past = [w for w in windows.get(c, []) if w.get("test_end") is not None and w["test_end"] < start]
         s = summarize_walk_forward(past, hist[c])
         if s["n_trades_oos"] < min_trades or s["n_live_windows"] < min_windows:
+            continue
+        if s["oos_max_drawdown"] <= -1.0:      # ruined so far: a closed account (see _qualifying)
             continue
         if require_pardo and not s["pardo_pass"]:
             continue
@@ -258,6 +279,13 @@ def walk_forward_portfolio(
         hist = rets.loc[: start - pd.Timedelta(nanoseconds=1)]
         if len(hist) < 60:
             continue
+        block = rets.loc[start:end] if end is None else rets.loc[start: end - pd.Timedelta(nanoseconds=1)]
+        if parts and compound(pd.concat(parts).to_numpy())[-1] <= 0.0:
+            # the book went to zero or below in an earlier period: it is closed
+            # (close_after_ruin), nothing is selected again
+            parts.append(pd.Series(0.0, index=block.index))
+            log.append(dict(period_start=start, selected=[], weights={}, ruined=True))
+            continue
         sharpes = hist.apply(annualized_sharpe)
         ok = sharpes >= min_sharpe
         if min_trades_proxy > 0:
@@ -266,7 +294,6 @@ def walk_forward_portfolio(
         if windows is not None:
             cands = _causal_filter(cands, hist, windows, start, min_trades, min_windows, require_pardo, min_wfe)
         sel = select_subset(hist, cands, method, max_strategies, corr_ceiling)
-        block = rets.loc[start:end] if end is None else rets.loc[start: end - pd.Timedelta(nanoseconds=1)]
         if not sel or block.empty:
             parts.append(pd.Series(0.0, index=block.index))
             log.append(dict(period_start=start, selected=[], weights={}))
@@ -277,10 +304,11 @@ def walk_forward_portfolio(
         # the block's return to the last digit, not to three
         log.append(dict(period_start=start, selected=sel, weights=w.to_dict()))
 
-    port = pd.concat(parts) if parts else pd.Series(dtype=float)
+    port = close_after_ruin(pd.concat(parts)) if parts else pd.Series(dtype=float)
     return dict(
         portfolio_returns=port,
-        portfolio_equity=initial_equity * (1 + port).cumprod() if len(port) else pd.Series(dtype=float),
+        portfolio_equity=(pd.Series(initial_equity * compound(port.to_numpy()), index=port.index)
+                          if len(port) else pd.Series(dtype=float)),
         selections=log,
         sharpe=annualized_sharpe(port) if len(port) > 2 else 0.0,
     )

@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 import sys
 import unittest
+import numpy as np
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -46,6 +47,11 @@ def _fill_price_for(order, open_, level):
 
 
 class LiveOrderTests(unittest.TestCase):
+    # minutes of sweeps (the hedge_wide templates of the sample above all):
+    # pytest skips the class unless run with -m slow (tests/conftest.py);
+    # unittest runs it
+    slow = True
+
     @classmethod
     def setUpClass(cls):
         cls.df = synthetic_ohlc(1400, seed=17)
@@ -606,6 +612,84 @@ class SpreadSizingTests(unittest.TestCase):
         capped = portfolio_targets([spread, cash], {"X|t": 0.5, "SPY|t": 0.5}, account_equity=100_000.0, max_gross=0.295)
         self.assertAlmostEqual(capped["scale_applied"], 0.5)
         self.assertAlmostEqual(float(capped["legs"].set_index("asset").loc["X", "shares"]), 1.5)
+
+
+class BracketTargetTests(unittest.TestCase):
+    """The engine can take a target on the entry bar (when the bar's prices
+    beyond the fill certainly came after it), so the published entry carries
+    the target as a bracket: an ATR target as an offset from the FILL (a gap
+    moves it), a countertrend midline as a price. Checked against what the
+    engine then does on the next bar."""
+
+    def test_entry_orders_carry_the_target_the_engine_uses(self):
+        df = synthetic_ohlc(1200, seed=5)
+        found = same_bar = 0
+        for entry in ("stop", "pullback", "close_confirm"):
+            tpl = StrategyTemplate("b", exit_style="target_stop", entry_style=entry, cost_bps=0.0,
+                                   atr_mult_target=0.5)   # near enough to be hit on the entry bar
+            for t in range(LOOKBACK + 20, len(df) - 1, 3):
+                st = strategy_state(df.iloc[:t], tpl, equity=100_000.0, lookback_bars=LOOKBACK)
+                for o in st["entry_orders"]:
+                    self.assertIn("bracket", o["note"])
+                    self.assertAlmostEqual(o["target_offset"], o["side"] * tpl.atr_mult_target * st["atr"])
+                    found += 1
+                if not st["entry_orders"]:
+                    continue
+                after = backtest(df.iloc[t - LOOKBACK:t + 1], tpl, initial_equity=100_000.0)
+                for tr in after["trades"]:
+                    if tr["entry_date"] == tr["exit_date"] == df.index[t] and tr["reason"] == "target":
+                        o = next(o for o in st["entry_orders"] if o["side"] == tr["side"])
+                        self.assertAlmostEqual(tr["exit_price"], tr["entry_price"] + o["target_offset"], places=8)
+                        same_bar += 1
+        self.assertGreater(found, 0)
+        self.assertGreater(same_bar, 0, "the sweep never takes a target on its entry bar")
+
+    def test_a_fade_carries_the_midline_and_others_carry_nothing(self):
+        df = synthetic_ohlc(900, seed=5)
+        fade = StrategyTemplate("f", exit_style="channel", direction_logic="countertrend", cost_bps=0.0)
+        plain = StrategyTemplate("p", exit_style="atr_trail", cost_bps=0.0)
+        seen = 0
+        for t in range(400, 900, 25):
+            for o in strategy_state(df.iloc[:t], fade, lookback_bars=LOOKBACK)["entry_orders"]:
+                self.assertIn("target", o)
+                seen += 1
+            for o in strategy_state(df.iloc[:t], plain, lookback_bars=LOOKBACK)["entry_orders"]:
+                self.assertFalse({"target", "target_offset"} & set(o))
+        self.assertGreater(seen, 0)
+
+
+class FlatAssetTradeListTests(unittest.TestCase):
+    def test_an_asset_the_book_is_flat_in_is_still_priced(self):
+        by_asset = pd.DataFrame(columns=["shares", "price", "point_value", "basis", "notional", "pct_of_account"])
+        t = trade_list(by_asset, {"SPY": 50.0, "spread": -1.0}, prices={"SPY": (400.0, 1.0), "spread": (-1.5, 1000.0)})
+        self.assertEqual(list(t["action"]), ["SELL", "BUY"])
+        self.assertAlmostEqual(float(t.loc["SPY", "order_notional"]), 50 * 400.0)
+        self.assertAlmostEqual(float(t.loc["spread", "order_notional"]), 1.5 * 1000.0)
+        self.assertTrue(np.isnan(trade_list(by_asset, {"X": 1.0}).loc["X", "order_notional"]))
+
+
+class DeadAtrExitLevelTests(unittest.TestCase):
+    def test_the_published_trail_uses_the_atr_the_engine_manages_with(self):
+        """A flat patch drives the ATR to 0 while a chandelier position is
+        open: the engine keeps managing it with the last usable ATR, so the
+        published stop is 3 of THOSE ATRs below the high, not a stop sitting
+        on the high itself."""
+        n = 80
+        o = np.full(n, 100.0); h = o + 1.0; l = o - 1.0; c = o.copy()
+        for i in range(40, 60):                              # a trend: long at the 20-bar high, extreme 119
+            o[i] = c[i] = 100.0 + (i - 39); h[i] = o[i] + 1.0; l[i] = o[i] - 1.0
+        o[60:] = h[60:] = l[60:] = c[60:] = 121.0            # then pinned at the extreme: TR 0, ATR(5) 0
+        df = pd.DataFrame({"Open": o, "High": h, "Low": l, "Close": c}, index=pd.bdate_range("2025-01-01", periods=n))
+        tpl = StrategyTemplate("t", exit_style="atr_trail", n_entry=20, atr_n=5, atr_mult_trail=3.0,
+                               atr_mult_stop=100.0, cost_bps=0.0, sides="long_only")
+        st = strategy_state(df, tpl, equity=100_000.0, lookback_bars=70)
+        self.assertEqual(st["position"], 1)
+        self.assertEqual(st["atr"], 0.0)
+        stop = next(x for x in st["exit_orders"] if x["kind"] == "stop")
+        res = backtest(df.iloc[-70:], tpl, initial_equity=100_000.0)
+        self.assertGreater(res["last_atr"], 0.0)
+        self.assertAlmostEqual(stop["level"], res["open_position"]["trail_extreme"] - 3.0 * res["last_atr"])
+        self.assertLess(stop["level"], 121.0)
 
 
 if __name__ == "__main__":

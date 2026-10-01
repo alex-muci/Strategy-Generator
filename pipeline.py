@@ -16,6 +16,7 @@ what is left in the entry points is argument parsing, printing and output.
 """
 
 from __future__ import annotations
+import argparse
 from contextlib import contextmanager
 from multiprocessing import get_context
 import os
@@ -26,7 +27,7 @@ import numpy as np
 import pandas as pd
 
 from data import load_yfinance
-from generator import param_grid_for
+from generator import param_grid_for, FAMILIES
 from live import drop_forming_bar
 from portfolio import select_portfolio, walk_forward_portfolio, MIN_TRADES, MIN_WINDOWS
 from robustness import (
@@ -34,13 +35,121 @@ from robustness import (
     reality_check, effective_n_trials, merge_block_stats, evaluate_template,
 )
 from strategy import (
-    annualized_sharpe, max_drawdown, periods_per_year, set_periods_per_year,
-    periods_per_year_for_interval,
+    annualized_sharpe, max_drawdown, periods_per_year, set_periods_per_year, compound,
+    periods_per_year_for_interval, SIDES,
 )
 from walkforward import matrix_cells, matrix_row, matrix_frame
 
 
 SYNTHETIC_INTERVAL = "1d"   # data.synthetic_ohlc is always business-daily
+
+
+# --------------------------------------------------------------------------
+# the command line both entry points share
+# --------------------------------------------------------------------------
+
+def add_research_args(p: argparse.ArgumentParser, *, start: str) -> argparse.ArgumentParser:
+    """The research flags of `main.py` and `etf_dashboard.py research`, defined
+    once: the template family, the walk-forward, sizing, the instrument, the
+    portfolio step and the stress tests. A flag that means the same thing in
+    both must not be able to drift (a default, a choice list, a help text).
+    What is left to each entry point is what only it has: where the data
+    comes from (`--real`/`--csv`/synthetic vs `--assets`), `--interval` and
+    `--jobs` (which the dashboard's signals phase shares too), the output
+    and the per-asset `--sides-map` / `--portfolio-vol` of a multi-asset book.
+    `start` is the default of `--start` (the two entry points differ)."""
+    p.add_argument("--family", default="quick", choices=list(FAMILIES))
+    p.add_argument("--max-templates", type=int, default=None)
+    p.add_argument("--sides", nargs="+", default=None, choices=SIDES,
+                   help="restrict every template to these sides (default: the family's own list, "
+                        "'both' for quick and default). On an asset with a drift, e.g. --sides long_only")
+    p.add_argument("--start", default=start)
+    p.add_argument("--bars-per-day", type=float, default=None,
+                   help="intraday bars per trading day, replacing the US-equity session --interval assumes "
+                        "(7 '1h' bars): e.g. 23 for '1h' bars of a future on a ~23 h session. Sets the "
+                        "annualization (252 x this bars a year); intraday intervals only")
+    p.add_argument("--bars", type=int, default=3000, help="synthetic bars (per asset)")
+    p.add_argument("--train", type=int, default=500, help="training window (bars)")
+    p.add_argument("--test", type=int, default=125, help="test window (bars)")
+    p.add_argument("--anchored", action="store_true", help="expanding instead of rolling training window")
+    p.add_argument("--selection", default="plateau", choices=["plateau", "best"])
+    p.add_argument("--metric", default="sharpe", choices=["sharpe", "return_over_dd", "profit_factor"])
+    p.add_argument("--wide-grid", action="store_true")
+    p.add_argument("--cost-bps", type=float, default=5.0,
+                   help="commission+slippage per side, bps of notional. A cash asset's cost: an instrument with a "
+                        "margin is costed per unit only (--cost-per-unit), its bps cost is 0")
+    p.add_argument("--risk-pct", type=float, default=0.01, help="equity risked per trade (per slot)")
+    p.add_argument("--max-leverage", type=float, default=2.0)
+    p.add_argument("--vol-target", type=float, default=0.0,
+                   help="annualized volatility each entry is sized to (e.g. 0.15); 0 = risk --risk-pct on the ATR "
+                        "stop. Set it near the asset's own vol to put the strategies on the buy & hold scale; the "
+                        "same target gives every asset of a book the same risk")
+    p.add_argument("--vol-target-n", type=int, default=60,
+                   help="bars of close-to-close changes in the realized-vol estimate")
+    p.add_argument("--point-value", type=float, default=1.0,
+                   help="currency per 1.0 of price per unit: 1 for a share, 1000 for a Brent lot, 50 for ES")
+    p.add_argument("--cost-per-unit", type=float, default=0.0,
+                   help="commission+slippage per unit per side in currency, on top of --cost-bps")
+    p.add_argument("--margin-per-unit", type=float, default=0.0,
+                   help="initial margin per unit in currency. Give it for every future or spread: it makes the "
+                        "series a future (--max-leverage caps margin / equity, so set it at or below 1; the vol "
+                        "target sizes on price-point changes; costs are per unit only, --cost-bps is 0; the "
+                        "benchmark is one unit's P&L). Without it the series is a cash asset (cap on notional, "
+                        "vol target on %% returns). Required for prices at or below zero")
+    p.add_argument("--roll-cost-per-unit", type=float, default=0.0,
+                   help="currency per unit charged to a position held through a contract roll, long or short: "
+                        "the data needs a Roll column (1 on the bars at whose close the contract rolled; "
+                        "extra_utils/ETF_trick_spreads.py writes it). Never fold roll costs into the price "
+                        "series: a short would collect them")
+    p.add_argument("--whole-units", action="store_true",
+                   help="floor every size to whole units (contracts); a size below one opens nothing. "
+                        "Recommended for futures: research then trades what the live orders round to")
+    p.add_argument("--instrument-map", nargs="+", default=None, metavar="ASSET=PV[,COST[,MARGIN[,ROLL]]]",
+                   help="per-asset instrument: point value, cost per unit per side, margin per unit, roll cost per "
+                        "unit, e.g. brent_z25z26=1000,15,3000; other assets keep the run-wide flags. A mapped asset "
+                        "takes only what is given here (a cost, margin or roll cost left out is 0, e.g. SPY=1 is a "
+                        "plain share). ASSET is a ticker, or a CSV's file stem")
+    p.add_argument("--min-sharpe", type=float, default=0.3)
+    p.add_argument("--max-strategies", type=int, default=8)
+    p.add_argument("--corr-ceiling", type=float, default=0.6)
+    p.add_argument("--require-pardo", action="store_true", help="only candidates passing Pardo's WFA criteria")
+    p.add_argument("--select-method", default="greedy", choices=["greedy", "cluster"])
+    p.add_argument("--weighting", default="equal", choices=["equal", "hrp"])
+    p.add_argument("--cpcv-groups", type=int, default=8)
+    p.add_argument("--cpcv-k", type=int, default=2)
+    p.add_argument("--n-boot", type=int, default=1000)
+    return p
+
+
+INSTRUMENT_FIELDS = ("point_value", "cost_per_unit", "margin_per_unit", "roll_cost_per_unit")
+
+
+def parse_instrument_map(items, assets) -> dict:
+    """{'brent': {'point_value': 1000.0, 'cost_per_unit': 15.0, 'margin_per_unit': 3000.0,
+    'roll_cost_per_unit': 0.0}} from ['brent=1000,15,3000']; everything after the
+    point value may be left out (and is then 0). `assets` are the run's asset
+    names: a mapped name that is not one of them is an error, not a no-op."""
+    usage = "expected ASSET=POINT_VALUE[,COST_PER_UNIT[,MARGIN_PER_UNIT[,ROLL_COST_PER_UNIT]]]"
+    out = {}
+    for item in items or []:
+        # the LAST '=': a Yahoo futures ticker has one of its own (CL=F=1000,2.5,6000)
+        asset, _, spec = item.rpartition("=")
+        if asset not in assets:
+            raise SystemExit(f"--instrument-map {item}: {asset!r} is not an asset of this run ({', '.join(assets)})")
+        if asset in out:
+            raise SystemExit(f"--instrument-map {item}: {asset!r} is mapped twice")
+        try:
+            vals = [float(v) for v in spec.split(",")]
+        except ValueError:
+            raise SystemExit(f"--instrument-map {item}: {usage}")
+        if (not 1 <= len(vals) <= len(INSTRUMENT_FIELDS) or not all(np.isfinite(vals))
+                or vals[0] <= 0 or any(v < 0 for v in vals)):
+            raise SystemExit(f"--instrument-map {item}: {usage}")
+        # a full instrument: what is left out is a cash share's (no per-unit cost,
+        # no margin, no roll), never the run-wide futures settings
+        vals += [0.0] * (len(INSTRUMENT_FIELDS) - len(vals))
+        out[asset] = dict(zip(INSTRUMENT_FIELDS, vals))
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -71,14 +180,19 @@ def cscv_partitions_for(T: int) -> int:
 
 def eval_config(args, interval: str) -> dict:
     """The evaluation settings of a research run, as a plain (picklable,
-    JSON-able) dict read off an argparse namespace."""
+    JSON-able) dict read off an argparse namespace. `cost_bps` is the
+    run-wide one as given: `instrument_of` zeroes it for an instrument with a
+    margin."""
+    bars_per_day = getattr(args, "bars_per_day", None)
     return dict(
-        interval=interval, periods_per_year=periods_per_year_for_interval(interval),
+        interval=interval, bars_per_day=bars_per_day,
+        periods_per_year=periods_per_year_for_interval(interval, bars_per_day),
         train_bars=args.train, test_bars=args.test, anchored=args.anchored,
         metric=args.metric, selection=args.selection, wide_grid=args.wide_grid,
         cost_bps=args.cost_bps, risk_pct=args.risk_pct, max_leverage=args.max_leverage,
         vol_target=args.vol_target, vol_target_n=args.vol_target_n,
         point_value=args.point_value, cost_per_unit=args.cost_per_unit, margin_per_unit=args.margin_per_unit,
+        roll_cost_per_unit=float(getattr(args, "roll_cost_per_unit", 0.0) or 0.0),
         whole_units=bool(getattr(args, "whole_units", False)),
         cpcv_groups=args.cpcv_groups, cpcv_k=args.cpcv_k,
     )
@@ -87,31 +201,58 @@ def eval_config(args, interval: str) -> dict:
 def instrument_of(c: dict, asset: str | None = None) -> dict:
     """The instrument settings of a research config, with the defaults of a
     cash share for configs written before they existed; `asset` picks up the
-    per-asset overrides of `instrument_map` (a dashboard book that mixes
-    shares and a future) and, when those give a margin, zero bps costs."""
+    per-asset overrides of `instrument_map` (a book that mixes shares and a
+    future, or a single-asset run given its instrument by name).
+
+    An instrument with a margin is costed per unit only: `cost_bps` is 0 for
+    it, whether the margin is run-wide or mapped. Its quoted level is a
+    back-adjusted or spread price, not a notional, so a basis-point cost of it
+    is arbitrary (and through zero undefined); main.py and the dashboard
+    apply this one rule."""
     out = dict(point_value=float(c.get("point_value", 1.0) or 1.0),
                cost_per_unit=float(c.get("cost_per_unit", 0.0) or 0.0),
                margin_per_unit=float(c.get("margin_per_unit", 0.0) or 0.0),
+               roll_cost_per_unit=float(c.get("roll_cost_per_unit", 0.0) or 0.0),
                whole_units=bool(c.get("whole_units", False)))
     over = (c.get("instrument_map") or {}).get(asset) if asset is not None else None
     if over:
         # a mapped asset is its own instrument: what the map leaves out is a
         # cash share's, not the run-wide futures settings (SPY=1 in a Brent
         # book must not inherit the Brent margin and per-lot cost)
-        out.update(point_value=1.0, cost_per_unit=0.0, margin_per_unit=0.0)
+        out.update(point_value=1.0, cost_per_unit=0.0, margin_per_unit=0.0, roll_cost_per_unit=0.0)
         out.update({k: (bool(v) if k == "whole_units" else float(v)) for k, v in over.items() if k in out})
-        if out["margin_per_unit"] > 0:
-            out["cost_bps"] = 0.0
+    if out["margin_per_unit"] > 0:
+        out["cost_bps"] = 0.0
     return out
 
 
-def instrument_text(c: dict) -> str:
+def cost_bps_of(c: dict, asset: str | None = None) -> float:
+    """The bps cost an asset of the run is actually charged (0 with a margin)."""
+    return float(instrument_of(c, asset).get("cost_bps", c.get("cost_bps", 0.0)))
+
+
+def costs_text(c: dict, assets=None) -> str:
+    """The bps costs a run actually charges, for a report: one number when
+    every asset pays the same, else per asset (a margined one pays 0)."""
+    assets = list(assets) if assets else [None]
+    bps = {a: cost_bps_of(c, a) for a in assets}
+
+    def one(v):
+        return f"{v:g} bps/side" if v > 0 else "per unit only"
+    if len(set(bps.values())) == 1:
+        return one(next(iter(bps.values())))
+    return ", ".join(f"{a} {one(v)}" for a, v in bps.items())
+
+
+def instrument_text(c: dict, asset: str | None = None) -> str:
     """One phrase describing a non-default instrument, empty for a cash share."""
-    ins = instrument_of(c)
-    if ins == dict(point_value=1.0, cost_per_unit=0.0, margin_per_unit=0.0, whole_units=False):
+    ins = {k: v for k, v in instrument_of(c, asset).items() if k != "cost_bps"}
+    if ins == dict(point_value=1.0, cost_per_unit=0.0, margin_per_unit=0.0, roll_cost_per_unit=0.0,
+                   whole_units=False):
         return ""
     return (f"point value {ins['point_value']:g} per unit, {ins['cost_per_unit']:g} per unit per side, "
             f"margin {ins['margin_per_unit']:g} per unit"
+            + (f", {ins['roll_cost_per_unit']:g} per unit per roll" if ins["roll_cost_per_unit"] else "")
             + (", whole units" if ins["whole_units"] else ""))
 
 
@@ -349,9 +490,11 @@ def curve_stats(r: pd.Series, additive: bool = False) -> dict:
 def against_benchmark(r: pd.Series, bh: pd.Series) -> dict:
     """Beta, correlation and information ratio of a return stream against
     buy-and-hold over the stream's own dates. The IR (annualized Sharpe of the
-    residual after removing beta x benchmark) is scale-free, so it compares
-    a strategy sized on its own rule (1 % per trade, or a vol target) with an
-    unlevered holding."""
+    residual after removing beta x benchmark) and the correlation are
+    scale-free, so they compare a strategy sized on its own rule (1 % per
+    trade, or a vol target) with an unlevered holding. The beta is in units
+    of the benchmark: against the one-unit benchmark of a future it scales
+    with 1 / point value (`benchmark_returns`)."""
     x = bh.reindex(r.index).fillna(0.0).to_numpy()
     y = r.to_numpy()
     if len(y) < 3 or x.std(ddof=1) == 0 or y.std(ddof=1) == 0:
@@ -372,9 +515,10 @@ def benchmark_returns(df: pd.DataFrame, point_value: float = 1.0, initial_equity
     spread), or a margined future (whose quoted level, back-adjusted or
     rolled, is not the price of an investment: its percentage change is not
     the contract's return), is benchmarked by the P&L of holding one unit on
-    the initial equity: additive, on an arbitrary scale (Sharpe, beta,
-    correlation and the information ratio are scale-free; CAGR and drawdown
-    are not)."""
+    the initial equity: additive, on an arbitrary scale. Its Sharpe, the
+    correlation to it and the information ratio are scale-free; the beta is
+    NOT (it scales with initial_equity / point_value: it reads as the number
+    of units held on average), nor are CAGR and drawdown."""
     close = df["Close"]
     if (df["Low"] > 0).all() and not margin_per_unit > 0:
         return BENCH_BUY_HOLD, close.pct_change()
@@ -383,7 +527,11 @@ def benchmark_returns(df: pd.DataFrame, point_value: float = 1.0, initial_equity
 
 def benchmark_curve(r: pd.Series, additive: bool = False) -> pd.Series:
     """Growth of 1 from per-bar returns: compounded, or summed for an additive stream."""
-    return 1 + r.cumsum() if additive else (1 + r).cumprod()
+    if additive:
+        return 1 + r.cumsum()
+    # compounded, and closed at a deficit (strategy.compound): a portfolio's
+    # returns can go below -100 % once a futures slot owes more than it had
+    return pd.Series(compound(r.to_numpy()), index=r.index)
 
 
 def benchmark_stats(bh_returns: pd.Series, rets: pd.DataFrame, port: dict, nested: dict,

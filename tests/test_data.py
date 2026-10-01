@@ -258,3 +258,55 @@ class LoaderFuturesTests(unittest.TestCase):
         df, _ = self._load(frame, drop_nonpositive=False)
         self.assertEqual(len(df), 300)
         self.assertEqual(float(df["Close"].iloc[20]), -37.63)
+
+
+class RollColumnTests(unittest.TestCase):
+    """A Roll column read as 0 would charge no roll cost at all: every way a
+    vendor writes a flag is read, and anything else is refused."""
+
+    def _load(self, values):
+        import tempfile
+        from data import load_csv
+        n = 250
+        idx = pd.bdate_range("2024-01-01", periods=n)
+        df = pd.DataFrame({"Open": 1.0, "High": 1.5, "Low": 0.5, "Close": 1.0}, index=idx)
+        roll = [""] * n
+        roll[:len(values)] = values
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "x.csv")
+            df.assign(Roll=roll).to_csv(path)
+            return load_csv(path)["Roll"].to_numpy()[:len(values)]
+
+    def test_flags_in_any_spelling(self):
+        np.testing.assert_array_equal(self._load(["True", "1", "0"]), [1, 1, 0])
+        np.testing.assert_array_equal(self._load(["TRUE", "", " yes", "false", "2"]), [1, 0, 1, 0, 1])
+
+    def test_an_unknown_token_is_an_error(self):
+        with self.assertRaises(ValueError):
+            self._load(["roll", "0"])
+
+    def test_align_rolls_drops_a_roll_before_the_data_and_adds_merged_ones(self):
+        from data import align_rolls
+        r = pd.Series([1.0, 0, 1, 1, 0, 0], index=range(6))
+        np.testing.assert_array_equal(align_rolls(r, pd.Index([1, 4, 5])).to_numpy(), [0, 2, 0, 0, 0, 0])
+
+    def test_rolls_survive_a_newest_first_file_and_a_duplicate_stamp(self):
+        import tempfile
+        from data import load_csv
+        n = 250
+        idx = pd.bdate_range("2024-01-01", periods=n)
+        df = pd.DataFrame({"Open": 1.0, "High": 1.5, "Low": 0.5, "Close": 1.0, "Roll": 0.0}, index=idx)
+        df.iloc[100, df.columns.get_loc("Roll")] = 1.0
+        df.iloc[100, :4] = 0.0                                   # a no-trade row carrying the roll
+        dup = pd.concat([df, df.iloc[[59]].assign(Roll=1.0, Close=1.2)])   # a second print of bar 59, rolled
+        with tempfile.TemporaryDirectory() as tmp:
+            fwd, rev = os.path.join(tmp, "f.csv"), os.path.join(tmp, "r.csv")
+            df.to_csv(fwd); df.iloc[::-1].to_csv(rev)
+            a, b = load_csv(fwd), load_csv(rev)
+            pd.testing.assert_frame_equal(a, b)
+            self.assertEqual(list(a.index[a["Roll"] > 0]), [idx[99]])      # the bar before the dropped one
+            # the duplicate's roll stays with the one print kept
+            dpath = os.path.join(tmp, "d.csv"); dup.to_csv(dpath)
+            d = load_csv(dpath)
+            self.assertEqual(float(d["Roll"].loc[idx[59]]), 1.0)
+            self.assertEqual(float(d["Close"].loc[idx[59]]), 1.2)

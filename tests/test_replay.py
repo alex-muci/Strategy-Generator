@@ -219,10 +219,10 @@ class OrderLogTests(unittest.TestCase):
         self.assertEqual(set(self._rows("stop-chan", "stop_working")["detail_text"]), {"hard", "channel"})
         self.assertEqual(set(self._rows("stop-trail", "stop_working")["detail_text"]), {"hard", "trail"})
         self.assertEqual(set(self._rows("cc-target", "stop_working")["detail_text"]), {"hard"})
-        # a target is checked from the bar after the entry, the stop already on
-        # the entry bar (the same-bar stop): one stop_working row more per entry
+        # the target works from the fill like the stop: one target_working row
+        # for every stop_working row, the entry bar's included
         for name in ("cc-target", "fade-chan"):
-            self.assertEqual(len(self._rows(name, "target_working")) + len(self._rows(name, "entry_fill")),
+            self.assertEqual(len(self._rows(name, "target_working")),
                              len(self._rows(name, "stop_working")), name)
         self.assertEqual(len(self._rows("stop-chan", "target_working")), 0)
 

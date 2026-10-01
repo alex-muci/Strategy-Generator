@@ -142,11 +142,18 @@ Execution model (no look-ahead):
   * a 'pullback' limit rests `pullback_atr_mult` ATRs from the broken level
     on the side of the trade: back inside the channel when following the
     break, deeper beyond it when fading
+  * an exit order the OPEN already trades through (a stop, or a target)
+    fills at the open before anything intrabar; inside the bar the stop
+    goes first. On the entry bar a target is taken when the bar's prices
+    beyond the fill on its side certainly came after the fill (see _bar_loop)
   * costs per side: `cost_bps` of the notional (units x point_value x
     |price|) plus `cost_per_unit` x units; a spread has no notional, so it
-    is costed per unit with cost_bps = 0
+    is costed per unit with cost_bps = 0. A contract roll (the data's `Roll`
+    column) costs `roll_cost_per_unit` x units to whatever is held through it
   * P&L: side x units x point_value x (price change); equity is marked to
     market at the CLOSE of each bar, after all fills
+  * ruin: an equity at or below zero closes the account at that close; a
+    deficit (a loss beyond the cash) is kept, as a futures account owes it
 """
 
 from __future__ import annotations
@@ -162,7 +169,8 @@ PERIODS_PER_YEAR = 252
 
 # Regular-session bars per year for the intervals yfinance serves. US equity
 # ETFs trade 6.5h a day, which Yahoo cuts into seven '1h' bars (the last one is
-# a 30-minute stub), thirteen '30m' bars, and so on.
+# a 30-minute stub), thirteen '30m' bars, and so on. A future on a ~23h
+# session has more: pass --bars-per-day (periods_per_year_for_interval).
 BARS_PER_YEAR = {
     "1mo": 12, "1wk": 52, "1d": 252,
     "1h": 252 * 7, "60m": 252 * 7, "90m": 252 * 5,
@@ -189,14 +197,30 @@ def set_periods_per_year(n: int) -> None:
     PERIODS_PER_YEAR = n
 
 
-def periods_per_year_for_interval(interval: str) -> int:
-    """Bars per year for a yfinance interval string ('1d', '1h', '30m', ...)."""
-    try:
+INTRADAY_MINUTES = {"1h": 60, "60m": 60, "90m": 90, "30m": 30, "15m": 15, "5m": 5, "1m": 1}
+TRADING_DAYS_PER_YEAR = 252
+
+
+def periods_per_year_for_interval(interval: str, bars_per_day: float | None = None) -> int:
+    """Bars per year for a yfinance interval string ('1d', '1h', '30m', ...).
+
+    The intraday entries of BARS_PER_YEAR count a US equity session (6.5 h:
+    seven '1h' bars a day). A future trading ~23 h a day has 23 '1h' bars a
+    day, and annualizing them at 7 understates every Sharpe by sqrt(23/7):
+    `bars_per_day` replaces the session's count (252 x bars_per_day a year).
+    It is for intraday intervals only, and at most a whole day of them."""
+    if interval not in BARS_PER_YEAR:
+        raise ValueError(f"unknown interval {interval!r}; known: {', '.join(BARS_PER_YEAR)}")
+    if bars_per_day is None:
         return BARS_PER_YEAR[interval]
-    except KeyError:
-        raise ValueError(
-            f"unknown interval {interval!r}; known: {', '.join(BARS_PER_YEAR)}"
-        ) from None
+    if interval not in INTRADAY_MINUTES:
+        raise ValueError(f"bars_per_day applies to intraday intervals ({', '.join(INTRADAY_MINUTES)}), "
+                         f"not {interval!r}: those are one bar per day, week or month by definition")
+    most = 24 * 60 / INTRADAY_MINUTES[interval]
+    if not 0 < bars_per_day <= most:
+        raise ValueError(f"bars_per_day {bars_per_day:g} for {interval} bars: must be in (0, {most:g}] "
+                         "(a day has 24 hours)")
+    return max(1, int(round(TRADING_DAYS_PER_YEAR * bars_per_day)))
 
 
 # --------------------------------------------------------------------------
@@ -1129,6 +1153,7 @@ class StrategyTemplate:
     cost_per_unit: float = 0.0   # currency per unit per side (commission + slippage in ticks), on top of cost_bps
     margin_per_unit: float = 0.0  # initial margin per unit, the leverage cap's basis; 0 = none (cap on notional)
     whole_units: bool = False    # floor every size to whole units (contracts); a size below 1 opens nothing
+    roll_cost_per_unit: float = 0.0  # currency per unit held through a contract roll (the data's `Roll` bars)
 
     def with_params(self, **kwargs) -> "StrategyTemplate":
         d = asdict(self)
@@ -1158,7 +1183,7 @@ class StrategyTemplate:
         assert self.bias_filter in BIAS_FILTERS
         assert self.sides in SIDES
         assert self.point_value > 0, "point_value must be positive"
-        assert self.cost_per_unit >= 0 and self.margin_per_unit >= 0
+        assert self.cost_per_unit >= 0 and self.margin_per_unit >= 0 and self.roll_cost_per_unit >= 0
 
 
 # --------------------------------------------------------------------------
@@ -1355,11 +1380,13 @@ ORDER_KINDS = [
     "target_working",       # the ATR target or channel midline in force on this bar
     "time_exit_submit",     # time exit: market order at the open of this bar
     "exit_fill",            # position closed: price, shares; aux = trade P&L, detail = REASONS index
+    "roll",                 # the position was held through a contract roll at this close; aux = the roll cost
 ]
 ORDER_TYPES = ["-", "stop", "limit", "pullback", "market"]
 STOP_KINDS = ["hard", "channel", "trail"]
 _O_ENTRY_WORKING, _O_SUBMIT_MKT, _O_PB_SUBMIT, _O_PB_WORKING, _O_PB_EXPIRE, _O_PB_CANCEL = 0, 1, 2, 3, 4, 5
 _O_ENTRY_FILL, _O_ENTRY_REJECT, _O_STOP_WORKING, _O_TARGET_WORKING, _O_TIME_EXIT, _O_EXIT_FILL = 6, 7, 8, 9, 10, 11
+_O_ROLL = 12
 
 
 def _olog(o_i, o_f, m, bar, kind, side, detail, level, qty, aux):
@@ -1383,6 +1410,7 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
               atr_mult_stop, atr_mult_target, atr_mult_trail, pullback_atr_mult,
               pullback_valid_bars, max_hold_bars, risk_pct, max_leverage, vol_target_bar, cost_rate,
               point_value, cost_per_unit, margin_per_unit, whole_units,
+              roll, roll_cost_per_unit, fixed_capital,
               initial_equity, first_trade_bar, log_orders):
     """The bar loop. Plain numpy code so numba can compile it unchanged;
     the pure-Python version is used when numba is not installed.
@@ -1403,12 +1431,37 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
 
     Costs per side: cost_rate * notional + cost_per_unit * units. P&L:
     side * units * point_value * (price change). `whole_units` floors the
-    size to an integer after the cap (a contract is indivisible).
+    size to an integer after the cap (a contract is indivisible). A roll:
+    a position still open at the close of a bar with roll[i] > 0 (the
+    contract was rolled at that close) pays roll_cost_per_unit * units,
+    whichever its side: the cost of trading out of one contract and into
+    the next is charged to what is held, never folded into the price
+    series (where a short would collect it as a gain).
+
+    Exits: a stop or a target (an ATR target, a countertrend's channel
+    midline) the OPEN already trades through fills at the open, before
+    anything intrabar: the open is the bar's first price, so that ordering
+    is not ambiguous. Only when both are reached intrabar does the stop go
+    first (the conservative reading of an unknown path). On the entry bar the
+    stops are checked as on any bar, and the target too when every price
+    beyond the fill on the target's side came after it: a fill at the open
+    (a market order, or any order the open gapped through) or a stop entry
+    (price runs THROUGH a buy stop upwards, so a high above it is later). A
+    limit entry's bar is ambiguous (its high may precede the fill), and its
+    target waits for the next bar.
 
     Ruin: a close that leaves the equity at or below zero (a gap through the
     stop beyond the margin) liquidates the position at that close (reason
-    "ruin"), floors the cash at zero and ends the run flat: the equity is 0
-    from there on, never negative, so no return flips sign.
+    "ruin") and closes the account: nothing trades after it and the equity
+    stays at what the liquidation left. That is a DEFICIT when the loss went
+    beyond the cash: a futures account owes it to the broker, so it is kept
+    (a -167 % bar, not a -100 % one). The bar returns after it are 0.
+
+    `fixed_capital` sizes every entry (and the leverage cap) on
+    `initial_equity` instead of the cash, and turns ruin off: each bar's P&L
+    then depends on the prices alone, never on what the account made or
+    lost before, which is what a cross-validation that re-uses the bars
+    after a held-out block needs (robustness.trial_returns).
 
     Bars before `first_trade_bar` are indicator warm-up only: nothing is
     entered on them (and no order rests on them), so the walk-forward can
@@ -1437,7 +1490,7 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
     t_pnl = np.empty(n)
     t_cost = np.empty(n)
     n_trades = 0
-    # order log: at most 5 events on any bar (see the sites below), 8 is the margin
+    # order log: at most 6 events on any bar (see the sites below), 8 is the margin
     cap = 8 * n + 8 if log_orders else 1
     o_i = np.zeros((cap, 4), dtype=np.int64)
     o_f = np.zeros((cap, 3))
@@ -1465,11 +1518,15 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
     for i in range(1, n):
         # ---- ruin: the previous close left nothing ----
         if ruined:
-            equity[i] = 0.0
+            equity[i] = cash
             continue
-        if equity[i - 1] <= 0.0:
+        if not fixed_capital and equity[i - 1] <= 0.0:
+            # (a roll charged at that close stays charged: the ruin was decided on
+            # the equity net of it, and undoing it could leave a closed account
+            # with cash; one roll on a dead account is the conservative reading)
             if position != 0:
-                # liquidated at that close; the loss beyond the cash is the broker's
+                # liquidated at that close; a loss beyond the cash is a deficit
+                # the account owes, not the broker's to absorb
                 gross = position * shares * point_value * (close[i - 1] - entry_price)
                 xcost = cost_rate * shares * point_value * abs(close[i - 1]) + cost_per_unit * shares
                 cash += gross - xcost
@@ -1487,9 +1544,9 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
                 n_trades += 1
                 position = 0
                 shares = 0.0
-            cash = 0.0
-            equity[i - 1] = 0.0
-            equity[i] = 0.0
+            # the account is closed: it stays at what is left, a deficit included
+            equity[i - 1] = cash
+            equity[i] = cash
             pend_active = False
             ruined = True
             continue
@@ -1559,7 +1616,28 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
                     elif exit_style == 0 and not pos_trend:
                         m = _olog(o_i, o_f, m, i, _O_TARGET_WORKING, side, 0, mid_x[i - 1], shares, 0.0)
 
-                if side == 1 and low[i] <= stop_level:
+                # the target in force: the ATR target, or a countertrend
+                # trade's channel midline (a limit order on the far side)
+                has_tgt = exit_style == 2 or (exit_style == 0 and not pos_trend)
+                tgt = target_price if exit_style == 2 else mid_x[i - 1]
+                tgt_reason = 3 if exit_style == 2 else 2
+
+                # the open is the bar's first price: an order it already trades
+                # through fills there, before anything intrabar. Stop first
+                # (a target and a stop both through the open fill at the same
+                # price), then the target, which the open can reach without
+                # going anywhere near the stop
+                if side == 1 and open_[i] <= stop_level:
+                    exit_price = open_[i]
+                    reason = stop_reason
+                elif side == -1 and open_[i] >= stop_level:
+                    exit_price = open_[i]
+                    reason = stop_reason
+                elif has_tgt and ((side == 1 and open_[i] >= tgt) or (side == -1 and open_[i] <= tgt)):
+                    exit_price = open_[i]
+                    reason = tgt_reason
+                # intrabar, the path is unknown: the stop goes first
+                elif side == 1 and low[i] <= stop_level:
                     exit_price = min(open_[i], stop_level)
                     reason = stop_reason
                 elif side == -1 and high[i] >= stop_level:
@@ -1617,6 +1695,14 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
                 m = _olog(o_i, o_f, m, i, _O_PB_CANCEL, pend_side, 0 if i < first_trade_bar else 1,
                           pend_level, 0.0, 0.0)
             pend_active = False  # don't leave a stale resting order behind
+            if position != 0 and roll[i] > 0.0 and roll_cost_per_unit > 0.0:
+                # held through a roll at this close: the position pays it
+                # (roll[i] rolls: more than one when a dropped bar's moved here)
+                rc = roll_cost_per_unit * shares * roll[i]
+                cash -= rc
+                entry_cost += rc
+                if log_orders:
+                    m = _olog(o_i, o_f, m, i, _O_ROLL, position, 0, close[i], shares, rc)
             equity[i] = cash + (position * shares * point_value * (close[i] - entry_price) if position != 0 else 0.0)
             continue
 
@@ -1732,6 +1818,9 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
         entered = False
         if fill_side != 0:
             stop_dist = atr_mult_stop * a
+            # the capital the size is a fraction of: the account's cash, or a
+            # constant one (fixed_capital: no compounding, no path dependence)
+            base = initial_equity if fixed_capital else cash
             if vol_target_bar > 0.0:
                 # constant dollar volatility: the dollar vol wanted over the
                 # dollar vol of one unit; the stop still sits atr_mult_stop
@@ -1739,11 +1828,11 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
                 # (rvol in price points; for a cash asset it is the pct vol,
                 # and one unit's dollar vol is that times the fill price)
                 if margin_per_unit > 0.0:
-                    qty = cash * vol_target_bar / (rvol[i - 1] * point_value)
+                    qty = base * vol_target_bar / (rvol[i - 1] * point_value)
                 else:
-                    qty = cash * vol_target_bar / (rvol[i - 1] * abs(fill_px) * point_value)
+                    qty = base * vol_target_bar / (rvol[i - 1] * abs(fill_px) * point_value)
             else:
-                qty = cash * risk_pct / (stop_dist * point_value)
+                qty = base * risk_pct / (stop_dist * point_value)
             # scaled by the learner's conviction in the logic the trade is
             # entered under: the net side weight in its favour on the bar
             # before the fill (1 unless the direction is learned). A pullback
@@ -1753,7 +1842,7 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
             # the leverage cap's basis per unit: the margin when one is given
             # (a spread has no notional), else the notional at the fill
             basis = margin_per_unit if margin_per_unit > 0.0 else point_value * abs(fill_px)
-            qty = min(qty, max_leverage * cash / basis) if basis > 0.0 else 0.0
+            qty = min(qty, max_leverage * base / basis) if basis > 0.0 else 0.0
             if whole_units:
                 qty = np.floor(qty)
             if qty > 0:
@@ -1780,7 +1869,10 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
         # fill) and, for a trend trade with a channel exit, the opposite
         # channel -- whichever sits nearest the fill. A stop the fill is
         # already through (a close_confirm open that gapped past the exit
-        # channel) goes out at the fill itself.
+        # channel) goes out at the fill itself. The target is working from
+        # the fill too; it is taken on this bar only when the bar's prices on
+        # its side certainly came AFTER the fill (see the docstring) and no
+        # stop was reached (both reached: the stop, as on any bar).
         if entered:
             sb_level = stop_price
             sb_reason = 5
@@ -1802,11 +1894,37 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
                     sb_level = upper_x[i - 1]
                     sb_reason = 1
                     sb_kind = 1
+            sb_tgt = exit_style == 2 or (exit_style == 0 and not pos_trend)
+            tgt = target_price if exit_style == 2 else mid_x[i - 1]
             if log_orders:
                 m = _olog(o_i, o_f, m, i, _O_STOP_WORKING, position, sb_kind, sb_level, shares, 0.0)
+                if sb_tgt:
+                    m = _olog(o_i, o_f, m, i, _O_TARGET_WORKING, position, 0, tgt, shares, 0.0)
+            # every price beyond the fill on the target's side is later than
+            # the fill: a fill at the open, or a stop entry (fill_type 1),
+            # whose price ran through the level in the trade's direction
+            after_fill = fill_px == open_[i] or fill_type == 1
+            # the same order as on any later bar (the fill is this bar's
+            # "open" for the position): an order the fill is already through
+            # goes out at the fill, the stop first; then intrabar, the stop
+            # first, then the target
+            stop_at_fill = (position == 1 and fill_px <= sb_level) or (position == -1 and fill_px >= sb_level)
+            tgt_at_fill = (sb_tgt and after_fill
+                           and ((position == 1 and fill_px >= tgt) or (position == -1 and fill_px <= tgt)))
             hit = (position == 1 and low[i] <= sb_level) or (position == -1 and high[i] >= sb_level)
-            if hit:
-                sb_px = min(fill_px, sb_level) if position == 1 else max(fill_px, sb_level)
+            tgt_hit = (sb_tgt and after_fill
+                       and ((position == 1 and high[i] >= tgt) or (position == -1 and low[i] <= tgt)))
+            if stop_at_fill:
+                sb_px = fill_px
+            elif tgt_at_fill:
+                sb_px = fill_px
+                sb_reason = 3 if exit_style == 2 else 2
+            elif hit:
+                sb_px = sb_level
+            elif tgt_hit:
+                sb_px = tgt
+                sb_reason = 3 if exit_style == 2 else 2
+            if stop_at_fill or tgt_at_fill or hit or tgt_hit:
                 gross = position * shares * point_value * (sb_px - entry_price)
                 xcost = cost_rate * shares * point_value * abs(sb_px) + cost_per_unit * shares
                 cash += gross - xcost
@@ -1834,11 +1952,19 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
             else:
                 trail_extreme = min(trail_extreme, low[i])
 
+        # ---- a roll at this close: the position held through it pays it ----
+        if position != 0 and roll[i] > 0.0 and roll_cost_per_unit > 0.0:
+            rc = roll_cost_per_unit * shares * roll[i]
+            cash -= rc
+            entry_cost += rc
+            if log_orders:
+                m = _olog(o_i, o_f, m, i, _O_ROLL, position, 0, close[i], shares, rc)
+
         # ---- mark to market at the close of bar i ----
         equity[i] = cash + (position * shares * point_value * (close[i] - entry_price) if position != 0 else 0.0)
 
     # ---- ruin on the last bar: the loop above would have closed it on the next ----
-    if n > 1 and equity[n - 1] <= 0.0 and not ruined:
+    if n > 1 and equity[n - 1] <= 0.0 and not ruined and not fixed_capital:
         if position != 0:
             gross = position * shares * point_value * (close[n - 1] - entry_price)
             xcost = cost_rate * shares * point_value * abs(close[n - 1]) + cost_per_unit * shares
@@ -1857,8 +1983,7 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
             n_trades += 1
             position = 0
             shares = 0.0
-        cash = 0.0
-        equity[n - 1] = 0.0
+        equity[n - 1] = cash
         pend_active = False
 
     # the trailing state is returned too, so the live signal layer in live.py can
@@ -1918,6 +2043,10 @@ def validate_instrument(df: pd.DataFrame, tpl: StrategyTemplate) -> None:
     so `backtest` runs it every call."""
     if not tpl.point_value > 0:
         raise ValueError(f"point_value must be positive, got {tpl.point_value}")
+    if tpl.roll_cost_per_unit > 0 and "Roll" not in df.columns:
+        raise ValueError(
+            f"roll_cost_per_unit {tpl.roll_cost_per_unit:g} needs a Roll column in the data (1 on the bars at "
+            "whose close the contract rolled; extra_utils/ETF_trick_spreads.py writes one, data.load_csv reads it)")
     low = float(np.nanmin(df[["Open", "High", "Low", "Close"]].to_numpy(dtype=float))) if len(df) else 1.0
     if low <= 0:
         if not tpl.margin_per_unit > 0:
@@ -1971,7 +2100,7 @@ def typical_units(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: float
 
 
 def backtest(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: float = 100_000.0,
-             first_trade_bar: int = 0, log_orders: bool = False) -> dict:
+             first_trade_bar: int = 0, log_orders: bool = False, fixed_capital: bool = False) -> dict:
     """Run `tpl` over `df` (must have Open/High/Low/Close). Returns a dict:
         equity   : pd.Series of end-of-bar equity, indexed like df
         returns  : pd.Series of per-bar simple returns of equity
@@ -1985,6 +2114,16 @@ def backtest(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: float = 10
     `first_trade_bar` > 0 uses the first bars as indicator warm-up only: the
     equity stays at `initial_equity` and no trade can open before that bar.
 
+    `fixed_capital` sizes every entry on `initial_equity` rather than on the
+    account's cash, never declares ruin, and returns each bar's P&L over
+    `initial_equity` (additive returns) instead of over the previous equity:
+    every return is then a function of the prices only, the same whatever
+    the account did on earlier bars (see `_bar_loop`).
+
+    A `Roll` column in `df` (> 0 on the bars at whose close the contract
+    rolled) charges `tpl.roll_cost_per_unit` per unit to a position held
+    through that close, long or short.
+
     Prices may be zero or negative (see `validate_instrument`): every rule
     works on price differences, and adding a constant to every price leaves
     the trades, the P&L and the equity unchanged.
@@ -1992,6 +2131,10 @@ def backtest(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: float = 10
     n = len(df)
     first_trade_bar = int(max(first_trade_bar, 0))
     validate_instrument(df, tpl)
+    # the roll bars matter only when a roll costs something (a Roll column of
+    # any dtype is then left alone)
+    roll = (_to_arr(df["Roll"].fillna(0.0)) if "Roll" in df.columns and tpl.roll_cost_per_unit > 0
+            else np.zeros(n))
     close = _to_arr(df["Close"])
     open_ = _to_arr(df["Open"])
     high = _to_arr(df["High"])
@@ -2015,6 +2158,7 @@ def backtest(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: float = 10
         int(tpl.pullback_valid_bars), int(tpl.max_hold_bars), float(tpl.risk_pct), float(tpl.max_leverage),
         float(vol_target_bar), tpl.cost_bps / 1e4,
         float(tpl.point_value), float(tpl.cost_per_unit), float(tpl.margin_per_unit), bool(tpl.whole_units),
+        roll, float(tpl.roll_cost_per_unit), bool(fixed_capital),
         float(initial_equity), first_trade_bar, bool(log_orders),
     )
     (equity, entries, t_entry, t_exit, t_side, t_entry_px, t_exit_px, t_shares, t_pnl, t_cost,
@@ -2037,9 +2181,14 @@ def backtest(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: float = 10
         for k in range(n_trades)
     ]
     rets = np.zeros(n)
-    # a ruined run sits at 0: one -100 % bar, then flat (never 0/0 or a sign flip)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        rets[1:] = np.where(equity[:-1] > 0.0, equity[1:] / equity[:-1] - 1.0, 0.0)
+    if fixed_capital:
+        # P&L over the constant capital the sizes are a fraction of: additive
+        rets[1:] = np.diff(equity) / float(initial_equity)
+    else:
+        # a ruined run: one bar down to what the liquidation left (below -100 %
+        # when it left a deficit), then flat (never a ratio of non-positive equities)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            rets[1:] = np.where(equity[:-1] > 0.0, equity[1:] / equity[:-1] - 1.0, 0.0)
     equity_s = pd.Series(equity, index=idx)
     returns = pd.Series(rets, index=idx)
     stats = performance_stats(equity, trades, initial_equity, rets, t_pnl[:n_trades],
@@ -2073,6 +2222,26 @@ def annualized_sharpe(rets: pd.Series | np.ndarray, ppy: int | None = None) -> f
     sd = r.std(ddof=1)
     ppy = periods_per_year() if ppy is None else ppy
     return float(r.mean() / sd * np.sqrt(ppy)) if sd > 0 else 0.0
+
+
+def compound(returns) -> np.ndarray:
+    """Growth of 1 from per-bar simple returns (1-D, or 2-D column by column),
+    for an account that is closed once it reaches zero or less: from the bar
+    the curve first sits at or below 0 it stays at that value. A deficit is
+    owed, not invested: compounding it with later returns would flip their
+    sign (a gain would deepen it), and a later window or another CPCV group
+    trading on is a restart the account could not make."""
+    eq = np.cumprod(1.0 + np.asarray(returns, dtype=float), axis=0)
+    dead = eq <= 0.0
+    if not dead.any():
+        return eq
+    first = np.argmax(dead, axis=0)
+    if eq.ndim == 1:
+        eq[first:] = eq[first]
+    else:
+        for j in np.flatnonzero(dead.any(axis=0)):
+            eq[first[j]:, j] = eq[first[j], j]
+    return eq
 
 
 def max_drawdown(equity) -> float:
