@@ -244,3 +244,17 @@ class CsvLoaderTests(unittest.TestCase):
         self.assertEqual(len(kept), 400)
         self.assertEqual(float(kept["Close"].iloc[7]), 0.0)
 
+
+
+class LoaderFuturesTests(unittest.TestCase):
+    _load = LoaderTests._load
+
+    def test_a_future_keeps_its_bars_at_or_below_zero(self):
+        """WTI settled at -37.63 on 2020-04-20: on a margined future that bar is
+        the gap every stop and P&L must go through, not a bad print."""
+        frame = _frame()
+        frame.iloc[20, frame.columns.get_loc("Low")] = -40.0
+        frame.iloc[20, frame.columns.get_loc("Close")] = -37.63
+        df, _ = self._load(frame, drop_nonpositive=False)
+        self.assertEqual(len(df), 300)
+        self.assertEqual(float(df["Close"].iloc[20]), -37.63)

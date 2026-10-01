@@ -413,3 +413,21 @@ class IndicatorCacheTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ExposureBasisTests(unittest.TestCase):
+    def test_a_margined_long_through_zero_is_long_throughout(self):
+        """Exposure is units x margin (with a margin) signed by the side, never
+        by the price: the same whether the spread sits at -1.5 or +8.5."""
+        idx = pd.bdate_range("2024-01-01", periods=6)
+        close = np.array([-1.5, -1.0, -0.2, 0.4, 1.3, 1.3])
+        res = dict(equity=pd.Series(100_000.0, index=idx),
+                   trades=[dict(entry_date=idx[1], exit_date=idx[5], side=1, shares=2.0)], open_position=None)
+        a = exposure_totals(res, close, point_value=1000.0, margin_per_unit=3000.0)
+        b = exposure_totals(res, close + 10.0, point_value=1000.0, margin_per_unit=3000.0)
+        self.assertEqual(a, b)
+        self.assertAlmostEqual(a["gross"], 4 * 2.0 * 3000.0 / 100_000.0)
+        self.assertAlmostEqual(a["net"], a["gross"])
+        # without a margin: notional at |close|, still signed by the side
+        c = exposure_totals(res, close, point_value=1000.0)
+        self.assertAlmostEqual(c["net"], c["gross"])

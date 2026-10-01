@@ -596,7 +596,8 @@ class SpreadSizingTests(unittest.TestCase):
                     point_value=1.0, margin_per_unit=0.0, entry_price=490.0, entry_date=None, unrealized=1000.0,
                     exit_orders=[dict(kind="stop", level=480.0)])
         out = portfolio_targets([spread, cash], {"X|t": 0.5, "SPY|t": 0.5}, account_equity=100_000.0)
-        self.assertEqual(out["exposure_basis"], "margin")
+        self.assertEqual(out["exposure_basis"], "notional + margin")
+        self.assertEqual(portfolio_targets([spread], {"X|t": 1.0}, account_equity=100_000.0)["exposure_basis"], "margin")
         self.assertAlmostEqual(float(out["by_asset"].loc["X", "notional"]), -9000.0)
         self.assertAlmostEqual(float(out["by_asset"].loc["SPY", "notional"]), 50_000.0)
         self.assertAlmostEqual(out["gross_exposure"], 0.59)

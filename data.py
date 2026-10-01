@@ -31,6 +31,7 @@ def load_yfinance(
     end: str | None = None,
     interval: str = "1d",
     min_bars: int = 200,
+    drop_nonpositive: bool = True,
 ) -> pd.DataFrame:
     """Fetch OHLC data for `ticker` between `start` and `end` (YYYY-MM-DD).
 
@@ -42,6 +43,11 @@ def load_yfinance(
     Open, High, Low, Close, Volume: sorted, one row per stamp, and tz-naive
     (intraday bars in UTC, daily and longer bars on their exchange-local date;
     see `_naive_index`).
+
+    `drop_nonpositive` drops bars with a price at or below zero: on a share
+    they are bad prints. Turn it off for a future that genuinely traded
+    there (WTI on 2020-04-20): dropping that bar would erase the gap every
+    stop and P&L must go through.
 
     Raises ValueError rather than returning an empty frame: a wrong ticker, a
     rate limit or no network all make yfinance return an empty DataFrame, and a
@@ -69,7 +75,7 @@ def load_yfinance(
     # a share cannot trade at or below zero: such a bar is a bad print, and the
     # engine would refuse the whole series over it (strategy.validate_instrument)
     bad = (df[["Open", "High", "Low", "Close"]] <= 0).any(axis=1)
-    if bad.any():
+    if drop_nonpositive and bad.any():
         print(f"  {ticker}: dropped {int(bad.sum())} bar(s) with a price at or below zero (bad prints)")
         df = df[~bad]
     df = df.set_axis(_naive_index(df.index, interval))

@@ -1910,6 +1910,24 @@ def instrument_warnings(tpl: StrategyTemplate) -> list:
     return out
 
 
+def typical_units(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: float = 100_000.0) -> float:
+    """The size, in units, the engine's rule gives an entry of `tpl` on a
+    median bar of `df` (median ATR or realized vol, median |close|), before
+    the learner's conviction and `whole_units`: what a flat run with
+    `whole_units` needs to be told it floors to 0."""
+    close = df["Close"].to_numpy(dtype=float)
+    if tpl.vol_target > 0:
+        sigma = float(np.nanmedian(df["Close"].diff().rolling(tpl.vol_target_n).std().to_numpy()))
+        qty = initial_equity * tpl.vol_target / np.sqrt(periods_per_year()) / (sigma * tpl.point_value)
+    else:
+        a = float(np.nanmedian(atr(df, tpl.atr_n).to_numpy()))
+        qty = initial_equity * tpl.risk_pct / (tpl.atr_mult_stop * a * tpl.point_value)
+    basis = tpl.margin_per_unit if tpl.margin_per_unit > 0 else tpl.point_value * float(np.nanmedian(np.abs(close)))
+    if basis > 0:
+        qty = min(qty, tpl.max_leverage * initial_equity / basis)
+    return float(qty) if np.isfinite(qty) else 0.0
+
+
 def backtest(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: float = 100_000.0,
              first_trade_bar: int = 0, log_orders: bool = False) -> dict:
     """Run `tpl` over `df` (must have Open/High/Low/Close). Returns a dict:

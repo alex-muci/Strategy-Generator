@@ -46,7 +46,7 @@ from pipeline import (
 from portfolio import returns_frame
 from replay import save_run, replay_run, TARGETS as REPLAY_TARGETS
 from strategy import (annualized_sharpe, max_drawdown, periods_per_year, BARS_PER_YEAR, SIDES, validate_instrument,
-                      instrument_warnings)
+                      instrument_warnings, typical_units, set_periods_per_year)
 
 
 def parse_args(argv=None):
@@ -64,8 +64,9 @@ def parse_args(argv=None):
                           "needs --margin-per-unit and --cost-per-unit with --cost-bps 0")
     p.add_argument("--start", default="2005-01-01")
     p.add_argument("--interval", default="1d", choices=sorted(BARS_PER_YEAR),
-                   help="bar interval for --real; also sets the annualization factor "
-                        "(ignored without --real: the synthetic series is daily)")
+                   help="bar interval of --real / --csv; also sets the annualization factor (intraday: "
+                        "US-equity session bars per day, so a ~23 h futures session is under-annualized). "
+                        "Ignored for the synthetic series, which is daily")
     p.add_argument("--bars", type=int, default=3000, help="synthetic bars")
     p.add_argument("--seed", type=int, default=7)
     p.add_argument("--trend-prob", type=float, default=0.45, help="synthetic: probability a regime is trending")
@@ -123,10 +124,13 @@ def main(argv=None) -> dict:
         print(f"NOTE: --interval {args.interval} ignored, the synthetic series is {interval} bars")
     args.interval = interval
     cfg = eval_config(args, interval)
+    set_periods_per_year(cfg["periods_per_year"])   # before anything here annualizes (the pool re-sets it)
 
     if args.real:
         print(f"Loading {args.real} ({interval} bars) from yfinance...")
-        df = load_real(args.real, start=args.start, interval=interval)
+        # a margined future can genuinely trade at or below zero (WTI, April 2020): keep those bars
+        df = load_real(args.real, start=args.start, interval=interval,
+                       drop_nonpositive=not args.margin_per_unit > 0)
     elif args.csv:
         print(f"Loading {args.csv} ({interval} bars)...")
         df = load_csv(args.csv, interval=interval)
@@ -149,6 +153,13 @@ def main(argv=None) -> dict:
     validate_instrument(df, _costed(templates[0], cfg))
     for w in instrument_warnings(_costed(templates[0], cfg)):
         print(f"WARNING: {w}")
+    if args.whole_units:
+        q = typical_units(df, _costed(templates[0], cfg))
+        if q < 1.5:
+            print(f"WARNING: --whole-units: a typical entry sizes to {q:.2f} units on the 100,000 the research "
+                  "sizes on, floored to " + ("0: most templates will never trade" if q < 1 else
+                                             "1: the size barely varies") +
+                  ". Raise --risk-pct / --vol-target (or --max-leverage), or drop --whole-units")
     with worker_pool(args.jobs, {asset: df}, cfg) as pool:
         out = _run(df, asset, templates, pool, args, cfg)
     print(f"\nTotal runtime {time.time() - t0:.1f}s. Outputs in {os.path.join(args.out, '')}")
@@ -200,7 +211,7 @@ def _run(df, asset, templates, pool, args, cfg=None) -> dict:
     finalists = finalist_diagnostics(results, port, fam, args, pool)
 
     # ---- the benchmark nobody optimized: holding the asset over the same bars ----
-    kind, bh = benchmark_returns(df, args.point_value)
+    kind, bh = benchmark_returns(df, args.point_value, margin_per_unit=args.margin_per_unit)
     bench = benchmark_stats(bh, rets, port, nested, kind=kind)
     _print_benchmark(bench, args, asset)
 
@@ -249,10 +260,10 @@ def _print_benchmark(b: dict, args, asset: str | None = None) -> None:
     asset = asset or args.real or "synthetic series"
     print(f"\nBenchmark: {b.get('kind', BENCH_BUY_HOLD)} {asset} over the same OOS bars: Sharpe {b['buy_hold']['sharpe']:.2f}, "
           f"CAGR {b['buy_hold']['cagr']:.1%}, max DD {b['buy_hold']['max_dd']:.1%}; "
-          f"{b['n_templates_beat_bh']} of {b['n_templates']} templates have a higher OOS Sharpe")
+          f"{b['n_templates_beat_bh']} of {b['n_templates']} templates traded and have a higher OOS Sharpe")
     if b["nested"]:
         n, bhn = b["nested"], b["buy_hold_nested_period"]
-        print(f"  nested walk-forward portfolio Sharpe {n['sharpe']:.2f} vs buy-and-hold {bhn['sharpe']:.2f} "
+        print(f"  nested walk-forward portfolio Sharpe {n['sharpe']:.2f} vs {b.get('kind', BENCH_BUY_HOLD)} {bhn['sharpe']:.2f} "
               f"over the nested period; beta {n['beta']:.2f}, corr {n['corr']:.2f}, "
               f"information ratio {n['info_ratio']:.2f}")
 
@@ -479,7 +490,8 @@ def _report(df, results, port, nested, fam, finalists, bench, args, asset: str |
                  f"{s['oos_exposure']:.0%} | {s['oos_notional']:.2f} | {s['oos_avg_net_exposure']:+.2f} | "
                  f"{port['weights'][name]:.2f} |\n")
     L.append("\nexposure = share of OOS bars with a position; notional = mean |position notional| / equity over all "
-             "OOS bars (a leverage, 0 when flat); net exp. = the same signed (long > 0, short < 0).\n")
+             "OOS bars (a leverage, 0 when flat; margin instead of notional when --margin-per-unit is given); "
+             "net exp. = the same signed by the side (long > 0, short < 0).\n")
     for name, f in finalists.items():
         if "wfa_matrix" in f and len(f["wfa_matrix"]):
             m = f["wfa_matrix"]
@@ -505,21 +517,28 @@ def _report(df, results, port, nested, fam, finalists, bench, args, asset: str |
     L.append("The asset was not optimized, selected or stress-tested, so it is the one curve with no "
              "selection bias. ")
     if bench_kind != BENCH_BUY_HOLD:
-        L.append(f"It trades at or below zero, so it has no buy-and-hold return: the benchmark is the P&L of "
+        why = ("It trades at or below zero" if (df["Low"] <= 0).any()
+               else "It is a margined future, whose quoted level is not the price of an investment")
+        L.append(f"{why}, so it has no buy-and-hold return: the benchmark is the P&L of "
                  f"holding one unit (point value {args.point_value:g}) on the initial equity, an additive "
                  "curve (summed, not compounded). Its Sharpe, beta, correlation and information ratio are "
-                 "scale-free; its CAGR and drawdown are on that arbitrary scale. ")
+                 "scale-free; its CAGR (here the simple annual P&L) and drawdown (from the peak) are fractions "
+                 "of the initial equity, on that arbitrary scale. ")
     ins = instrument_text(eval_config(args, args.interval))
     if ins:
         L.append(f"Instrument: {ins}. ")
     if args.vol_target > 0:
+        cap = (f"margin capped at {args.max_leverage:g}x equity" if args.margin_per_unit > 0
+               else f"capped at {args.max_leverage:g}x")
         L.append(f"The templates size every entry to {args.vol_target:.0%} annualized volatility "
-                 f"(realized over {args.vol_target_n} bars, capped at {args.max_leverage:g}x), so their "
-                 "CAGR and drawdown are on a scale comparable to the unlevered holding; time spent flat "
-                 "and the leverage cap keep their realized vol below the target.\n\n")
+                 f"(realized over {args.vol_target_n} bars, {cap}), so "
+                 + ("their CAGR and drawdown are on a scale comparable to the unlevered holding; "
+                    if bench_kind == BENCH_BUY_HOLD else "")
+                 + "time spent flat and the leverage cap keep their realized vol below the target.\n\n")
     else:
         L.append(f"Compare Sharpe: the templates risk {args.risk_pct:.1%} of equity per trade, so their CAGR "
-                 "and drawdown are on a smaller scale than an unlevered holding.\n\n")
+                 "and drawdown are on a " + ("smaller scale than an unlevered holding" if bench_kind == BENCH_BUY_HOLD
+                                             else "different scale from the one-unit benchmark") + ".\n\n")
     L.append("| curve | period | Sharpe | CAGR | max DD | beta to B&H | corr | info ratio |\n")
     L.append("|---|---|---|---|---|---|---|---|\n")
     bh = b["buy_hold"]
@@ -534,7 +553,7 @@ def _report(df, results, port, nested, fam, finalists, bench, args, asset: str |
         L.append(f"| **nested portfolio** | nested period | **{n['sharpe']:.2f}** | {n['cagr']:.1%} | {n['max_dd']:.1%} | "
                  f"{n['beta']:.2f} | {n['corr']:.2f} | **{n['info_ratio']:.2f}** |\n")
     hold = "holding" if bench_kind == BENCH_BUY_HOLD else "holding one unit of"
-    L.append(f"\n{b['n_templates_beat_bh']} of {b['n_templates']} templates have a higher OOS Sharpe than {hold} {asset}.\n")
+    L.append(f"\n{b['n_templates_beat_bh']} of {b['n_templates']} templates traded and have a higher OOS Sharpe than {hold} {asset}.\n")
     if b["nested"]:
         n, bhn = b["nested"], b["buy_hold_nested_period"]
         if n["sharpe"] < bhn["sharpe"]:

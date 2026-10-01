@@ -518,13 +518,22 @@ def portfolio_targets(
     return dict(
         legs=legs, by_asset=by_asset, scale_applied=scale,
         gross_before_scaling=gross,
-        # what gross / net measure: notional for shares, margin once any leg is a margined future
-        exposure_basis="margin" if len(legs) and bool((legs["basis"] != legs["point_value"] * legs["price"].abs()).any())
-        else "notional",
+        # what gross / net (and --max-gross) measure: notional for shares, margin for a
+        # margined future; on a book with both, the capital committed (the shares' cost
+        # plus the futures' margin), NOT a notional exposure: a lot of Brent at 80 counts
+        # its margin, not its 80,000 of notional
+        exposure_basis=_exposure_basis(legs),
         gross_exposure=float(legs["notional"].abs().sum()) / account_equity if len(legs) else 0.0,
         net_exposure=float(legs["notional"].sum()) / account_equity if len(legs) else 0.0,
         open_risk=risk, open_risk_pct=risk / account_equity if account_equity else 0.0,
     )
+
+
+def _exposure_basis(legs: pd.DataFrame) -> str:
+    if not len(legs):
+        return "notional"
+    margined = legs["basis"] != legs["point_value"] * legs["price"].abs()
+    return "margin" if margined.all() else ("notional + margin" if margined.any() else "notional")
 
 
 def apply_gross_scale(states: list, scale: float) -> list:

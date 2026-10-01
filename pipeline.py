@@ -55,12 +55,13 @@ def resolve_interval(interval: str, synthetic: bool) -> str:
 
 
 def load_real(ticker: str, start: str, interval: str = "1d", now=None,
-              session_close: tuple[str, str] | None = None) -> pd.DataFrame:
+              session_close: tuple[str, str] | None = None, drop_nonpositive: bool = True) -> pd.DataFrame:
     """yfinance history WITHOUT the bar that is still forming. Research on a
     half-finished last bar is research on a price nobody could have traded.
     `session_close` is the listing exchange's (HH:MM, zone); default New York."""
     kw = {} if session_close is None else dict(session_close=session_close)
-    return drop_forming_bar(load_yfinance(ticker, start=start, interval=interval), interval, now=now, **kw)
+    return drop_forming_bar(load_yfinance(ticker, start=start, interval=interval, drop_nonpositive=drop_nonpositive),
+                            interval, now=now, **kw)
 
 
 def cscv_partitions_for(T: int) -> int:
@@ -94,6 +95,10 @@ def instrument_of(c: dict, asset: str | None = None) -> dict:
                whole_units=bool(c.get("whole_units", False)))
     over = (c.get("instrument_map") or {}).get(asset) if asset is not None else None
     if over:
+        # a mapped asset is its own instrument: what the map leaves out is a
+        # cash share's, not the run-wide futures settings (SPY=1 in a Brent
+        # book must not inherit the Brent margin and per-lot cost)
+        out.update(point_value=1.0, cost_per_unit=0.0, margin_per_unit=0.0)
         out.update({k: (bool(v) if k == "whole_units" else float(v)) for k, v in over.items() if k in out})
         if out["margin_per_unit"] > 0:
             out["cost_bps"] = 0.0
@@ -322,17 +327,23 @@ def curve_stats(r: pd.Series, additive: bool = False) -> dict:
     """Sharpe, CAGR and max drawdown of a return stream. `additive` returns
     (the one-unit benchmark's, P&L over a fixed initial equity) add up to
     their curve; compounding them would describe neither the P&L nor an
-    investment."""
+    investment. For them `cagr` is the simple annual P&L over the initial
+    equity and `max_dd` the deepest fall from a running peak, also over the
+    initial equity (how a futures account measures both): the summed curve
+    can cross zero, where a ratio to the peak or a compounded rate means
+    nothing."""
     eq = benchmark_curve(r, additive)
     n = len(r)
     if n < 2:
         return dict(sharpe=0.0, cagr=0.0, max_dd=0.0, n_bars=n)
-    return dict(
-        sharpe=annualized_sharpe(r),
-        cagr=float(eq.iloc[-1] ** (periods_per_year() / n) - 1) if eq.iloc[-1] > 0 else -1.0,
-        max_dd=max_drawdown(eq),
-        n_bars=n,
-    )
+    if additive:
+        v = np.concatenate([[1.0], eq.to_numpy(dtype=float)])
+        cagr = float((v[-1] - 1.0) * periods_per_year() / n)
+        max_dd = float((v - np.maximum.accumulate(v)).min())
+    else:
+        cagr = float(eq.iloc[-1] ** (periods_per_year() / n) - 1) if eq.iloc[-1] > 0 else -1.0
+        max_dd = max_drawdown(eq)
+    return dict(sharpe=annualized_sharpe(r), cagr=cagr, max_dd=max_dd, n_bars=n)
 
 
 def against_benchmark(r: pd.Series, bh: pd.Series) -> dict:
@@ -353,15 +364,19 @@ BENCH_BUY_HOLD = "buy and hold"
 BENCH_ONE_UNIT = "hold 1 unit"
 
 
-def benchmark_returns(df: pd.DataFrame, point_value: float = 1.0, initial_equity: float = 100_000.0):
+def benchmark_returns(df: pd.DataFrame, point_value: float = 1.0, initial_equity: float = 100_000.0,
+                      margin_per_unit: float = 0.0):
     """(kind, per-bar returns) of the benchmark nobody optimized. Holding the
-    asset is a return series only while its price is positive; an instrument
-    that trades at or below zero (a spread) has no buy-and-hold return, so the
-    benchmark is then the P&L of holding one unit, on the initial equity:
-    additive, on an arbitrary scale (Sharpe, beta, correlation and the
-    information ratio are scale-free; CAGR and drawdown are not)."""
+    asset is a return series only while its price is positive and is the
+    price of what is held; an instrument that trades at or below zero (a
+    spread), or a margined future (whose quoted level, back-adjusted or
+    rolled, is not the price of an investment: its percentage change is not
+    the contract's return), is benchmarked by the P&L of holding one unit on
+    the initial equity: additive, on an arbitrary scale (Sharpe, beta,
+    correlation and the information ratio are scale-free; CAGR and drawdown
+    are not)."""
     close = df["Close"]
-    if (df["Low"] > 0).all():
+    if (df["Low"] > 0).all() and not margin_per_unit > 0:
         return BENCH_BUY_HOLD, close.pct_change()
     return BENCH_ONE_UNIT, float(point_value) * close.diff() / float(initial_equity)
 
@@ -393,7 +408,9 @@ def benchmark_stats(bh_returns: pd.Series, rets: pd.DataFrame, port: dict, neste
         returns=bh,
         buy_hold=curve_stats(bh, additive),
         n_templates=int(rets.shape[1]),
-        n_templates_beat_bh=int((tpl_sharpes > annualized_sharpe(bh)).sum()),
+        # a template that never traded has a Sharpe of 0: sitting flat "beats" a losing
+        # benchmark without being evidence of anything, so only templates that traded count
+        n_templates_beat_bh=int(((tpl_sharpes > annualized_sharpe(bh)) & rets.ne(0.0).any()).sum()),
         static=None, nested=None, buy_hold_nested_period=None,
     )
     pr = port["portfolio_returns"]

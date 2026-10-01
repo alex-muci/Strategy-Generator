@@ -25,7 +25,7 @@ python -m venv env  # assuming 3.12 installed
 ./env/Script/Activate
 pip install -r requirements.txt 
 
-python -m unittest discover -s tests -t . -v # 375 tests (engine, order log, templates, hedge learner and its wide ladder, walk-forward, robustness, selection, data, live signals, replay, both entry points, spreads: shift invariance, point value, per-unit costs, margin cap, ruin, whole units, the ETF trick, a mixed cash + spread book)
+python -m unittest discover -s tests -t . -v # 382 tests (engine, order log, templates, hedge learner and its wide ladder, walk-forward, robustness, selection, data, live signals, replay, both entry points, spreads: shift invariance, point value, per-unit costs, margin cap, ruin, whole units, the ETF trick, a mixed cash + spread book)
 # faster (about 1:35 min instead of 4.5): pip install -r requirements-dev.txt, then, with ./env active,
 python -m pytest -n auto --dist loadscope   # same tests in parallel; loadscope keeps a class (and its one-off setup) on one worker
 ```
@@ -441,12 +441,18 @@ so a series with a price at or below zero is refused unless
 `--margin-per-unit` is given and `--cost-bps` is 0
 (`strategy.validate_instrument`, run by both entry points before any window,
 and by every `backtest` call). A share cannot trade at or below zero:
-`load_yfinance` drops such a bar as a bad print. P&L is
+`load_yfinance` drops such a bar as a bad print, except on a `--real`
+run with `--margin-per-unit` (a future such as WTI on 2020-04-20, whose
+negative settlement is a real gap). P&L is
 `side x units x point_value x (price change)` on every bar, for a share
 (point value 1) and a lot alike; `shares` in the trade lists are units.
 Research trades fractional units unless `--whole-units` is set; the live
 trade list always rounds to whole units, so a futures research run without
 the flag can book P&L on 0.3 contracts that the live book never holds.
+With the flag, `main.py` warns before the run when a typical entry sizes
+below one unit on the 100,000 the research sizes on (every template would
+sit flat); the live book sizes each slot on its share of the account, so a
+small slot can floor to 0 where the research traded one lot.
 
 **Ruin.** A close that leaves the equity at or below zero (a gap through the
 stop beyond the margin) liquidates the position at that close (trade reason
@@ -469,13 +475,18 @@ engine take the short side itself. Use settlements as the close when the
 vendor has them, and confirm the sign convention (front minus back) before
 reading a `long` as a bet on backwardation.
 
-The benchmark of such a run is not buy and hold (a spread has no return):
-it is the P&L of **holding one unit** on the initial equity, an additive
-curve (summed, never compounded) on an arbitrary scale. Its Sharpe, beta,
-correlation and information ratio are scale-free and read as before; its
-CAGR and drawdown are on that scale. The exposure statistics of the
-walk-forward (units x price) are marks, not exposures, on an instrument that
-crosses zero; they are reported, never used to select.
+The benchmark of such a run is not buy and hold (a spread has no return,
+and the percentage change of a back-adjusted future's level is not the
+contract's return): for a series that touches zero, or any run with
+`--margin-per-unit`, it is the P&L of **holding one unit** on the initial
+equity, an additive curve (summed, never compounded) on an arbitrary scale.
+Its Sharpe, beta, correlation and information ratio are scale-free and read
+as before; its CAGR column is the simple annual P&L and its drawdown the
+deepest fall from a peak, both as fractions of the initial equity. A
+calendar spread that stays positive over the whole sample and is run
+without a margin still gets a percentage buy and hold: give the margin.
+The walk-forward's exposure statistics measure a unit in margin when one is
+given, else in notional at |price|, and sign it by the side.
 
 **The dashboard.** `etf_dashboard.py research` takes a CSV file among its
 `--assets` (named by its file stem, reloaded from the same path by
@@ -488,10 +499,15 @@ python etf_dashboard.py research --assets SPY TLT brent_z25z26.csv \
 python etf_dashboard.py signals --account-equity 200000
 ```
 
-An asset with a margin in the map is costed per unit only (its `cost_bps`
-is 0), and the book measures its exposure in **margin** (units x margin per
-unit) while a share's stays notional; the exposure tiles say which, and
-`--max-gross` caps that measure. The ETF dashboard's futures mapping
+A mapped asset is its own instrument: a cost or margin left out of its
+entry is 0 (`SPY=1` is a plain share, not a share with the run-wide Brent
+margin). An asset with a margin in the map is costed per unit only (its
+`cost_bps` is 0), and the book measures its exposure in **margin** (units x
+margin per unit) while a share's stays notional; on a book with both the
+tiles read `notional + margin`, the capital committed rather than a
+notional exposure (a lot of Brent counts its margin, not its 80,000), and
+`--max-gross` caps that measure. The chart's holding curve compounds each
+share and sums each one-unit asset before averaging them. The ETF dashboard's futures mapping
 (`--futures`) is the separate ETF-signalled-contract path and is unrelated.
 
 ### The `hedge` channel: an online-learned alternative to fitted lookbacks

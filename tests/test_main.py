@@ -346,8 +346,8 @@ class EntryPointRegressionTests(_RestoresAnnualization):
         full["Volume"] = 1.0
         seen = {}
 
-        def fake(ticker, start, interval):
-            seen.update(ticker=ticker, start=start, interval=interval)
+        def fake(ticker, start, interval, drop_nonpositive=True):
+            seen.update(ticker=ticker, start=start, interval=interval, drop_nonpositive=drop_nonpositive)
             return full
 
         orig = P.load_yfinance
@@ -357,7 +357,7 @@ class EntryPointRegressionTests(_RestoresAnnualization):
             after = P.load_real("SPY", "2024-01-01", "1d", now=idx[-1] + pd.Timedelta(days=1, hours=1))
         finally:
             P.load_yfinance = orig
-        self.assertEqual(seen, dict(ticker="SPY", start="2024-01-01", interval="1d"))
+        self.assertEqual(seen, dict(ticker="SPY", start="2024-01-01", interval="1d", drop_nonpositive=True))
         self.assertEqual(len(during), 299)
         self.assertEqual(during.index[-1], idx[-2])
         self.assertEqual(len(after), 300)
@@ -643,11 +643,17 @@ class AdditiveBenchmarkTests(unittest.TestCase):
         pd.testing.assert_series_equal(P.benchmark_curve(r, additive=False), (1 + r).cumprod())
         a, m = P.curve_stats(r, additive=True), P.curve_stats(r, additive=False)
         self.assertEqual(a["sharpe"], m["sharpe"])                # scale-free either way
-        self.assertAlmostEqual(a["max_dd"], 1.0 / 1.5 - 1.0)       # 1.5 -> 1.0 on the summed curve
-        self.assertNotEqual(a["max_dd"], m["max_dd"])
-        # a one-unit stream with a bar losing more than the initial equity stays a curve
+        # 1.5 -> 1.0 on the summed curve: half the initial equity, not a third of the peak
+        self.assertAlmostEqual(a["max_dd"], -0.5)
+        self.assertAlmostEqual(a["cagr"], 0.2 * P.periods_per_year() / 4)   # simple annual P&L
+        self.assertNotEqual(a["cagr"], m["cagr"])
+        # a one-unit stream with a bar losing more than the initial equity stays a curve,
+        # and its drawdown is that loss over the initial equity, not a ratio to a peak
+        # the curve has crossed zero from
         r = pd.Series([0.0, -1.5, 0.2, 0.2], index=r.index)
-        self.assertEqual(P.curve_stats(r, additive=True)["cagr"], -1.0)
+        s = P.curve_stats(r, additive=True)
+        self.assertAlmostEqual(s["max_dd"], -1.5)
+        self.assertAlmostEqual(s["cagr"], -1.1 * P.periods_per_year() / 4)
         self.assertAlmostEqual(P.benchmark_curve(r, additive=True).iloc[-1], -0.1)
 
     def test_benchmark_stats_carry_the_additive_flag(self):
@@ -672,3 +678,58 @@ class AdditiveBenchmarkTests(unittest.TestCase):
         self.assertEqual(P._costed(base, cfg).point_value, 1.0)      # no asset: the run-wide settings
         self.assertIn("whole units", P.sizing_text(cfg))
         self.assertFalse(M.parse_args([]).whole_units)
+
+    def test_a_mapped_asset_does_not_inherit_the_run_wide_future(self):
+        """SPY=1 in a Brent book is a plain share: no Brent margin, no per-lot cost,
+        the run's bps costs (a margin only is what zeroes them)."""
+        cfg = _cfg(point_value=1000.0, cost_per_unit=10.0, margin_per_unit=5000.0, cost_bps=5.0)
+        cfg["instrument_map"] = ED._parse_instrument_map(["SPY=1"], ["SPY", "brent"])
+        base = generate_templates("quick", max_templates=1)[0]
+        spy, brent = P._costed(base, cfg, "SPY"), P._costed(base, cfg, "brent")
+        self.assertEqual((spy.point_value, spy.cost_per_unit, spy.margin_per_unit, spy.cost_bps), (1.0, 0.0, 0.0, 5.0))
+        self.assertEqual((brent.point_value, brent.cost_per_unit, brent.margin_per_unit), (1000.0, 10.0, 5000.0))
+        # a spec written before the map was filled out (point value only) reads the same way
+        cfg["instrument_map"] = {"SPY": dict(point_value=1.0)}
+        self.assertEqual(P._costed(base, cfg, "SPY").margin_per_unit, 0.0)
+
+    def test_a_margined_future_is_benchmarked_by_one_unit(self):
+        """A back-adjusted Brent series is positive, but its percentage change is
+        not the contract's return: with a margin the benchmark is one lot's P&L."""
+        df = synthetic_ohlc(300, seed=3)
+        self.assertEqual(P.benchmark_returns(df)[0], P.BENCH_BUY_HOLD)
+        kind, r = P.benchmark_returns(df, point_value=1000.0, margin_per_unit=6000.0)
+        self.assertEqual(kind, P.BENCH_ONE_UNIT)
+        pd.testing.assert_series_equal(r, 1000.0 * df["Close"].diff() / 100_000.0)
+
+    def test_flat_templates_do_not_beat_a_losing_benchmark(self):
+        idx = pd.bdate_range("2020-01-01", periods=300)
+        bh = pd.Series(np.random.default_rng(2).normal(-0.001, 0.01, 300), index=idx)
+        rets = pd.DataFrame({"flat": 0.0, "good": bh * -0.5}, index=idx)
+        b = P.benchmark_stats(bh, rets, dict(portfolio_returns=rets["good"]), dict(portfolio_returns=rets["good"]))
+        self.assertLess(b["buy_hold"]["sharpe"], 0.0)
+        self.assertEqual(b["n_templates_beat_bh"], 1)
+
+    def test_the_dashboard_holding_curve_compounds_shares_in_a_mixed_book(self):
+        """One additive asset must not turn the share's compounding into a sum."""
+        idx = pd.bdate_range("2020-01-01", periods=400)
+        up = pd.DataFrame({c: 100.0 * 1.01 ** np.arange(400) for c in ("Open", "High", "Low", "Close")}, index=idx)
+        spr = pd.DataFrame({c: np.linspace(-1.0, 1.0, 400) for c in ("Open", "High", "Low", "Close")}, index=idx)
+        cfg = dict(instrument_map={"spr": dict(point_value=1000.0, cost_per_unit=10.0, margin_per_unit=3000.0)})
+        nested = dict(portfolio_equity=pd.Series(1.0, index=idx))
+        c = ED._curves({"SPY": up, "spr": spr}, None, nested, None, cfg)
+        share = 1.01 ** 399
+        spread = 1.0 + 1000.0 * 2.0 / 100_000.0
+        self.assertAlmostEqual(c["buy_hold"][-1], round((share + spread) / 2, 5), places=4)
+
+
+class TypicalUnitsTests(unittest.TestCase):
+    def test_the_size_a_median_bar_gives(self):
+        df = synthetic_ohlc(600, seed=5)
+        tpl = S.StrategyTemplate("t")
+        a = float(np.nanmedian(S.atr(df, tpl.atr_n)))
+        self.assertAlmostEqual(S.typical_units(df, tpl), 100_000 * tpl.risk_pct / (tpl.atr_mult_stop * a))
+        # a Brent lot on the same moves: a thousandth of it, and the margin cap binds on top
+        lot = tpl.with_params(point_value=1000.0, margin_per_unit=6000.0, max_leverage=0.5)
+        self.assertLess(S.typical_units(df, lot), 1.0)
+        self.assertAlmostEqual(S.typical_units(df, tpl.with_params(max_leverage=0.01)),
+                               0.01 * 100_000 / float(np.nanmedian(df["Close"])))

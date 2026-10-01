@@ -148,8 +148,9 @@ def parse_args(argv=None):
                    help="floor every size to whole units (contracts); recommended for futures")
     r.add_argument("--instrument-map", nargs="+", default=None, metavar="ASSET=PV[,COST[,MARGIN]]",
                    help="per-asset instrument: point value, cost per unit per side, margin per unit, e.g. "
-                        "brent_z25z26=1000,15,3000; the others keep the run-wide flags. An asset given a "
-                        "margin is costed per unit only (cost_bps 0)")
+                        "brent_z25z26=1000,15,3000; the others keep the run-wide flags. A mapped asset takes only "
+                        "what is given here (a cost or margin left out is 0, e.g. SPY=1 is a plain share); one "
+                        "given a margin is costed per unit only (cost_bps 0)")
     r.add_argument("--min-sharpe", type=float, default=0.3)
     r.add_argument("--max-strategies", type=int, default=8)
     r.add_argument("--corr-ceiling", type=float, default=0.6)
@@ -373,6 +374,9 @@ def _parse_instrument_map(items, assets) -> dict:
             raise SystemExit(f"--instrument-map {item}: expected ASSET=POINT_VALUE[,COST_PER_UNIT[,MARGIN_PER_UNIT]]")
         if not 1 <= len(vals) <= 3 or vals[0] <= 0 or any(v < 0 for v in vals):
             raise SystemExit(f"--instrument-map {item}: expected ASSET=POINT_VALUE[,COST_PER_UNIT[,MARGIN_PER_UNIT]]")
+        # a full instrument: what is left out is a cash share's (no per-unit cost,
+        # no margin), never the run-wide futures settings
+        vals += [0.0] * (3 - len(vals))
         out[asset] = dict(zip(("point_value", "cost_per_unit", "margin_per_unit"), vals))
     return out
 
@@ -572,15 +576,17 @@ def _curves(data, rets, nested, port, cfg=None) -> dict:
     ne = nested["portfolio_equity"]
     if not len(ne):
         return dict(dates=[], strategy=[], buy_hold=[])
-    # holding each asset: its return, or, for one that trades through zero
-    # (a spread), the P&L of one unit on the initial equity (additive, so the
-    # whole curve is summed rather than compounded when any asset needs it)
-    parts, kinds = {}, set()
+    # holding each asset equally from the curve's first bar: each asset's own
+    # growth of 1 (compounded from its return, or, for a spread or a margined
+    # future, summed from the P&L of one unit on the initial equity), then
+    # averaged. Averaging the RETURNS first would sum a share's returns too
+    # as soon as one asset in the book is additive.
+    parts = {}
     for a in data:
-        kind, r = benchmark_returns(data[a], point_value=instrument_of(cfg, a)["point_value"])
-        parts[a], kinds = r.fillna(0.0), kinds | {kind}
-    bh_rets = pd.concat(parts, axis=1).mean(axis=1)
-    bh = benchmark_curve(bh_rets.reindex(ne.index).fillna(0.0), additive=BENCH_ONE_UNIT in kinds)
+        ins = instrument_of(cfg, a)
+        kind, r = benchmark_returns(data[a], point_value=ins["point_value"], margin_per_unit=ins["margin_per_unit"])
+        parts[a] = benchmark_curve(r.reindex(ne.index).fillna(0.0), additive=kind == BENCH_ONE_UNIT)
+    bh = pd.concat(parts, axis=1).mean(axis=1)
     strat = ne / ne.iloc[0]
     step = max(1, len(strat) // 400)
     s, b = strat.iloc[::step], bh.iloc[::step]

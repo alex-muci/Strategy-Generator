@@ -191,7 +191,8 @@ def window_backtest(df: pd.DataFrame, tpl, start: int, end: int, *,
     out["entries"] = res["entries"][off:]
     out["stats"] = performance_stats(eq, res["trades"], initial_equity)
     out["window_start"] = df.index[start]
-    out["exposure"] = exposure_totals(out, df["Close"].to_numpy()[start:end], point_value=tpl.point_value)
+    out["exposure"] = exposure_totals(out, df["Close"].to_numpy()[start:end], point_value=tpl.point_value,
+                                      margin_per_unit=tpl.margin_per_unit)
     return out
 
 
@@ -222,16 +223,24 @@ def position_units(res: dict) -> np.ndarray:
     return shares
 
 
-def exposure_totals(res: dict, close: np.ndarray, point_value: float = 1.0) -> dict:
-    """Bar-count and notional-over-equity totals of a backtest result, so
+def exposure_totals(res: dict, close: np.ndarray, point_value: float = 1.0, margin_per_unit: float = 0.0) -> dict:
+    """Bar-count and exposure-over-equity totals of a backtest result, so
     windows can be pooled: held_bars (bars with a position), gross (sum over
-    bars of |notional| / equity) and net (sum of signed notional / equity)."""
+    bars of |exposure| / equity) and net (the same signed by the SIDE).
+
+    The exposure of a unit is its margin when the instrument has one (a
+    future, whose quoted price may be back-adjusted or through zero: the same
+    basis as the engine's leverage cap and live.portfolio_targets), else its
+    notional at |close| x point_value. Never the price's sign: a long held
+    through zero is long all the way."""
     units = position_units(res)
-    notional = units * close[:len(units)] * point_value
+    basis = (np.full(len(units), float(margin_per_unit)) if margin_per_unit > 0
+             else np.abs(close[:len(units)]) * point_value)
+    exposure = units * basis
     eq = res["equity"].to_numpy()
     with np.errstate(invalid="ignore", divide="ignore"):
-        lev = np.where(eq > 0, notional / eq, 0.0)
-    # held bars count units, not notional: a spread can close at exactly 0 while held
+        lev = np.where(eq > 0, exposure / eq, 0.0)
+    # held bars count units, not exposure: a spread can close at exactly 0 while held
     return dict(n_bars=int(len(eq)), held_bars=int((units != 0).sum()),
                 gross=float(np.abs(lev).sum()), net=float(lev.sum()))
 
