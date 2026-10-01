@@ -437,6 +437,15 @@ class SharedCommandLineTests(unittest.TestCase):
         b = M.parse_args(["--real", "SPY", "--instrument-map", "QQQ=1"])
         with self.assertRaises(SystemExit):
             M.resolve_instrument(b, M.asset_label(b))
+        # a Yahoo futures ticker carries its own '=': the map splits on the last one
+        f = M.parse_args(["--real", "CL=F", "--instrument-map", "CL=F=1000,2.5,6000"])
+        with contextlib.redirect_stdout(io.StringIO()):
+            M.resolve_instrument(f, M.asset_label(f))
+        self.assertEqual((f.point_value, f.margin_per_unit), (1000.0, 6000.0))
+        for bad in (["SPY=nan"], ["SPY=inf"], ["SPY=1", "SPY=2"]):
+            g = M.parse_args(["--real", "SPY", "--instrument-map", *bad])
+            with self.assertRaises(SystemExit):
+                M.resolve_instrument(g, "SPY")
         # mapped as a plain share: the run-wide futures flags do not leak in
         c = M.parse_args(["--real", "SPY", "--margin-per-unit", "5000", "--instrument-map", "SPY=1"])
         M.resolve_instrument(c, "SPY")

@@ -614,3 +614,19 @@ class NestedCausalFilterTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RuinedCandidateTests(unittest.TestCase):
+    def test_a_closed_account_is_never_a_candidate_and_ends_the_portfolio(self):
+        import portfolio as PF
+        idx = pd.bdate_range("2024-01-01", periods=6)
+        r = pd.Series([0.1, -1.5, 0.0, 0.0, 0.0, 0.0], index=idx)
+        table = pd.DataFrame(dict(oos_sharpe=[2.0, 0.5], n_live_windows=[5, 5], n_trades_oos=[50, 50],
+                                  pardo_pass=[True, True], wfe=[1.0, 1.0], oos_max_dd=[-1.65, -0.2]),
+                             index=["ruined", "fine"])
+        self.assertEqual(PF._qualifying(table, 0.3, 3, False, None, 10), ["fine"])
+        port = pd.Series([0.1, -1.2, 0.05, 0.02, -0.01, 0.03], index=idx)
+        closed = PF.close_after_ruin(port)
+        self.assertTrue((closed.iloc[2:] == 0.0).all())
+        self.assertEqual(list(closed.iloc[:2]), [0.1, -1.2])
+        pd.testing.assert_series_equal(PF.close_after_ruin(r * 0.1), r * 0.1)

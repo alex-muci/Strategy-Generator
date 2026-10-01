@@ -32,7 +32,7 @@ import numpy as np
 import pandas as pd
 
 from live import utcnow
-from pipeline import sizing_text
+from pipeline import sizing_text, costs_text
 
 # Palette: the data-viz reference instance, validated in both modes with
 # scripts/validate_palette.js (2 categorical slots, all checks PASS).
@@ -663,7 +663,7 @@ def _diagnostics_section(spec: dict) -> str:
            f'{_e(c["interval"])} bars from {_e(c["start"])}, family '
            f'<b>{_e(c["family"])}</b>. Walk-forward train={c["train_bars"]} test='
            f'{c["test_bars"]} {"anchored" if c["anchored"] else "rolling"}, '
-           f'{_e(c["selection"])} parameter selection, {_n(c["cost_bps"], 1)} bps/side costs, '
+           f'{_e(c["selection"])} parameter selection, {_e(costs_text(c, spec.get("assets")))} costs, '
            f'{_e(sizing_text(c))} (per slot), '
            f'{_e(c["weighting"])} weights.')
     return f'<p class="ink2">{cfg}</p>' + _table(["measure", "value", "what it means"],

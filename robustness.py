@@ -65,9 +65,14 @@ def trial_returns(df: pd.DataFrame, tpl, combos: list, initial_equity: float = 1
     whole units, every later contract count, indefinitely, far beyond any
     embargo -- so the "training" returns after it would carry the test
     block's prices. At fixed capital a return depends on the prices of the
-    trade it belongs to and nothing else: the embargo (`cpcv_embargo`,
-    `train_masks`) then covers every way a test bar can reach a training
-    one. Ruin is off for the same reason (it is an account state too)."""
+    trade it belongs to and nothing else, and the embargo (`cpcv_embargo`,
+    `train_masks`) keeps every training row that a test-group price could
+    still steer (an indicator, a resting order, a trade carried out of the
+    group) out of training. What it cannot remove is that WHICH trades a
+    trial takes after the embargo can differ (it was still busy, or not, when
+    a signal came): a different trade on clean prices, not information about
+    the test period (README, "How the evaluation is made robust"). Ruin is
+    off for the same reason as the compounding (it is an account state)."""
     T, N = len(df), len(combos)
     R = np.zeros((T, N))
     E = np.zeros((T, N), dtype=np.int8)

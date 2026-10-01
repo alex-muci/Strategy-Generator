@@ -1694,7 +1694,8 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
             pend_active = False  # don't leave a stale resting order behind
             if position != 0 and roll[i] > 0.0 and roll_cost_per_unit > 0.0:
                 # held through a roll at this close: the position pays it
-                rc = roll_cost_per_unit * shares
+                # (roll[i] rolls: more than one when a dropped bar's moved here)
+                rc = roll_cost_per_unit * shares * roll[i]
                 cash -= rc
                 entry_cost += rc
                 if log_orders:
@@ -1942,7 +1943,7 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
 
         # ---- a roll at this close: the position held through it pays it ----
         if position != 0 and roll[i] > 0.0 and roll_cost_per_unit > 0.0:
-            rc = roll_cost_per_unit * shares
+            rc = roll_cost_per_unit * shares * roll[i]
             cash -= rc
             entry_cost += rc
             if log_orders:

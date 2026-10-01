@@ -122,10 +122,7 @@ def load_csv(path: str, interval: str = "1d", min_bars: int = 200, drop_no_trade
                        for name in ("Open", "High", "Low", "Close")}, index=raw.index)
     df["Volume"] = pd.to_numeric(raw[by_name["volume"]], errors="coerce") if "volume" in by_name else np.nan
     if "roll" in by_name:
-        col = raw[by_name["roll"]]
-        if col.dtype == object:   # 'True' / 'False' as text
-            col = col.astype(str).str.strip().str.lower().map({"true": 1.0, "false": 0.0}).fillna(col)
-        df["Roll"] = (pd.to_numeric(col, errors="coerce").fillna(0.0) != 0).astype(float)
+        df["Roll"] = _roll_flags(raw[by_name["roll"]], path)
     prices = df[["Open", "High", "Low", "Close"]]
     keep = prices.notna().all(axis=1)
     if drop_no_trade_rows:
@@ -150,24 +147,46 @@ YAHOO_INTRADAY_DAYS = {"1h": 729, "60m": 729}
 YAHOO_FINE_DAYS = 59
 
 
+_ROLL_TOKENS = {"true": 1.0, "yes": 1.0, "y": 1.0, "t": 1.0, "false": 0.0, "no": 0.0, "n": 0.0, "f": 0.0,
+                "": 0.0, "nan": 0.0, "none": 0.0}
+
+
+def _roll_flags(col: pd.Series, path: str = "") -> pd.Series:
+    """A CSV's Roll column as 0/1 floats: numbers (non-zero = a roll), booleans,
+    or text (true/false, yes/no, blank). Anything else is an error: a roll flag
+    silently read as 0 would charge no roll cost at all."""
+    if pd.api.types.is_numeric_dtype(col) or pd.api.types.is_bool_dtype(col):
+        return (pd.to_numeric(col, errors="coerce").fillna(0.0) != 0).astype(float)
+    text = col.astype(str).str.strip().str.lower()
+    num = pd.to_numeric(text, errors="coerce")
+    tok = text.map(_ROLL_TOKENS)
+    bad = num.isna() & tok.isna() & col.notna()
+    if bad.any():
+        raise ValueError(f"{path!r}: Roll column has values that are not a flag: "
+                         f"{sorted(set(col[bad].astype(str)))[:5]} (use 1/0 or true/false)")
+    return (num.fillna(tok).fillna(0.0) != 0).astype(float)
+
+
 def align_rolls(roll: pd.Series, keep: pd.Index) -> pd.Series:
     """`roll` (1 on the bars at whose close a contract rolled) on the bars
     `keep`, a subset of its index: a roll on a bar that is not kept moves to
     the last kept bar before it (a position held at that close was still
     held when the roll happened, unless it exited in between, which a bar
-    that is not there cannot show), or to the first kept bar when none is
-    earlier. The result is indexed like `roll` (0 off `keep`), so it can be
-    assigned back before the rows are dropped."""
+    that is not there cannot show); one before the first kept bar is
+    dropped (nothing could be held through it). Several rolls landing on one
+    bar add up (each is paid). The result is indexed like `roll` (0 off
+    `keep`), so it can be assigned back before the rows are dropped."""
     r = roll.fillna(0.0).astype(float)
     kept = r.index.isin(keep)
     if kept.all() or not kept.any():
         return r.where(kept, 0.0)
     # the kept bar each row's roll lands on: the last kept bar at or before it
     pos = np.arange(len(r))
-    last_kept = pd.Series(np.where(kept, pos, np.nan)).ffill().bfill().to_numpy().astype(int)
+    last_kept = pd.Series(np.where(kept, pos, np.nan)).ffill().to_numpy()
+    ok = ~np.isnan(last_kept)
     out = np.zeros(len(r))
-    np.add.at(out, last_kept, r.to_numpy())
-    return pd.Series(np.minimum(out, 1.0), index=r.index)
+    np.add.at(out, last_kept[ok].astype(int), r.to_numpy()[ok])
+    return pd.Series(out, index=r.index)
 
 
 def yahoo_earliest_start(interval: str, now: pd.Timestamp | None = None) -> pd.Timestamp | None:

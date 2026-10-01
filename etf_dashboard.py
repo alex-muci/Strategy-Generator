@@ -74,12 +74,13 @@ from pipeline import (
     resolve_interval, load_real, eval_config, worker_pool, evaluate_slots,
     family_diagnostics, build_portfolios, finalist_stats, sizing_text,
     benchmark_returns, benchmark_curve, instrument_of, _costed, BENCH_ONE_UNIT,
-    add_research_args, parse_instrument_map,
+    add_research_args, parse_instrument_map, costs_text,
 )
 from portfolio import returns_frame
 from strategy import (
     StrategyTemplate, annualized_sharpe, max_drawdown, set_periods_per_year, periods_per_year,
     periods_per_year_for_interval, SIDES, BARS_PER_YEAR, validate_instrument, instrument_warnings,
+    typical_units,
 )
 from futures_map import (
     CONTRACTS, LISTINGS, FX_SYMBOLS, HEDGE_RATIO_BARS, QUOTES_STALE_DAYS,
@@ -309,10 +310,16 @@ def research(args) -> dict:
                   f"costed per unit only ({tpl.cost_per_unit:g} per unit per side)")
         for w in instrument_warnings(tpl):
             print(f"  WARNING {a}: {w}")
+        if tpl.whole_units:
+            q = typical_units(data[a], tpl)
+            if q < 1.0:
+                print(f"  WARNING {a}: --whole-units: a typical entry sizes to {q:.2f} units on the 100,000 the "
+                      "research sizes on, floored to 0: its templates will rarely trade. Raise --risk-pct / "
+                      "--vol-target, trade a smaller contract, or drop --whole-units")
     jobs = [(f"{a}|{t.name}", a, t) for a in args.assets for t in templates_for(a)]
     print(f"{len(templates_for(args.assets[0]))} templates x {len(args.assets)} assets = {len(jobs)} slots; "
           f"walk-forward train={args.train} test={args.test} "
-          f"{'anchored' if args.anchored else 'rolling'}, {args.cost_bps} bps/side")
+          f"{'anchored' if args.anchored else 'rolling'}, {costs_text(cfg, args.assets)}")
 
     def progress(i, total, key, res):
         if i % max(1, total // 20) == 0 or i == total:
@@ -346,7 +353,7 @@ def _parse_sides_map(items, assets) -> dict:
     an error, not a slot that silently trades both ways."""
     out = {}
     for item in items or []:
-        asset, _, side = item.partition("=")
+        asset, _, side = item.rpartition("=")     # the last '=': CL=F=long_only
         if asset not in assets:
             raise SystemExit(f"--sides-map {item}: {asset!r} is not in --assets")
         if side not in SIDES:
@@ -790,9 +797,11 @@ def _slot_signal(slot: dict, df: pd.DataFrame, cfg: dict, live: dict, args,
     # the first fit, then once per test window -- also when the last fit found
     # nothing: the walk-forward keeps such a window flat for all of it
     if mem["fitted_on"] is None or (stale and not args.no_refit):
-        # the in-sample fit is sized on the capital the slot trades, as the
-        # walk-forward sizes each window's fit on the account it carries
-        # (with whole units the contract counts, and so the fit, depend on it)
+        # the in-sample fit is sized on the capital the slot actually trades
+        # (with whole units the contract counts, and so the fit, depend on it).
+        # Research sized each template on its own account (100,000, carried
+        # window to window), not on this slot's share of yours: with whole
+        # units the two fits can differ, and the live one is the one you trade
         fit = refit_params(df, base, param_grid_for(base, wide=cfg["wide_grid"]),
                            train_bars=train, metric=cfg["metric"],
                            selection=cfg["selection"], anchored=cfg["anchored"],
@@ -924,7 +933,7 @@ def _write_research_report(spec, path):
          f"{d['n_trials']} parameter trials in total.\n",
          f"Walk-forward train={c['train_bars']} test={c['test_bars']} "
          f"{'anchored' if c['anchored'] else 'rolling'}, selection={c['selection']}, "
-         f"costs {c['cost_bps']} bps/side, {sizing_text(c)}.\n\n",
+         f"costs {costs_text(c, spec['assets'])}, {sizing_text(c)}.\n\n",
          f"## Verdict: {v['level'].upper()}\n\n{v['headline']}\n\n"]
     for r in v["reasons"]:
         L.append(f"- {r}\n")

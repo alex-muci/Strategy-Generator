@@ -258,3 +258,34 @@ class LoaderFuturesTests(unittest.TestCase):
         df, _ = self._load(frame, drop_nonpositive=False)
         self.assertEqual(len(df), 300)
         self.assertEqual(float(df["Close"].iloc[20]), -37.63)
+
+
+class RollColumnTests(unittest.TestCase):
+    """A Roll column read as 0 would charge no roll cost at all: every way a
+    vendor writes a flag is read, and anything else is refused."""
+
+    def _load(self, values):
+        import tempfile
+        from data import load_csv
+        n = 250
+        idx = pd.bdate_range("2024-01-01", periods=n)
+        df = pd.DataFrame({"Open": 1.0, "High": 1.5, "Low": 0.5, "Close": 1.0}, index=idx)
+        roll = [""] * n
+        roll[:len(values)] = values
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "x.csv")
+            df.assign(Roll=roll).to_csv(path)
+            return load_csv(path)["Roll"].to_numpy()[:len(values)]
+
+    def test_flags_in_any_spelling(self):
+        np.testing.assert_array_equal(self._load(["True", "1", "0"]), [1, 1, 0])
+        np.testing.assert_array_equal(self._load(["TRUE", "", " yes", "false", "2"]), [1, 0, 1, 0, 1])
+
+    def test_an_unknown_token_is_an_error(self):
+        with self.assertRaises(ValueError):
+            self._load(["roll", "0"])
+
+    def test_align_rolls_drops_a_roll_before_the_data_and_adds_merged_ones(self):
+        from data import align_rolls
+        r = pd.Series([1.0, 0, 1, 1, 0, 0], index=range(6))
+        np.testing.assert_array_equal(align_rolls(r, pd.Index([1, 4, 5])).to_numpy(), [0, 2, 0, 0, 0, 0])

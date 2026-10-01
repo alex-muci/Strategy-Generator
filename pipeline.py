@@ -132,14 +132,18 @@ def parse_instrument_map(items, assets) -> dict:
     usage = "expected ASSET=POINT_VALUE[,COST_PER_UNIT[,MARGIN_PER_UNIT[,ROLL_COST_PER_UNIT]]]"
     out = {}
     for item in items or []:
-        asset, _, spec = item.partition("=")
+        # the LAST '=': a Yahoo futures ticker has one of its own (CL=F=1000,2.5,6000)
+        asset, _, spec = item.rpartition("=")
         if asset not in assets:
             raise SystemExit(f"--instrument-map {item}: {asset!r} is not an asset of this run ({', '.join(assets)})")
+        if asset in out:
+            raise SystemExit(f"--instrument-map {item}: {asset!r} is mapped twice")
         try:
             vals = [float(v) for v in spec.split(",")]
         except ValueError:
             raise SystemExit(f"--instrument-map {item}: {usage}")
-        if not 1 <= len(vals) <= len(INSTRUMENT_FIELDS) or vals[0] <= 0 or any(v < 0 for v in vals):
+        if (not 1 <= len(vals) <= len(INSTRUMENT_FIELDS) or not all(np.isfinite(vals))
+                or vals[0] <= 0 or any(v < 0 for v in vals)):
             raise SystemExit(f"--instrument-map {item}: {usage}")
         # a full instrument: what is left out is a cash share's (no per-unit cost,
         # no margin, no roll), never the run-wide futures settings
@@ -225,6 +229,16 @@ def instrument_of(c: dict, asset: str | None = None) -> dict:
 def cost_bps_of(c: dict, asset: str | None = None) -> float:
     """The bps cost an asset of the run is actually charged (0 with a margin)."""
     return float(instrument_of(c, asset).get("cost_bps", c.get("cost_bps", 0.0)))
+
+
+def costs_text(c: dict, assets=None) -> str:
+    """The bps costs a run actually charges, for a report: one number when
+    every asset pays the same, else per asset (a margined one pays 0)."""
+    assets = list(assets) if assets else [None]
+    bps = {a: cost_bps_of(c, a) for a in assets}
+    if len(set(bps.values())) == 1:
+        return f"{next(iter(bps.values())):g} bps/side"
+    return "bps/side " + ", ".join(f"{a} {v:g}" for a, v in bps.items())
 
 
 def instrument_text(c: dict, asset: str | None = None) -> str:

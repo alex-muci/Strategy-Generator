@@ -25,7 +25,7 @@ python -m venv env  # assuming 3.12 installed
 ./env/Script/Activate
 pip install -r requirements.txt 
 
-python -m unittest discover -s tests -t . -v # __N_TESTS__ tests (engine, exit ordering, order log, templates, hedge learner and its wide ladder, walk-forward, robustness, selection, data, live signals, replay, both entry points, spreads: shift invariance, point value, per-unit and roll costs, margin cap, ruin, whole units, the ETF trick, a mixed cash + spread book)
+python -m unittest discover -s tests -t . -v # 414 tests (engine, exit ordering, order log, templates, hedge learner and its wide ladder, walk-forward, robustness, selection, data, live signals, replay, both entry points, spreads: shift invariance, point value, per-unit and roll costs, margin cap, ruin, whole units, the ETF trick, a mixed cash + spread book)
 # faster: pip install -r requirements-dev.txt, then, with ./env active,
 python -m pytest -n auto --dist loadscope   # in parallel; loadscope keeps a class (and its one-off setup) on one worker
 python -m pytest -m slow                    # the minutes-long live-order sweeps pytest skips by default
@@ -1140,10 +1140,17 @@ They are listed with the number that would justify reopening each one.
   contract count, indefinitely: changing one price inside a test block moved
   over a hundred training returns far past the embargo without ruining
   either run. At fixed capital a return depends on its own trade's prices
-  only, so the embargo covers every way a test bar reaches training
-  (`tests/test_selection.py`, the whole-units test, shows the compounding
-  run leaking on the same fixture and the fixed one not). CPCV's training
-  records and paths are then summed, not compounded (`cpcv(..., additive=True)`).
+  only, and the account-state channel is gone (`tests/test_selection.py`,
+  the whole-units test, shows the compounding run leaking on the same
+  fixture and the fixed one not). Two channels remain, both small and both
+  older than this: which trades a trial takes after the embargo can differ
+  (a different trade on clean prices, see above), and a Keltner EMA settled
+  to 1e-4 of its seed still moves fill prices by ~1e-5. CPCV's training
+  records and paths are summed, not compounded (`cpcv(..., additive=True)`),
+  so CPCV scores the rule at constant capital while the walk-forward scores
+  the compounding account: the same ranking for fractional sizes, close to it
+  for whole units, and CPCV never shows a ruin (selection does: a template
+  whose walk-forward account went to zero or below is never a candidate).
 - **`adx()` seeds Wilder's smoothing with the first observation**, not
   with the SMA of the first n as charting platforms do. The two differ
   only while the seed is remembered, and `warmup_bars` already keeps the
