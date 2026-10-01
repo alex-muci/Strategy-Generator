@@ -125,12 +125,25 @@ FAMILIES = {
         bias_filters=["none"],
         sides=["both"],
     ),
+    # the learner's committee traded directly (entry_style 'stance': hold its
+    # side, sized by its stance, no channel break, stop or exit rule), on the
+    # slow ladders; follow-only and learned, nothing to fit
+    "online_stance": dict(
+        direction_logics=["trend", "learned"],
+        channel_types=["hedge_slow", "hedge_wide_slow"],
+        entry_styles=["stance"],
+        exit_styles=["channel"],
+        regimes=[("er", "none")],
+        vol_filters=[False],
+        bias_filters=["none"],
+        sides=["both"],
+    ),
     "full": dict(
         direction_logics=DIRECTION_LOGICS,
         # the slow ladders are the fast ones' experts with a longer memory, so
         # they have their own families rather than doubling the hedge part of this one
         channel_types=[c for c in CHANNEL_TYPES if not c.endswith("_slow")],
-        entry_styles=ENTRY_STYLES,
+        entry_styles=[e for e in ENTRY_STYLES if e != "stance"],
         exit_styles=EXIT_STYLES,
         regimes=_ALL_REGIMES,
         vol_filters=VOL_FILTERS,
@@ -147,7 +160,7 @@ _SHORT = {
     "trend": "TR", "countertrend": "CT", "learned": "LN",
     "donchian": "don", "keltner": "kel", "bollinger": "bol", "hedge": "hdg", "hedge_wide": "hdw",
     "hedge_slow": "hds", "hedge_wide_slow": "hws",
-    "stop": "stop", "close_confirm": "cls", "pullback": "pb",
+    "stop": "stop", "close_confirm": "cls", "pullback": "pb", "stance": "stance",
     "channel": "chan", "atr_trail": "trail", "target_stop": "tgt", "time_stop": "time",
     "none": "none", "trend_only": "trend", "range_only": "range",
     "sma": "sma",

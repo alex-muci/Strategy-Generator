@@ -1129,7 +1129,7 @@ REGIME_INDICATORS = {
 
 DIRECTION_LOGICS = ["trend", "countertrend", "learned"]
 CHANNEL_TYPES = ["donchian", "keltner", "bollinger", "hedge", "hedge_wide", "hedge_slow", "hedge_wide_slow"]
-ENTRY_STYLES = ["stop", "close_confirm", "pullback"]
+ENTRY_STYLES = ["stop", "close_confirm", "pullback", "stance"]
 EXIT_STYLES = ["channel", "atr_trail", "target_stop", "time_stop"]
 REGIME_INDICATOR_NAMES = list(REGIME_INDICATORS)
 REGIME_FILTERS = ["none", "trend_only", "range_only"]
@@ -1384,10 +1384,10 @@ def _compute_indicators(df: pd.DataFrame, tpl: StrategyTemplate, dfkey=None) -> 
 # Backtest engine (single asset, bar-by-bar for correct stateful exits)
 # --------------------------------------------------------------------------
 
-ENTRY_CODES = {"stop": 0, "close_confirm": 1, "pullback": 2}
+ENTRY_CODES = {"stop": 0, "close_confirm": 1, "pullback": 2, "stance": 3}   # stance never reaches the bar loop (_stance_backtest)
 EXIT_CODES = {"channel": 0, "atr_trail": 1, "target_stop": 2, "time_stop": 3}
 REGIME_CODES = {"none": 0, "trend_only": 1, "range_only": 2}
-REASONS = ["stop", "channel", "midline", "target", "time", "stop_same_bar", "ruin"]
+REASONS = ["stop", "channel", "midline", "target", "time", "stop_same_bar", "ruin", "stance"]
 
 # The order log (backtest(..., log_orders=True)): what the loop had WORKING on
 # a bar and what it did on it, read out of the loop itself rather than rebuilt
@@ -2128,6 +2128,156 @@ def typical_units(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: float
     return float(qty) if np.isfinite(qty) else 0.0
 
 
+STANCE_STEPS = 4      # the 'stance' entry trades its committee's stance in quarters of a full size
+
+
+def hedge_stance(df: pd.DataFrame, atr_n: int, mode: str = "learned", cost_bps: float = 0.0,
+                 ladder: str = "hedge", sides: str = "both", cost_pts: float = 0.0) -> np.ndarray:
+    """Per-bar signed stance of the learner's committee at the close, in
+    [-1, 1]: the weighted experts' stances summed (weight times +1 long, -1
+    short, 0 flat), times the trade weight on a position-sized ladder (that
+    is `hedge_position`). This, not a break of the averaged channel, is what
+    the learner is scored on and what its regret bound is about. NaN until
+    the learner is formed."""
+    sides_s = hedge_scored_sides(ladder, sides)
+    if hedge_position_sized(ladder):
+        return hedge_position(df, atr_n, mode, cost_bps, ladder, sides, cost_pts)
+    W = hedge_weights(df, atr_n, mode, cost_bps, ladder, sides_s, cost_pts)
+    S, _, _ = _hedge_stances(df, atr_n, mode, ladder, sides_s)
+    p = np.clip((W * S).sum(axis=1), -1.0, 1.0)
+    p[:min(len(p), hedge_warmup(atr_n, ladder))] = np.nan
+    return p
+
+
+def _stance_backtest(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: float, first_trade_bar: int,
+                     log_orders: bool, fixed_capital: bool) -> dict:
+    """The `stance` entry style: hold the side of the learner's committee
+    (`hedge_stance`) instead of trading a break of its averaged channel.
+
+    The experts are scored on holding a stance for a while after a break;
+    the channel templates trade something else (a break of the weight-
+    averaged channel, then a channel, trail, target or time exit and a hard
+    ATR stop), and a planted edge shows the gap: a fade edge the committee
+    earns a Sharpe of 3 on is worth about 1 through the countertrend exits.
+    Here the template trades what the learner learned:
+
+    * the side is the sign of the committee's stance at the close of bar
+      i-1 (flat when it is exactly 0, or on a side `sides` forbids), and
+      the order goes at the open of bar i, so nothing is filled on
+      information of its own bar;
+    * the position is the stance, rounded to quarters (STANCE_STEPS), times
+      the risk or vol-target units of `backtest` (risk_pct at atr_mult_stop
+      ATRs, or vol_target) at the bar it changes, capped at max_leverage;
+      it is re-sized when the rounded stance moves (the trade is closed and
+      a new one opened, the cost charged on the units actually traded), so
+      the trade list holds one row per stretch of constant size;
+    * there is no stop, target or exit channel: the exit IS the learner
+      changing its mind, so exit_style and its parameters are inert.
+
+    Costs, point value, fixed capital and the returns follow `backtest`.
+    Margined instruments (futures, spreads, rolls, whole units) are not
+    supported here. Returns the dict `backtest` returns; `orders` is an
+    empty frame (no resting orders exist)."""
+    if tpl.margin_per_unit > 0 or tpl.whole_units or tpl.roll_cost_per_unit > 0:
+        raise NotImplementedError("the 'stance' entry style trades cash assets only")
+    n = len(df)
+    first_trade_bar = int(max(first_trade_bar, 0))
+    open_ = _to_arr(df["Open"]); close = _to_arr(df["Close"])
+    ind = _compute_indicators(df, tpl, _df_key(df, close))
+    ladder = hedge_ladder_for(tpl.channel_type)
+    cost_pts = float(tpl.cost_per_unit) / float(tpl.point_value)
+    mode = "learned" if tpl.direction_logic == "learned" else tpl.direction_logic
+    dfkey = _df_key(df, close)
+    p = _cached(df, ("hedge_stance", ladder, mode, tpl.atr_n, float(tpl.cost_bps), tpl.sides, cost_pts),
+                lambda: hedge_stance(df, tpl.atr_n, mode, tpl.cost_bps, ladder, tpl.sides, cost_pts), dfkey)
+    allow_long, allow_short = _allowed(tpl.sides)
+    # the target, a signed fraction of one full size in quarters: the stance
+    # moves a little every bar, and re-trading every wiggle would pay the
+    # spread for nothing; a quarter of the size is the smallest step traded
+    q = np.where(np.isnan(p), 0.0, np.round(p * STANCE_STEPS) / STANCE_STEPS)
+    q = np.where((q > 0) & ~allow_long, 0.0, q)
+    q = np.where((q < 0) & ~allow_short, 0.0, q)
+    ready = ind["ready"] & ~np.isnan(p)
+    atr_v = ind["atr"]; rvol = ind.get("rvol")
+    vol_target_bar = float(tpl.vol_target) / np.sqrt(periods_per_year()) if tpl.vol_target > 0 else 0.0
+    pv = float(tpl.point_value); cost_rate = tpl.cost_bps / 1e4
+    equity = np.full(n, float(initial_equity)); entries = np.zeros(n)
+    cash = float(initial_equity)
+    pos = 0; shares = 0.0; e_bar = -1; e_px = 0.0; e_cost = 0.0; trades = []
+
+    def close_trade(i, px, charge=True):
+        nonlocal cash, pos, shares
+        xc = (cost_rate * shares * pv * abs(px) + tpl.cost_per_unit * shares) if charge else 0.0
+        cash -= xc
+        pnl = pos * shares * pv * (px - e_px) - e_cost - xc
+        trades.append(dict(entry_date=df.index[e_bar], side=int(pos), entry_price=float(e_px), shares=float(shares),
+                           cost=float(e_cost + xc), exit_date=df.index[i], exit_price=float(px), reason="stance",
+                           pnl=float(pnl), bars_held=int(i - e_bar)))
+        pos = 0; shares = 0.0
+
+    level = 0.0                      # the quantised stance the position was sized for
+    for i in range(1, n):
+        # the open of bar i: the position marked from the last close, then the order
+        if pos != 0:
+            cash += pos * shares * pv * (open_[i] - close[i - 1])
+        if i < first_trade_bar:
+            want = 0.0
+        elif ready[i - 1]:
+            want = float(q[i - 1])
+        else:
+            want = level
+        if want != level:
+            new_side = int(np.sign(want))
+            qty = 0.0
+            if new_side != 0 and atr_v[i - 1] > 0 and (vol_target_bar <= 0 or (rvol is not None and rvol[i - 1] > 0)):
+                base = initial_equity if fixed_capital else cash
+                if vol_target_bar > 0:
+                    qty = base * vol_target_bar / (rvol[i - 1] * abs(open_[i]) * pv)
+                else:
+                    qty = base * tpl.risk_pct / (tpl.atr_mult_stop * atr_v[i - 1] * pv)
+                qty *= abs(want)
+                qty = min(qty, tpl.max_leverage * base / (pv * abs(open_[i]))) if open_[i] != 0 and base > 0 else 0.0
+            if new_side == pos and pos != 0 and qty > 0:
+                # same side, new size: the trade is closed and a new one opened at
+                # the open, charged on the units actually traded
+                d = abs(qty - shares)
+                c = cost_rate * d * pv * abs(open_[i]) + tpl.cost_per_unit * d
+                close_trade(i, open_[i], charge=False)
+                cash -= c
+                pos = new_side; shares = float(qty); e_bar = i; e_px = float(open_[i]); e_cost = c
+                entries[i] = 1.0
+            else:
+                if pos != 0:
+                    close_trade(i, open_[i])
+                if qty > 0:
+                    pos = new_side; shares = float(qty); e_bar = i; e_px = float(open_[i])
+                    e_cost = cost_rate * shares * pv * abs(e_px) + tpl.cost_per_unit * shares
+                    cash -= e_cost; entries[i] = 1.0
+            level = want if pos != 0 else 0.0
+        if pos != 0:
+            cash += pos * shares * pv * (close[i] - open_[i])
+        equity[i] = cash
+    rets = np.zeros(n)
+    if fixed_capital:
+        rets[1:] = np.diff(equity) / float(initial_equity)
+    else:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            rets[1:] = np.where(equity[:-1] > 0.0, equity[1:] / equity[:-1] - 1.0, 0.0)
+    idx = df.index
+    open_position = None
+    if pos != 0:
+        open_position = dict(side=int(pos), shares=float(shares), entry_price=float(e_px), entry_bar=int(e_bar),
+                             entry_date=pd.Timestamp(idx[e_bar]), entry_cost=float(e_cost), hard_stop=np.nan,
+                             target=np.nan, trail_extreme=np.nan, bars_held=int(n - 1 - e_bar),
+                             unrealized=float(pos * shares * pv * (close[-1] - e_px)), is_trend=True)
+    pnls = np.array([t["pnl"] for t in trades]); held = np.array([t["bars_held"] for t in trades], dtype=float)
+    stats = performance_stats(equity, trades, initial_equity, rets, pnls, held)
+    orders = _orders_frame(np.zeros((0, 4), dtype=np.int64), np.zeros((0, 3)), idx.to_numpy()) if log_orders else None
+    return {"equity": pd.Series(equity, index=idx), "returns": pd.Series(rets, index=idx), "entries": entries,
+            "trades": trades, "stats": stats, "open_position": open_position, "pending_order": None,
+            "last_atr": float(atr_v[-1]) if n else np.nan, "indicators": ind, "orders": orders}
+
+
 def backtest(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: float = 100_000.0,
              first_trade_bar: int = 0, log_orders: bool = False, fixed_capital: bool = False) -> dict:
     """Run `tpl` over `df` (must have Open/High/Low/Close). Returns a dict:
@@ -2157,6 +2307,8 @@ def backtest(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: float = 10
     works on price differences, and adding a constant to every price leaves
     the trades, the P&L and the equity unchanged.
     """
+    if tpl.entry_style == "stance":
+        return _stance_backtest(df, tpl, initial_equity, first_trade_bar, log_orders, fixed_capital)
     n = len(df)
     first_trade_bar = int(max(first_trade_bar, 0))
     validate_instrument(df, tpl)

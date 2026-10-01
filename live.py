@@ -213,6 +213,8 @@ def strategy_state(
     the walk-forward never had. Without it (`lookback_bars`, default 400 bars)
     the state is rebuilt from a flat start that many bars back.
     """
+    if tpl.entry_style == "stance":
+        raise NotImplementedError(f"{tpl.name}: live orders for the research-only 'stance' entry are not implemented")
     warm = warmup_bars(tpl)
     need = warm + 10
     first_trade = 0
