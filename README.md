@@ -25,7 +25,7 @@ python -m venv env  # assuming 3.12 installed
 ./env/Script/Activate
 pip install -r requirements.txt 
 
-python -m unittest discover -s tests -t . -v # 382 tests (engine, order log, templates, hedge learner and its wide ladder, walk-forward, robustness, selection, data, live signals, replay, both entry points, spreads: shift invariance, point value, per-unit costs, margin cap, ruin, whole units, the ETF trick, a mixed cash + spread book)
+python -m unittest discover -s tests -t . -v # 384 tests (engine, order log, templates, hedge learner and its wide ladder, walk-forward, robustness, selection, data, live signals, replay, both entry points, spreads: shift invariance, point value, per-unit costs, margin cap, ruin, whole units, the ETF trick, a mixed cash + spread book)
 # faster (about 1:35 min instead of 4.5): pip install -r requirements-dev.txt, then, with ./env active,
 python -m pytest -n auto --dist loadscope   # same tests in parallel; loadscope keeps a class (and its one-off setup) on one worker
 ```
@@ -356,7 +356,7 @@ A **template** is a fixed combination of categorical switches:
 | `channel_type` | `donchian` / `keltner` (EMA +/- k ATR) / `bollinger` (SMA +/- k sd) / `hedge` (online-learned, see below) / `hedge_wide` (the same learner over a wider ladder, sized by its own position, see below) |
 | `entry_style` | `stop` (at the level) / `close_confirm` (close beyond, next open) / `pullback` (after the break, a limit k ATR from the level: back inside the channel when following, deeper beyond it when fading) |
 | `exit_style` | `channel` (Turtle exit; midline target for countertrend) / `atr_trail` / `target_stop` / `time_stop` -- a hard ATR stop is always on |
-| `regime_indicator` | `er` Kaufman Efficiency Ratio / `adx` / `cti` Ehlers Correlation Trend / `chop` Choppiness / `vr` variance ratio |
+| `regime_indicator` | `er` Kaufman Efficiency Ratio / `adx` / `cti` Ehlers Correlation Trend / `chop` Choppiness / `vr` variance ratio (on log returns for a cash asset, on point changes for a future: see Cash assets vs futures and spreads) |
 | `regime_filter` | `none` / `trend_only` / `range_only` (Ranger's "sideways" mode) |
 | `vol_filter` | skip entries when ATR is in an extreme percentile |
 | `bias_filter` | `sma`: longs only above SMA(200), shorts only below (financial-hacker's market-direction filter) |
@@ -435,8 +435,16 @@ and the series is a future (or a futures spread).
 | costs | `--cost-bps` of the traded notional | `--cost-per-unit` per lot per side |
 | leverage cap (`--max-leverage`) | on **notional**: units x price / equity (2 = 2x long the index) | on **margin**: lots x margin / equity (0.5 = half the account posted as margin) |
 | vol-target sizing | on **% returns** (pct vol x price) | on **price changes** (point vol x point value) |
+| `vr` regime filter (variance ratio) | on **log returns** | on **price changes** |
 | prices at or below zero | refused (a bad print; dropped by the yfinance loader) | allowed (a spread trades through zero) |
 | benchmark | buy and hold, compounded | P&L of holding one lot on the initial equity, summed |
+
+On a cash asset the two rows that read returns (vol-target sizing and the
+`vr` filter) are exactly what they were before futures support was added,
+so earlier share runs reproduce. On a future both use price changes, the
+only form that means the same on a back-adjusted level and through zero.
+Every other rule (channels, ATR, stops, targets, the other regime
+indicators, the learner) works on price differences for both kinds.
 
 **Why the margin.** A future's price is not the price of anything you pay
 for. You post a margin, and your P&L is the price change times the point
@@ -475,7 +483,8 @@ spreads, and every number the engine computes comes from point changes x
 A futures calendar spread (Brent Dec25-Dec26, say) is quoted front minus
 back and trades through zero. Nothing needs to be added to its prices to
 run it here: the engine is **shift-invariant**. Every rule works on price
-differences (channels, ATR, stops, targets, every regime indicator, the
+differences (channels, ATR, stops, targets, every regime indicator -- the
+variance ratio on point changes once a margin is given --, the
 learner's stances and losses, the P&L), so adding any constant to every
 price, including one that makes the whole series negative, leaves the
 trades, the P&L and the equity unchanged, and `tests/test_instrument.py`

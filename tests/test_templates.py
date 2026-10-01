@@ -293,9 +293,12 @@ class TemplateBehaviourTests(unittest.TestCase):
                     self.assertTrue(prev_close > bias[i - 1] if tr["side"] == 1 else prev_close < bias[i - 1],
                                     f"{plain.name}: entered against the bias filter")
 
-    def _check_mirror(self, mirror: pd.DataFrame, c: float, params: dict, min_checked: int = 500):
+    def _check_mirror(self, mirror: pd.DataFrame, c: float, params: dict, min_checked: int = 500,
+                      skip_vr: bool = False):
         checked = 0
         for tpl in self.sample:
+            if skip_vr and tpl.regime_filter != "none" and tpl.regime_indicator == "vr":
+                continue
             t = tpl.with_params(**params)
             a, b = backtest(self.df, t), backtest(mirror, t.with_params(sides=_MIRROR_SIDES[t.sides]))
             np.testing.assert_allclose(a["equity"].to_numpy(), b["equity"].to_numpy(), rtol=1e-9,
@@ -316,11 +319,18 @@ class TemplateBehaviourTests(unittest.TestCase):
         entry bar, mirrored prices, identical P&L (with the leverage cap and
         costs off, the ATR-based size is the same on both sides). Anything the
         short-side code does differently from the long side shows up here.
-        Every regime indicator mirrors, the variance ratio included (it is
-        built on price differences). A one-sided template is mirrored into
-        the other side's template."""
+        On a cash asset the variance ratio is built on log returns, which do
+        not mirror, so it is left out here; the margined mirror below covers
+        it on price differences. A one-sided template is mirrored into the
+        other side's template."""
         c = 2.0 * (float(self.df["High"].max()) + 1.0)
-        self._check_mirror(_mirror(self.df), c, dict(cost_bps=0.0, max_leverage=1e9))
+        self._check_mirror(_mirror(self.df), c, dict(cost_bps=0.0, max_leverage=1e9), skip_vr=True)
+
+    def test_a_margined_mirror_covers_the_variance_ratio(self):
+        """With a margin (a future) the variance ratio is on price differences and
+        mirrors like every other indicator, on the same positive series."""
+        c = 2.0 * (float(self.df["High"].max()) + 1.0)
+        self._check_mirror(_mirror(self.df), c, dict(cost_bps=0.0, margin_per_unit=500.0, max_leverage=1e9))
 
     def test_the_mirror_through_zero_holds_with_the_cap_and_per_unit_costs_on(self):
         """Reflect around 0 instead: every price becomes negative. With the

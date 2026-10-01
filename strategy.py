@@ -282,14 +282,15 @@ def choppiness(df: pd.DataFrame, n: int) -> pd.Series:
     return ci.clip(0, 100)
 
 
-def variance_ratio(close: pd.Series, n: int, q: int = 5) -> pd.Series:
+def variance_ratio(close: pd.Series, n: int, q: int = 5, log_returns: bool = False) -> pd.Series:
     """Lo-MacKinlay style variance ratio over a rolling n-bar window:
-    Var(q-bar price change) / (q * Var(1-bar price change)).
+    Var(q-bar change) / (q * Var(1-bar change)).
     ~1 random walk, >1 trending (positive autocorrelation), <1 mean-reverting.
-    On price DIFFERENCES, not log returns: the ratio is scale-free either
-    way, and differences are defined for a price at or below zero and do
-    not move when a constant is added to every price."""
-    r = close.diff()
+    On price DIFFERENCES by default: defined for a price at or below zero and
+    unmoved when a constant is added to every price (a future or spread).
+    `log_returns` takes the changes of log(price) instead, the classic form
+    for a cash asset (`is_cash_asset`), whose price is always positive."""
+    r = np.log(close).diff() if log_returns else close.diff()
     rq = r.rolling(q).sum()
     v1 = r.rolling(n).var()
     vq = rq.rolling(n).var()
@@ -1063,7 +1064,9 @@ REGIME_INDICATORS = {
     "adx":  dict(fn=lambda df, n: adx(df, n), n=14, threshold=25.0, thresholds=[20.0, 25.0, 30.0]),
     "cti":  dict(fn=lambda df, n: cti(df["Close"], n).abs(), n=20, threshold=0.5, thresholds=[0.4, 0.5, 0.6]),
     "chop": dict(fn=lambda df, n: 100.0 - choppiness(df, n), n=14, threshold=50.0, thresholds=[38.2, 50.0, 61.8]),
-    "vr":   dict(fn=lambda df, n: variance_ratio(df["Close"], n), n=60, threshold=1.0, thresholds=[0.9, 1.0, 1.1]),
+    # `cash_fn`: the form a cash asset uses instead of `fn` (see is_cash_asset)
+    "vr":   dict(fn=lambda df, n: variance_ratio(df["Close"], n), n=60, threshold=1.0, thresholds=[0.9, 1.0, 1.1],
+                 cash_fn=lambda df, n: variance_ratio(df["Close"], n, log_returns=True)),
 }
 
 
@@ -1212,14 +1215,20 @@ def _channel_arrays(df, kind, n, k, atr_n, dfkey=None, mode="trend", role="entry
     return _cached(df, spec, build, dfkey)
 
 
-def rvol_is_pct(tpl: StrategyTemplate) -> bool:
-    """Which realized vol the volatility target sizes on. A cash asset (no
-    `margin_per_unit`) uses the std of its percentage returns: one share's
-    dollar vol is that times the price, the rule a share has always been
-    sized by. A future or spread (`margin_per_unit` given) uses the std of
-    its price changes in points: its quoted level is back-adjusted or goes
-    through zero, so a percentage of it means nothing, while one lot's dollar
-    vol is exactly point_value x that std."""
+def is_cash_asset(tpl: StrategyTemplate) -> bool:
+    """A cash asset (no `margin_per_unit`: a share, an ETF) or a future or
+    spread (`margin_per_unit` given). Two rules read the price differently:
+
+    * the volatility target: a cash asset sizes on the std of its percentage
+      returns (one share's dollar vol is that times the price, the rule a
+      share has always been sized by); a future on the std of its price
+      changes in points (its quoted level is back-adjusted or goes through
+      zero, so a percentage of it means nothing, while one lot's dollar vol
+      is exactly point_value x that std);
+    * the variance-ratio regime filter (`vr`): on log returns for a cash
+      asset, on point changes for a future.
+
+    Everything else works on price differences for both."""
     return not tpl.margin_per_unit > 0
 
 
@@ -1282,7 +1291,11 @@ def _compute_indicators(df: pd.DataFrame, tpl: StrategyTemplate, dfkey=None) -> 
     if tpl.regime_filter != "none":
         spec = REGIME_INDICATORS[tpl.regime_indicator]
         rn = tpl.regime_n if tpl.regime_n > 0 else spec["n"]
-        use("regime", _cached(df, ("regime", tpl.regime_indicator, rn), lambda: _to_arr(spec["fn"](df, rn)), dfkey))
+        # a cash asset reads the indicator on its returns where that differs
+        # (the variance ratio on log returns), a future or spread on point changes
+        cash = is_cash_asset(tpl) and "cash_fn" in spec
+        fn = spec["cash_fn"] if cash else spec["fn"]
+        use("regime", _cached(df, ("regime", tpl.regime_indicator, rn, cash), lambda: _to_arr(fn(df, rn)), dfkey))
         ind["regime_threshold"] = (
             tpl.regime_threshold if not np.isnan(tpl.regime_threshold) else spec["threshold"]
         )
@@ -1294,8 +1307,8 @@ def _compute_indicators(df: pd.DataFrame, tpl: StrategyTemplate, dfkey=None) -> 
     if tpl.vol_target > 0:
         # realized per-bar vol, NOT annualized (the cached array does not
         # depend on periods_per_year(); the target is scaled to per-bar in
-        # backtest()), measured the way the instrument is (rvol_is_pct):
-        if rvol_is_pct(tpl):
+        # backtest()), measured the way the instrument is (is_cash_asset):
+        if is_cash_asset(tpl):
             # a cash asset: std of pct changes, the share's own return vol
             use("rvol", _cached(df, ("rvol", tpl.vol_target_n),
                                 lambda: _to_arr(df["Close"].pct_change().rolling(tpl.vol_target_n).std()), dfkey))
@@ -1380,7 +1393,7 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
     vol_target_bar / (rvol[i-1] * point_value) with rvol in price points
     when a margin is given (a future or spread), cash * vol_target_bar /
     (rvol[i-1] * |fill| * point_value) with rvol the pct vol otherwise (a
-    cash asset; see `rvol_is_pct`) (both per-bar vols); scaled by the learner's conviction |direction[i-1]|
+    cash asset; see `is_cash_asset`) (both per-bar vols); scaled by the learner's conviction |direction[i-1]|
     when the direction is learned (direction is a constant +/-1 otherwise);
     capped at `max_leverage` * cash of margin (units * margin_per_unit) when
     a margin is given, else of notional (units * point_value * |price|);
@@ -1942,7 +1955,7 @@ def typical_units(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: float
     `whole_units` needs to be told it floors to 0."""
     close = df["Close"].to_numpy(dtype=float)
     if tpl.vol_target > 0:
-        if rvol_is_pct(tpl):
+        if is_cash_asset(tpl):
             pct = float(np.nanmedian(df["Close"].pct_change().rolling(tpl.vol_target_n).std().to_numpy()))
             sigma = pct * float(np.nanmedian(np.abs(close)))
         else:

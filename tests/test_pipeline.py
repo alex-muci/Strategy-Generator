@@ -1300,3 +1300,18 @@ class AnnualizationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class VarianceRatioByInstrumentTests(unittest.TestCase):
+    def test_a_cash_asset_reads_log_returns_and_a_future_point_changes(self):
+        """The `vr` regime filter is the classic log-return ratio on a share and
+        the shift-invariant point-change ratio once a margin makes it a future."""
+        from strategy import _compute_indicators
+        df = synthetic_ohlc(800, seed=4, trend_drift=0.002)
+        cash = StrategyTemplate("t", regime_filter="trend_only", regime_indicator="vr")
+        fut = cash.with_params(point_value=1000.0, margin_per_unit=6000.0, cost_bps=0.0)
+        np.testing.assert_array_equal(_compute_indicators(df, cash)["regime"],
+                                      variance_ratio(df["Close"], 60, log_returns=True).to_numpy())
+        np.testing.assert_array_equal(_compute_indicators(df, fut)["regime"], variance_ratio(df["Close"], 60).to_numpy())
+        self.assertFalse(np.allclose(np.nan_to_num(_compute_indicators(df, cash)["regime"]),
+                                     np.nan_to_num(_compute_indicators(df, fut)["regime"])))
