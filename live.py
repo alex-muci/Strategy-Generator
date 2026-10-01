@@ -316,12 +316,42 @@ def _entry_orders(df, tpl: StrategyTemplate, ind: dict, pending, equity: float) 
     # republishing it here would keep alive an order the backtest had pulled
     if not _last_ready(tpl, ind, n):
         return []
+    a = float(ind["atr"][n - 1])
+
+    def bracket(o: dict, level: float | None, trend: bool) -> dict:
+        """The target that works from the fill, bracketed with the entry: the
+        engine can take it on the entry bar itself (when the bar's prices
+        beyond the fill certainly came after it, strategy._bar_loop), so it
+        must be working the moment the entry fills.
+
+        An ATR target is an OFFSET from the fill (`target_offset`, signed in
+        price points): a gap fills away from the level and moves the target
+        with it, so peg it to the actual fill. `target_at_level` is where it
+        sits if the order fills at its level (None for an order at the open).
+        A countertrend midline is a fixed price (`target`).
+
+        The engine is conservative where a real bracket is not: after a limit
+        fill inside the bar (not at the open) it waits a bar for the target,
+        while a resting bracket can fill later on that same bar."""
+        if tpl.exit_style == "target_stop":
+            off = o["side"] * tpl.atr_mult_target * a
+            o["target_offset"] = off
+            o["target_at_level"] = None if level is None else level + off
+            o["note"] += (f"; bracket a target {tpl.atr_mult_target:g} ATR ({abs(off):.2f}) from the FILL"
+                          + ("" if level is None else f" ({o['target_at_level']:.2f} if filled at the level; "
+                                                      "re-peg it after a gap)"))
+        elif tpl.exit_style == "channel" and not trend:
+            o["target"] = float(ind["mid_x"][n - 1])
+            o["note"] += f"; bracket the channel midline {o['target']:.2f} as its target"
+        return o
+
     if pending is not None:
         side = pending["side"]
-        return [dict(kind="limit", side=side, level=pending["level"],
-                     shares=_size(equity, tpl, ind, n, pending["level"], pending["is_trend"]),
-                     note=f"pullback limit already working, expires in "
-                          f"{max(pending['expires_bar'] - (n - 1), 0)} bar(s)")]
+        return [bracket(dict(kind="limit", side=side, level=pending["level"],
+                             shares=_size(equity, tpl, ind, n, pending["level"], pending["is_trend"]),
+                             note=f"pullback limit already working, expires in "
+                                  f"{max(pending['expires_bar'] - (n - 1), 0)} bar(s)"),
+                        pending["level"], pending["is_trend"])]
     if _filter_block(df, tpl, ind):
         return []
 
@@ -333,22 +363,6 @@ def _entry_orders(df, tpl: StrategyTemplate, ind: dict, pending, equity: float) 
     # which channel edge opens a long, and which opens a short
     long_level, short_level = (upper, lower) if is_trend else (lower, upper)
     out = []
-    a = float(ind["atr"][n - 1])
-
-    def bracket(o: dict, fill: float | None) -> dict:
-        """The target that works from the fill, as one bracket with the entry:
-        the engine takes it on the entry bar itself when the bar's prices
-        beyond the fill certainly came after it (strategy._bar_loop), so it
-        must be working the moment the entry fills. `fill` None: at the open."""
-        if tpl.exit_style == "target_stop":
-            dist = tpl.atr_mult_target * a
-            o["target"] = None if fill is None else fill + o["side"] * dist
-            o["note"] += (f"; bracket a target {tpl.atr_mult_target:g} ATR ({dist:.2f}) from the fill"
-                          + ("" if fill is None else f" ({o['target']:.2f} at the level)"))
-        elif tpl.exit_style == "channel" and not is_trend:
-            o["target"] = float(ind["mid_x"][n - 1])
-            o["note"] += f"; bracket the channel midline {o['target']:.2f} as its target"
-        return o
 
     if tpl.entry_style == "close_confirm":
         # the break is already decided by the last close: this is a market
@@ -363,11 +377,11 @@ def _entry_orders(df, tpl: StrategyTemplate, ind: dict, pending, equity: float) 
         if take_long:
             out.append(bracket(dict(kind="market_on_open", side=1, level=None,
                                     shares=_size(equity, tpl, ind, n, float(df["Close"].iloc[-1]), is_trend),
-                                    note="close confirmed beyond the channel"), None))
+                                    note="close confirmed beyond the channel"), None, is_trend))
         elif take_short:
             out.append(bracket(dict(kind="market_on_open", side=-1, level=None,
                                     shares=_size(equity, tpl, ind, n, float(df["Close"].iloc[-1]), is_trend),
-                                    note="close confirmed beyond the channel"), None))
+                                    note="close confirmed beyond the channel"), None, is_trend))
         return out
 
     # 'stop' fills AT the channel edge; 'pullback' waits for the break, then
@@ -376,19 +390,18 @@ def _entry_orders(df, tpl: StrategyTemplate, ind: dict, pending, equity: float) 
         if not ok:
             continue
         if tpl.entry_style == "pullback":
-            out.append(dict(
-                kind="stop_then_limit", side=side, level=level,
-                limit=level - side * tpl.pullback_atr_mult * a,
+            limit = level - side * tpl.pullback_atr_mult * a
+            out.append(bracket(dict(
+                kind="stop_then_limit", side=side, level=level, limit=limit,
                 shares=_size(equity, tpl, ind, n, level, is_trend),
                 note=f"on a break of {level:.2f}, work a limit at "
-                     f"{level - side * tpl.pullback_atr_mult * a:.2f} for "
-                     f"{tpl.pullback_valid_bars} bar(s)"))
+                     f"{limit:.2f} for {tpl.pullback_valid_bars} bar(s)"), limit, is_trend))
         else:
             # a trend break is a stop order (fills as price runs through the
             # level); fading it is a limit order (fills as price reaches it)
             out.append(bracket(dict(kind="stop" if is_trend else "limit", side=side, level=level,
                                     shares=_size(equity, tpl, ind, n, level, is_trend),
-                                    note="breakout" if is_trend else "fade the break"), level))
+                                    note="breakout" if is_trend else "fade the break"), level, is_trend))
     return out
 
 

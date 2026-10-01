@@ -499,6 +499,16 @@ class RuinTests(unittest.TestCase):
         self.assertAlmostEqual(t["pnl"], -170_000.0, delta=1.0)    # 16.7 lots x 1000 x (0.8 - 11.0)
         self.assertAlmostEqual(float(res["equity"].iloc[-1]), 100_000.0 + t["pnl"])
 
+    def test_liquidated_at_a_roll_close_it_does_not_also_roll(self):
+        df = self._gap()
+        df["Roll"] = 0.0
+        df.iloc[42, df.columns.get_loc("Roll")] = 1.0        # the contract rolls at the close that ruins it
+        res = backtest(df, self._tpl(atr_mult_stop=1e6, risk_pct=1e5, roll_cost_per_unit=400.0), first_trade_bar=30)
+        t = res["trades"][0]
+        self.assertEqual(t["reason"], "ruin")
+        self.assertAlmostEqual(t["cost"], 0.0)               # no per-unit cost, and the roll undone
+        self.assertAlmostEqual(float(res["equity"].iloc[-1]), 100_000.0 + t["pnl"])
+
     def test_a_ruined_window_is_not_refunded(self):
         """The walk-forward is one account: after a window ends at or below
         zero, every later window is flat, never restarted on fresh capital."""

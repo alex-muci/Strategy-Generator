@@ -613,31 +613,49 @@ class SpreadSizingTests(unittest.TestCase):
         self.assertAlmostEqual(float(capped["legs"].set_index("asset").loc["X", "shares"]), 1.5)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class BracketTargetTests(unittest.TestCase):
-    """The engine takes a target on the entry bar when the bar's prices beyond
-    the fill certainly came after it, so the published entry carries the
-    target as a bracket, working from the fill."""
+    """The engine can take a target on the entry bar (when the bar's prices
+    beyond the fill certainly came after it), so the published entry carries
+    the target as a bracket: an ATR target as an offset from the FILL (a gap
+    moves it), a countertrend midline as a price. Checked against what the
+    engine then does on the next bar."""
 
-    def test_entry_orders_carry_the_target(self):
-        df = synthetic_ohlc(900, seed=5)
-        found = 0
-        for exit_style, logic in (("target_stop", "trend"), ("channel", "countertrend")):
-            tpl = StrategyTemplate("b", exit_style=exit_style, direction_logic=logic, cost_bps=0.0)
-            for t in range(400, 900, 25):
+    def test_entry_orders_carry_the_target_the_engine_uses(self):
+        df = synthetic_ohlc(1200, seed=5)
+        found = same_bar = 0
+        for entry in ("stop", "pullback", "close_confirm"):
+            tpl = StrategyTemplate("b", exit_style="target_stop", entry_style=entry, cost_bps=0.0,
+                                   atr_mult_target=0.5)   # near enough to be hit on the entry bar
+            for t in range(LOOKBACK + 20, len(df) - 1, 3):
                 st = strategy_state(df.iloc[:t], tpl, equity=100_000.0, lookback_bars=LOOKBACK)
                 for o in st["entry_orders"]:
                     self.assertIn("bracket", o["note"])
-                    if exit_style == "target_stop":
-                        self.assertAlmostEqual(o["target"], o["level"] + o["side"] * tpl.atr_mult_target * st["atr"])
-                    else:
-                        self.assertEqual(-o["side"] * (o["target"] - o["level"]) <= 0, True)   # the midline is inside
+                    self.assertAlmostEqual(o["target_offset"], o["side"] * tpl.atr_mult_target * st["atr"])
                     found += 1
+                if not st["entry_orders"]:
+                    continue
+                after = backtest(df.iloc[t - LOOKBACK:t + 1], tpl, initial_equity=100_000.0)
+                for tr in after["trades"]:
+                    if tr["entry_date"] == tr["exit_date"] == df.index[t] and tr["reason"] == "target":
+                        o = next(o for o in st["entry_orders"] if o["side"] == tr["side"])
+                        self.assertAlmostEqual(tr["exit_price"], tr["entry_price"] + o["target_offset"], places=8)
+                        same_bar += 1
         self.assertGreater(found, 0)
+        self.assertGreater(same_bar, 0, "the sweep never takes a target on its entry bar")
+
+    def test_a_fade_carries_the_midline_and_others_carry_nothing(self):
+        df = synthetic_ohlc(900, seed=5)
+        fade = StrategyTemplate("f", exit_style="channel", direction_logic="countertrend", cost_bps=0.0)
         plain = StrategyTemplate("p", exit_style="atr_trail", cost_bps=0.0)
+        seen = 0
         for t in range(400, 900, 25):
+            for o in strategy_state(df.iloc[:t], fade, lookback_bars=LOOKBACK)["entry_orders"]:
+                self.assertIn("target", o)
+                seen += 1
             for o in strategy_state(df.iloc[:t], plain, lookback_bars=LOOKBACK)["entry_orders"]:
-                self.assertNotIn("target", o)
+                self.assertFalse({"target", "target_offset"} & set(o))
+        self.assertGreater(seen, 0)
+
+
+if __name__ == "__main__":
+    unittest.main()
