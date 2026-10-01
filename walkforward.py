@@ -96,7 +96,7 @@ def warmup_bars(tpl) -> int:
     if tpl.vol_filter:
         need.append(tpl.vol_lookback + tpl.atr_n)
     if tpl.vol_target > 0:
-        # pct_change eats one bar, then the rolling std needs a full window (exact once full)
+        # diff eats one bar, then the rolling std needs a full window (exact once full)
         need.append(tpl.vol_target_n + 1)
     if tpl.bias_filter == "sma":
         need.append(tpl.bias_n)
@@ -191,16 +191,25 @@ def window_backtest(df: pd.DataFrame, tpl, start: int, end: int, *,
     out["entries"] = res["entries"][off:]
     out["stats"] = performance_stats(eq, res["trades"], initial_equity)
     out["window_start"] = df.index[start]
-    out["exposure"] = exposure_totals(out, df["Close"].to_numpy()[start:end])
+    out["exposure"] = exposure_totals(out, df["Close"].to_numpy()[start:end], point_value=tpl.point_value,
+                                      margin_per_unit=tpl.margin_per_unit)
     return out
 
 
-def position_notional(res: dict, close: np.ndarray) -> np.ndarray:
+def position_notional(res: dict, close: np.ndarray, point_value: float = 1.0) -> np.ndarray:
     """Signed notional held at the close of each bar of a backtest result
-    (shares x close x side), rebuilt from its closed trades and the position
-    still open at the end. A trade holds from its entry bar up to the bar
-    BEFORE its exit bar: the exit fills intrabar, so the position is flat at
-    the exit bar's close (the same convention as `bars_held`)."""
+    (units x close x point_value x side), rebuilt from its closed trades and
+    the position still open at the end. A trade holds from its entry bar up
+    to the bar BEFORE its exit bar: the exit fills intrabar, so the position
+    is flat at the exit bar's close (the same convention as `bars_held`).
+    On an instrument that trades through zero (a spread) this is the signed
+    mark of the position, not an exposure."""
+    return position_units(res) * close[:len(res["equity"])] * point_value
+
+
+def position_units(res: dict) -> np.ndarray:
+    """Signed units (shares or lots) held at the close of each bar of a
+    backtest result (see `position_notional` for the convention)."""
     idx = res["equity"].index
     n = len(idx)
     shares = np.zeros(n)
@@ -211,18 +220,28 @@ def position_notional(res: dict, close: np.ndarray) -> np.ndarray:
     if pos is not None:
         i = idx.get_loc(pos["entry_date"]) if pos["entry_date"] in idx else 0
         shares[i:] += pos["side"] * pos["shares"]
-    return shares * close[:n]
+    return shares
 
 
-def exposure_totals(res: dict, close: np.ndarray) -> dict:
-    """Bar-count and notional-over-equity totals of a backtest result, so
+def exposure_totals(res: dict, close: np.ndarray, point_value: float = 1.0, margin_per_unit: float = 0.0) -> dict:
+    """Bar-count and exposure-over-equity totals of a backtest result, so
     windows can be pooled: held_bars (bars with a position), gross (sum over
-    bars of |notional| / equity) and net (sum of signed notional / equity)."""
-    notional = position_notional(res, close)
+    bars of |exposure| / equity) and net (the same signed by the SIDE).
+
+    The exposure of a unit is its margin when the instrument has one (a
+    future, whose quoted price may be back-adjusted or through zero: the same
+    basis as the engine's leverage cap and live.portfolio_targets), else its
+    notional at |close| x point_value. Never the price's sign: a long held
+    through zero is long all the way."""
+    units = position_units(res)
+    basis = (np.full(len(units), float(margin_per_unit)) if margin_per_unit > 0
+             else np.abs(close[:len(units)]) * point_value)
+    exposure = units * basis
     eq = res["equity"].to_numpy()
     with np.errstate(invalid="ignore", divide="ignore"):
-        lev = np.where(eq > 0, notional / eq, 0.0)
-    return dict(n_bars=int(len(eq)), held_bars=int((notional != 0).sum()),
+        lev = np.where(eq > 0, exposure / eq, 0.0)
+    # held bars count units, not exposure: a spread can close at exactly 0 while held
+    return dict(n_bars=int(len(eq)), held_bars=int((units != 0).sum()),
                 gross=float(np.abs(lev).sum()), net=float(lev.sum()))
 
 

@@ -202,7 +202,13 @@ class VolTargetSizingTests(unittest.TestCase):
 
     @staticmethod
     def _rvol(df, n):
+        # the engine's realized vol on a cash asset: per-bar std of pct changes
         return df["Close"].pct_change().rolling(n).std()
+
+    @staticmethod
+    def _rvol_pts(df, n):
+        # ... and on a future or spread (a margin given): std of close DIFFERENCES (price points)
+        return df["Close"].diff().rolling(n).std()
 
     def _flat_entries(self, res):
         return _flat_entries(self.df, res)
@@ -215,33 +221,56 @@ class VolTargetSizingTests(unittest.TestCase):
         self.assertNotIn("rvol", a["indicators"])
         self.assertNotIn("rvol", b["indicators"])
 
-    def test_entry_notional_is_the_target_over_the_realized_vol(self):
+    def test_entry_dollar_vol_is_the_target_times_equity(self):
+        """The position's dollar volatility is the target x equity under both
+        rules: a cash asset's units x price x pct vol, a margined future's
+        units x point_value x sigma_points (whatever its price level)."""
         import strategy as S
-        tpl = StrategyTemplate("t", vol_target=0.15, vol_target_n=60, cost_bps=0.0, max_leverage=1e9)
-        res = backtest(self.df, tpl, first_trade_bar=self.K)
-        rv = self._rvol(self.df, 60)
-        eq = res["equity"]
-        checked = 0
-        for i, t in self._flat_entries(res):
-            notional = t["shares"] * t["entry_price"] / eq.iloc[i - 1]
-            self.assertAlmostEqual(notional, (0.15 / np.sqrt(S.periods_per_year())) / rv.iloc[i - 1],
-                                   places=8, msg=str(t["entry_date"]))
-            checked += 1
-        self.assertGreater(checked, 5)
+        target_bar = 0.15 / np.sqrt(S.periods_per_year())
+        cash = StrategyTemplate("t", vol_target=0.15, vol_target_n=60, cost_bps=0.0, max_leverage=1e9)
+        lot = cash.with_params(point_value=1000.0, margin_per_unit=1.0)
+        for tpl, rv, per_unit in ((cash, self._rvol(self.df, 60), lambda t, i, rv: t["entry_price"] * rv.iloc[i - 1]),
+                                  (lot, self._rvol_pts(self.df, 60), lambda t, i, rv: 1000.0 * rv.iloc[i - 1])):
+            res = backtest(self.df, tpl, first_trade_bar=self.K)
+            eq = res["equity"]
+            checked = 0
+            for i, t in self._flat_entries(res):
+                self.assertAlmostEqual(t["shares"] * per_unit(t, i, rv) / eq.iloc[i - 1], target_bar, places=8,
+                                       msg=f"{tpl.margin_per_unit} {t['entry_date']}")
+                checked += 1
+            self.assertGreater(checked, 5)
 
     def test_a_target_equal_to_the_realized_vol_gives_unit_notional(self):
-        """The whole point: at the asset's own vol the strategy holds ~1x, the
-        buy-and-hold scale."""
+        """The whole point: at the asset's own (pct) vol a cash asset is held at
+        exactly 1x notional, the buy-and-hold scale."""
         import strategy as S
         base = StrategyTemplate("t", vol_target=0.15, vol_target_n=60, cost_bps=0.0, max_leverage=1e9)
         first = backtest(self.df, base, first_trade_bar=self.K)
         i0, t0 = self._flat_entries(first)[0]
-        rv = self._rvol(self.df, 60)
-        tuned = base.with_params(vol_target=float(rv.iloc[i0 - 1] * np.sqrt(S.periods_per_year())))
-        res = backtest(self.df, tuned, first_trade_bar=self.K)
+        own_vol = float(self._rvol(self.df, 60).iloc[i0 - 1] * np.sqrt(S.periods_per_year()))
+        res = backtest(self.df, base.with_params(vol_target=own_vol), first_trade_bar=self.K)
         np.testing.assert_array_equal(res["entries"], first["entries"])
         t = [tr for tr in res["trades"] if tr["entry_date"] == t0["entry_date"]][0]
         self.assertAlmostEqual(t["shares"] * t["entry_price"] / res["equity"].iloc[i0 - 1], 1.0, places=8)
+
+    def test_a_cash_asset_is_sized_on_its_pct_vol_and_a_future_on_points(self):
+        """Without a margin the rule is the pct-of-notional one shares have always
+        used (units = equity x target / pct vol / fill price); with a margin it
+        is the points rule. The two differ on a trending share, which is why
+        the cash asset keeps the pct rule."""
+        import strategy as S
+        target_bar = 0.15 / np.sqrt(S.periods_per_year())
+        tpl = StrategyTemplate("t", vol_target=0.15, vol_target_n=60, cost_bps=0.0, max_leverage=1e9)
+        res = backtest(self.df, tpl, first_trade_bar=self.K)
+        rv_pct = self._rvol(self.df, 60)
+        eq = res["equity"]
+        entries = self._flat_entries(res)
+        self.assertGreater(len(entries), 5)
+        for i, t in entries:
+            old_units = eq.iloc[i - 1] * target_bar / rv_pct.iloc[i - 1] / t["entry_price"]
+            self.assertAlmostEqual(t["shares"] / old_units, 1.0, places=10)
+        fut = backtest(self.df, tpl.with_params(margin_per_unit=1.0), first_trade_bar=self.K)
+        self.assertNotEqual([t["shares"] for t in fut["trades"]], [t["shares"] for t in res["trades"]])
 
     def test_when_you_trade_does_not_depend_on_how_much(self):
         base = StrategyTemplate("t", cost_bps=0.0, max_leverage=1e9)
@@ -1271,3 +1300,18 @@ class AnnualizationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class VarianceRatioByInstrumentTests(unittest.TestCase):
+    def test_a_cash_asset_reads_log_returns_and_a_future_point_changes(self):
+        """The `vr` regime filter is the classic log-return ratio on a share and
+        the shift-invariant point-change ratio once a margin makes it a future."""
+        from strategy import _compute_indicators
+        df = synthetic_ohlc(800, seed=4, trend_drift=0.002)
+        cash = StrategyTemplate("t", regime_filter="trend_only", regime_indicator="vr")
+        fut = cash.with_params(point_value=1000.0, margin_per_unit=6000.0, cost_bps=0.0)
+        np.testing.assert_array_equal(_compute_indicators(df, cash)["regime"],
+                                      variance_ratio(df["Close"], 60, log_returns=True).to_numpy())
+        np.testing.assert_array_equal(_compute_indicators(df, fut)["regime"], variance_ratio(df["Close"], 60).to_numpy())
+        self.assertFalse(np.allclose(np.nan_to_num(_compute_indicators(df, cash)["regime"]),
+                                     np.nan_to_num(_compute_indicators(df, fut)["regime"])))

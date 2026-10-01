@@ -64,7 +64,7 @@ from dataclasses import asdict
 import numpy as np
 import pandas as pd
 
-from data import synthetic_ohlc, yahoo_earliest_start
+from data import synthetic_ohlc, yahoo_earliest_start, load_csv
 from generator import generate_templates, param_grid_for, FAMILIES
 from live import (
     refit_params, due_for_refit, strategy_state, bars_since,
@@ -73,11 +73,12 @@ from live import (
 from pipeline import (
     resolve_interval, load_real, eval_config, worker_pool, evaluate_slots,
     family_diagnostics, build_portfolios, finalist_stats, sizing_text,
+    benchmark_returns, benchmark_curve, instrument_of, _costed, BENCH_ONE_UNIT,
 )
 from portfolio import returns_frame
 from strategy import (
     StrategyTemplate, annualized_sharpe, max_drawdown, set_periods_per_year, periods_per_year,
-    periods_per_year_for_interval, SIDES, BARS_PER_YEAR,
+    periods_per_year_for_interval, SIDES, BARS_PER_YEAR, validate_instrument, instrument_warnings,
 )
 from futures_map import (
     CONTRACTS, LISTINGS, FX_SYMBOLS, HEDGE_RATIO_BARS, QUOTES_STALE_DAYS,
@@ -110,7 +111,9 @@ def parse_args(argv=None):
     common.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) - 1))
 
     r = sub.add_parser("research", parents=[common], help="decide what to trade (slow)")
-    r.add_argument("--assets", nargs="+", default=["SPY", "TLT", "GLD", "QQQ"])
+    r.add_argument("--assets", nargs="+", default=["SPY", "TLT", "GLD", "QQQ"],
+                   help="Yahoo tickers, or paths to OHLCV CSV files (a spread; see main.py --csv), "
+                        "named by their file stem")
     r.add_argument("--start", default="2010-01-01")
     r.add_argument("--family", default="quick", choices=list(FAMILIES))
     r.add_argument("--max-templates", type=int, default=None)
@@ -135,7 +138,19 @@ def parse_args(argv=None):
     r.add_argument("--vol-target", type=float, default=0.0,
                    help="annualized volatility each entry is sized to, per slot (e.g. 0.15); "
                         "0 = risk --risk-pct on the ATR stop. The same target gives every asset the same risk")
-    r.add_argument("--vol-target-n", type=int, default=60, help="bars of close-to-close returns in the realized-vol estimate")
+    r.add_argument("--vol-target-n", type=int, default=60, help="bars of close-to-close changes in the realized-vol estimate")
+    r.add_argument("--point-value", type=float, default=1.0,
+                   help="currency per 1.0 of price per unit (1 for a share); the same for every asset of the run")
+    r.add_argument("--cost-per-unit", type=float, default=0.0, help="commission+slippage per unit per side, in currency")
+    r.add_argument("--margin-per-unit", type=float, default=0.0,
+                   help="initial margin per unit; when given, --max-leverage caps margin / equity")
+    r.add_argument("--whole-units", action="store_true",
+                   help="floor every size to whole units (contracts); recommended for futures")
+    r.add_argument("--instrument-map", nargs="+", default=None, metavar="ASSET=PV[,COST[,MARGIN]]",
+                   help="per-asset instrument: point value, cost per unit per side, margin per unit, e.g. "
+                        "brent_z25z26=1000,15,3000; the others keep the run-wide flags. A mapped asset takes only "
+                        "what is given here (a cost or margin left out is 0, e.g. SPY=1 is a plain share); one "
+                        "given a margin is costed per unit only (cost_bps 0)")
     r.add_argument("--min-sharpe", type=float, default=0.3)
     r.add_argument("--max-strategies", type=int, default=8)
     r.add_argument("--corr-ceiling", type=float, default=0.6)
@@ -173,8 +188,26 @@ def parse_args(argv=None):
 # data
 # ==========================================================================
 
-def load_assets(assets, *, interval, start, synthetic, bars, now=None, quiet=False) -> dict:
-    """Load every asset and put them on ONE shared bar index.
+def asset_sources(assets) -> tuple:
+    """(labels, {label: path}) for an --assets list that may name CSV files:
+    a file is an asset named by its stem, loaded from the path."""
+    labels, sources = [], {}
+    for a in assets:
+        if a.lower().endswith(".csv"):
+            label = os.path.splitext(os.path.basename(a))[0]
+            sources[label] = a
+            labels.append(label)
+        else:
+            labels.append(a)
+    if len(set(labels)) != len(labels):
+        raise SystemExit(f"--assets: duplicate asset names in {assets}")
+    return labels, sources
+
+
+def load_assets(assets, *, interval, start, synthetic, bars, now=None, quiet=False, sources=None) -> dict:
+    """Load every asset and put them on ONE shared bar index. `sources` maps
+    an asset to a CSV file (`data.load_csv`; no forming bar is dropped, the
+    file is what it is) instead of Yahoo.
 
     The nested walk-forward portfolio needs a single list of window boundaries,
     and those come from positions in the bar index -- so if SPY and GLD disagreed
@@ -183,9 +216,12 @@ def load_assets(assets, *, interval, start, synthetic, bars, now=None, quiet=Fal
     front costs a few holidays and makes every slot directly comparable.
     """
     raw = {}
+    sources = sources or {}
     for i, a in enumerate(assets):
         listing = LISTINGS.get(a)
-        if synthetic:
+        if a in sources:
+            raw[a] = load_csv(sources[a], interval=interval)
+        elif synthetic:
             # a different seed per asset, so the assets are not the same series
             raw[a] = synthetic_ohlc(n_bars=bars, seed=100 + 7 * i, trend_prob=0.45 + 0.05 * i)
         else:
@@ -252,7 +288,9 @@ def _start_for_bars(n_bars: int, interval: str) -> str:
 
 def research(args) -> dict:
     t0 = time.time()
+    args.assets, sources = asset_sources(args.assets)
     sides_map = _parse_sides_map(args.sides_map, args.assets)
+    instrument_map = _parse_instrument_map(args.instrument_map, args.assets)
     os.makedirs(args.state_dir, exist_ok=True)
     interval = resolve_interval(args.interval, args.synthetic)
     if interval != args.interval:
@@ -262,7 +300,7 @@ def research(args) -> dict:
     print(f"Loading {len(args.assets)} assets ({args.interval} bars)"
           f"{' [synthetic]' if args.synthetic else ''}...")
     data = load_assets(args.assets, interval=args.interval, start=args.start,
-                       synthetic=args.synthetic, bars=args.bars)
+                       synthetic=args.synthetic, bars=args.bars, sources=sources)
     n_bars = len(next(iter(data.values())))
     if n_bars < args.train + 2 * args.test:
         raise SystemExit(
@@ -282,9 +320,17 @@ def research(args) -> dict:
     cfg = eval_config(args, args.interval) | dict(
         start=args.start, family=args.family, sides=args.sides,
         sides_map={a: list(s) for a, s in sides_map.items()}, portfolio_vol=args.portfolio_vol,
+        instrument_map=instrument_map, asset_sources=sources,
         min_sharpe=args.min_sharpe, corr_ceiling=args.corr_ceiling,
         weighting=args.weighting, select_method=args.select_method,
     )
+    # an instrument the sizing cannot handle fails here, per asset, not in
+    # every window of the pool; settings that run but look wrong are printed
+    for a in args.assets:
+        tpl = _costed(templates_for(a)[0], cfg, a)
+        validate_instrument(data[a], tpl)
+        for w in instrument_warnings(tpl):
+            print(f"  WARNING {a}: {w}")
     jobs = [(f"{a}|{t.name}", a, t) for a in args.assets for t in templates_for(a)]
     print(f"{len(templates_for(args.assets[0]))} templates x {len(args.assets)} assets = {len(jobs)} slots; "
           f"walk-forward train={args.train} test={args.test} "
@@ -312,6 +358,27 @@ def research(args) -> dict:
     for r in spec["verdict"]["reasons"]:
         print(f"  - {r}")
     return spec
+
+
+def _parse_instrument_map(items, assets) -> dict:
+    """{'brent': {'point_value': 1000.0, 'cost_per_unit': 15.0, 'margin_per_unit': 3000.0}}
+    from ['brent=1000,15,3000']; the cost and the margin may be left out."""
+    out = {}
+    for item in items or []:
+        asset, _, spec = item.partition("=")
+        if asset not in assets:
+            raise SystemExit(f"--instrument-map {item}: {asset!r} is not in --assets")
+        try:
+            vals = [float(v) for v in spec.split(",")]
+        except ValueError:
+            raise SystemExit(f"--instrument-map {item}: expected ASSET=POINT_VALUE[,COST_PER_UNIT[,MARGIN_PER_UNIT]]")
+        if not 1 <= len(vals) <= 3 or vals[0] <= 0 or any(v < 0 for v in vals):
+            raise SystemExit(f"--instrument-map {item}: expected ASSET=POINT_VALUE[,COST_PER_UNIT[,MARGIN_PER_UNIT]]")
+        # a full instrument: what is left out is a cash share's (no per-unit cost,
+        # no margin), never the run-wide futures settings
+        vals += [0.0] * (3 - len(vals))
+        out[asset] = dict(zip(("point_value", "cost_per_unit", "margin_per_unit"), vals))
+    return out
 
 
 def _parse_sides_map(items, assets) -> dict:
@@ -406,7 +473,7 @@ def _assemble_spec(data, results, args, cfg) -> dict:
         created=utcnow().isoformat(timespec="seconds"),
         assets=list(args.assets), config=cfg, slots=slots, risk_scale=scale,
         diagnostics=diag, verdict=_verdict(diag, slots),
-        curves=_curves(data, rets, nested, port),
+        curves=_curves(data, rets, nested, port, cfg),
         universe=_ranking_table(results, rets, selected),
     )
 
@@ -502,15 +569,24 @@ def _verdict(diag: dict, slots: list) -> dict:
     return dict(level=level, headline=headline, reasons=reasons)
 
 
-def _curves(data, rets, nested, port) -> dict:
+def _curves(data, rets, nested, port, cfg=None) -> dict:
+    cfg = cfg or {}
     """Downsampled curves for the dashboard chart: the honest (nested
     walk-forward) portfolio against simply holding the assets equally weighted."""
     ne = nested["portfolio_equity"]
     if not len(ne):
         return dict(dates=[], strategy=[], buy_hold=[])
-    bh_rets = pd.concat({a: data[a]["Close"].pct_change().fillna(0.0) for a in data},
-                        axis=1).mean(axis=1)
-    bh = (1 + bh_rets.reindex(ne.index).fillna(0.0)).cumprod()
+    # holding each asset equally from the curve's first bar: each asset's own
+    # growth of 1 (compounded from its return, or, for a spread or a margined
+    # future, summed from the P&L of one unit on the initial equity), then
+    # averaged. Averaging the RETURNS first would sum a share's returns too
+    # as soon as one asset in the book is additive.
+    parts = {}
+    for a in data:
+        ins = instrument_of(cfg, a)
+        kind, r = benchmark_returns(data[a], point_value=ins["point_value"], margin_per_unit=ins["margin_per_unit"])
+        parts[a] = benchmark_curve(r.reindex(ne.index).fillna(0.0), additive=kind == BENCH_ONE_UNIT)
+    bh = pd.concat(parts, axis=1).mean(axis=1)
     strat = ne / ne.iloc[0]
     step = max(1, len(strat) // 400)
     s, b = strat.iloc[::step], bh.iloc[::step]
@@ -615,7 +691,7 @@ def signals(args) -> dict:
           f"{' [synthetic]' if args.synthetic else ''}...")
     data = load_assets(spec["assets"], interval=interval,
                        start=start, synthetic=args.synthetic,
-                       bars=max(args.bars, need + 200), now=now)
+                       bars=max(args.bars, need + 200), now=now, sources=cfg.get("asset_sources"))
     have = len(next(iter(data.values())))
     if have < need:
         print(f"  WARNING: {have} shared bars, wanted {need}; refits use what is there")

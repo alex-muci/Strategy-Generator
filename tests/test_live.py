@@ -534,5 +534,79 @@ class PortfolioTargetTests(unittest.TestCase):
         self.assertEqual(trade_list(by_asset, {"SPY": 90.0}, lot=1.0).loc["SPY", "action"], "BUY")
 
 
+
+class SpreadSizingTests(unittest.TestCase):
+    """live.py restates the engine's sizing for the next bar's orders; on an
+    instrument below zero with a point value, per-unit costs and a margin cap
+    it must still be the engine's number, under both rules."""
+
+    @classmethod
+    def setUpClass(cls):
+        df = synthetic_ohlc(1400, seed=17)
+        shift = float(df["High"].max()) + 5.0
+        cls.df = df.assign(**{c: df[c] - shift for c in ("Open", "High", "Low", "Close")})
+
+    def _check(self, tpl, min_hits=6):
+        hits = 0
+        for t in range(LOOKBACK + 20, len(self.df), 3):
+            st = strategy_state(self.df.iloc[:t], tpl, equity=100_000.0, lookback_bars=LOOKBACK)
+            if st["position"] is not None or not st["entry_orders"]:
+                continue
+            after = backtest(self.df.iloc[t - LOOKBACK:t + 1], tpl, initial_equity=100_000.0)
+            if not after["entries"][-1]:
+                continue
+            side = (after["open_position"] or {}).get("side")
+            trade = [tr for tr in after["trades"] if tr["entry_date"] == self.df.index[t]]
+            if trade:
+                side, shares = trade[0]["side"], trade[0]["shares"]
+            else:
+                shares = after["open_position"]["shares"]
+            o = [o for o in st["entry_orders"] if o["side"] == side][0]
+            self.assertLess(o["level"], 0.0)
+            self.assertGreater(o["shares"], 0.0, f"bar {t}")
+            self.assertAlmostEqual(o["shares"] / shares, 100_000.0 / after["equity"].iloc[-2], places=6, msg=f"bar {t}")
+            self.assertEqual(st["point_value"], tpl.point_value)
+            hits += 1
+        self.assertGreater(hits, min_hits)
+
+    def test_atr_rule_on_a_spread(self):
+        self._check(StrategyTemplate("t", entry_style="stop", exit_style="target_stop", cost_bps=0.0,
+                                     cost_per_unit=15.0, margin_per_unit=3000.0, point_value=1000.0, max_leverage=0.5))
+
+    def test_vol_target_capped_on_the_margin(self):
+        self._check(StrategyTemplate("t", entry_style="stop", exit_style="target_stop", cost_bps=0.0, vol_target=2.0,
+                                     cost_per_unit=15.0, margin_per_unit=3000.0, point_value=1000.0, max_leverage=0.5))
+
+    def test_the_book_measures_a_margined_slot_in_margin_and_the_rest_in_notional(self):
+        """A long at a negative price is still a long: the exposure carries
+        the side, never the price's sign, and a slot with a margin is measured
+        in margin (its quoted price may be through zero or back-adjusted)."""
+        st = dict(slot="X|t", asset="X", template="t", position=1, shares=3.0, last_close=-1.5, point_value=1000.0,
+                  entry_price=-2.0, entry_date=None, unrealized=1500.0, exit_orders=[dict(kind="stop", level=-3.0)])
+        out = portfolio_targets([st], {"X|t": 1.0}, account_equity=100_000.0)
+        self.assertAlmostEqual(float(out["legs"]["notional"].iloc[0]), 3.0 * 1.5 * 1000.0)   # |price| x pv, long
+        self.assertEqual(out["exposure_basis"], "notional")
+        self.assertAlmostEqual(out["open_risk"], 3.0 * 1.5 * 1000.0)
+        tl = trade_list(out["by_asset"], {"X": 1.0})
+        self.assertAlmostEqual(float(tl.loc["X", "order_shares"]), 2.0)
+        self.assertAlmostEqual(float(tl.loc["X", "order_notional"]), 2.0 * 1.5 * 1000.0)
+        # with a margin: 3 lots x 3000 = 9000 of margin, 9 % of the account, and a cash leg alongside in notional
+        spread = dict(st, margin_per_unit=3000.0, position=-1)
+        cash = dict(slot="SPY|t", asset="SPY", template="t", position=1, shares=100.0, last_close=500.0,
+                    point_value=1.0, margin_per_unit=0.0, entry_price=490.0, entry_date=None, unrealized=1000.0,
+                    exit_orders=[dict(kind="stop", level=480.0)])
+        out = portfolio_targets([spread, cash], {"X|t": 0.5, "SPY|t": 0.5}, account_equity=100_000.0)
+        self.assertEqual(out["exposure_basis"], "notional + margin")
+        self.assertEqual(portfolio_targets([spread], {"X|t": 1.0}, account_equity=100_000.0)["exposure_basis"], "margin")
+        self.assertAlmostEqual(float(out["by_asset"].loc["X", "notional"]), -9000.0)
+        self.assertAlmostEqual(float(out["by_asset"].loc["SPY", "notional"]), 50_000.0)
+        self.assertAlmostEqual(out["gross_exposure"], 0.59)
+        self.assertAlmostEqual(out["net_exposure"], 0.41)
+        # --max-gross binds on that measure and scales both legs alike
+        capped = portfolio_targets([spread, cash], {"X|t": 0.5, "SPY|t": 0.5}, account_equity=100_000.0, max_gross=0.295)
+        self.assertAlmostEqual(capped["scale_applied"], 0.5)
+        self.assertAlmostEqual(float(capped["legs"].set_index("asset").loc["X", "shares"]), 1.5)
+
+
 if __name__ == "__main__":
     unittest.main()

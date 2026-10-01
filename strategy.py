@@ -109,20 +109,30 @@ Numeric params (walk-forward optimized, see generator.param_grid_for):
   regime_n, regime_threshold, vol_lookback, vol_low_pct, vol_high_pct,
   bias_n, risk_pct, max_leverage, cost_bps.
   vol_target, vol_target_n are sizing settings like risk_pct: set once per
-  run from the CLI, never tuned by the walk-forward.
+  run from the CLI, never tuned by the walk-forward. So are the instrument
+  settings point_value (currency per 1.0 of price per unit: 1 for a share,
+  1000 for a Brent lot), cost_per_unit (currency per unit per side, on top
+  of cost_bps) and margin_per_unit (initial margin per unit; 0 = none).
 
 Execution model (no look-ahead):
   * every decision on bar i uses indicator values fully formed on bar i-1
-  * position size, fixed at entry and held to the exit: `risk_pct` of equity
-    lost at the `atr_mult_stop` ATR stop, or, when `vol_target` > 0, a
-    notional of equity x (vol_target / sqrt(bars per year)) / realized
-    per-bar vol (std of close-to-close returns over `vol_target_n` bars).
-    A 'learned' direction scales either by the learner's conviction (0..1,
-    see hedge_direction): on the plain ladder its net side weight in
-    favour of the side taken, on a position-sized ladder ('hedge_wide')
-    the magnitude of its committee's position, which also sizes a fixed
-    direction there (hedge_active). Either way capped at `max_leverage` x
-    equity; the ATR stop is unchanged
+  * position size (in UNITS: shares or lots), fixed at entry and held to
+    the exit: `risk_pct` of equity lost at the `atr_mult_stop` ATR stop,
+    units = equity x risk_pct / (atr_mult_stop x ATR x point_value); or,
+    when `vol_target` > 0, the units whose dollar volatility is the target:
+    units = equity x (vol_target / sqrt(bars per year)) / (sigma x
+    point_value), sigma the std of close-to-close DIFFERENCES (price
+    points) over `vol_target_n` bars. Neither rule divides by a price, so
+    both work unchanged on an instrument that trades at or below zero (a
+    calendar spread), and adding a constant to every price changes
+    nothing. A 'learned' direction scales either by the learner's
+    conviction (0..1, see hedge_direction): on the plain ladder its net
+    side weight in favour of the side taken, on a position-sized ladder
+    ('hedge_wide') the magnitude of its committee's position, which also
+    sizes a fixed direction there (hedge_active). Either way capped at
+    `max_leverage` x equity of margin (units x margin_per_unit) when a
+    margin is given, else of notional (units x point_value x |price|); the
+    ATR stop is unchanged
   * stops/limits are filled intrabar at the level, or at the open if the
     open gapped through the level; a time exit is an order at the open, so
     it goes before any intrabar stop on its bar
@@ -132,8 +142,11 @@ Execution model (no look-ahead):
   * a 'pullback' limit rests `pullback_atr_mult` ATRs from the broken level
     on the side of the trade: back inside the channel when following the
     break, deeper beyond it when fading
-  * costs: `cost_bps` (commission + slippage) charged per side on notional
-  * equity is marked to market at the CLOSE of each bar, after all fills
+  * costs per side: `cost_bps` of the notional (units x point_value x
+    |price|) plus `cost_per_unit` x units; a spread has no notional, so it
+    is costed per unit with cost_bps = 0
+  * P&L: side x units x point_value x (price change); equity is marked to
+    market at the CLOSE of each bar, after all fills
 """
 
 from __future__ import annotations
@@ -269,11 +282,15 @@ def choppiness(df: pd.DataFrame, n: int) -> pd.Series:
     return ci.clip(0, 100)
 
 
-def variance_ratio(close: pd.Series, n: int, q: int = 5) -> pd.Series:
+def variance_ratio(close: pd.Series, n: int, q: int = 5, log_returns: bool = False) -> pd.Series:
     """Lo-MacKinlay style variance ratio over a rolling n-bar window:
-    Var(q-bar log return) / (q * Var(1-bar log return)).
-    ~1 random walk, >1 trending (positive autocorrelation), <1 mean-reverting."""
-    r = np.log(close).diff()
+    Var(q-bar change) / (q * Var(1-bar change)).
+    ~1 random walk, >1 trending (positive autocorrelation), <1 mean-reverting.
+    On price DIFFERENCES by default: defined for a price at or below zero and
+    unmoved when a constant is added to every price (a future or spread).
+    `log_returns` takes the changes of log(price) instead, the classic form
+    for a cash asset (`is_cash_asset`), whose price is always positive."""
+    r = np.log(close).diff() if log_returns else close.diff()
     rq = r.rolling(q).sum()
     v1 = r.rolling(n).var()
     vq = rq.rolling(n).var()
@@ -299,7 +316,8 @@ def bollinger(df: pd.DataFrame, n: int, k: float):
 
 
 def channel(df: pd.DataFrame, kind: str, n: int, k: float, atr_n: int,
-            mode: str = "trend", role: str = "entry", cost_bps: float = 0.0, sides: str = "both"):
+            mode: str = "trend", role: str = "entry", cost_bps: float = 0.0, sides: str = "both",
+            cost_pts: float = 0.0):
     if kind == "donchian":
         return donchian(df, n)
     if kind == "keltner":
@@ -308,7 +326,7 @@ def channel(df: pd.DataFrame, kind: str, n: int, k: float, atr_n: int,
         return bollinger(df, n, k)
     if kind in HEDGE_CHANNELS:
         return hedge_channel(df, atr_n, mode=mode, scale=HEDGE_EXIT_SCALE if role == "exit" else 1.0,
-                             cost_bps=cost_bps, ladder=kind, sides=sides)
+                             cost_bps=cost_bps, ladder=kind, sides=sides, cost_pts=cost_pts)
     raise ValueError(f"unknown channel_type {kind}")
 
 
@@ -863,19 +881,21 @@ def _hedge_stances(df: pd.DataFrame, atr_n: int, mode: str, ladder: str = "hedge
     return S, ~np.isnan(uppers), experts
 
 
-def _stance_loss(df: pd.DataFrame, atr_n: int, S: np.ndarray, formed: np.ndarray, cost_bps: float) -> np.ndarray:
+def _stance_loss(df: pd.DataFrame, atr_n: int, S: np.ndarray, formed: np.ndarray, cost_bps: float,
+                 cost_pts: float = 0.0) -> np.ndarray:
     """The T x N loss matrix the learner scores (in [0, 1]) from the T x N
     stances: expert e's loss on bar t is 0.5 * (1 - payoff) where the payoff
     is the ATR-normalised move of bar t in the direction of the stance e
     held at the previous close, minus the cost (per side, in ATRs, as the
-    engine charges it) of the sides e traded at the close of t to reach its
-    new stance, halved and clipped to [-1, 1]."""
+    engine charges it: `cost_bps` of |price| plus `cost_pts` price points,
+    the per-unit cost over the point value) of the sides e traded at the
+    close of t to reach its new stance, halved and clipped to [-1, 1]."""
     close = _to_arr(df["Close"])
     T, N = S.shape
     a = _to_arr(atr(df, atr_n))
     a_prev = np.where(a[:-1] > 0, a[:-1], np.nan)
     z = (close[1:] - close[:-1]) / a_prev                    # next-bar move, in ATRs
-    c = close[1:] * (float(cost_bps) / 1e4) / a_prev         # one side's cost, in ATRs
+    c = (np.abs(close[1:]) * (float(cost_bps) / 1e4) + float(cost_pts)) / a_prev   # one side's cost, in ATRs
     flips = np.abs(S[1:] - S[:-1])                            # sides traded to reach the new stance (a reversal is two)
     payoff = np.clip((S[:-1] * z[:, None] - c[:, None] * flips) / 2.0, -1.0, 1.0)
     loss = np.full((T, N), 0.5)
@@ -885,17 +905,18 @@ def _stance_loss(df: pd.DataFrame, atr_n: int, S: np.ndarray, formed: np.ndarray
 
 
 def _hedge_loss(df: pd.DataFrame, atr_n: int, mode: str, cost_bps: float = 0.0, ladder: str = "hedge",
-                sides: str = "both"):
+                sides: str = "both", cost_pts: float = 0.0):
     """The loss matrix the learner scores (see `_stance_loss`) plus the
     ladder's (lookbacks, sides)."""
     S, formed, _ = _hedge_stances(df, atr_n, mode, ladder, sides)
     lookbacks, esides = hedge_experts(mode, ladder)
-    return _stance_loss(df, atr_n, S, formed, cost_bps), lookbacks, esides
+    return _stance_loss(df, atr_n, S, formed, cost_bps, cost_pts), lookbacks, esides
 
 
-def _hedge_run(df: pd.DataFrame, atr_n: int, mode: str, cost_bps: float, ladder: str, sides: str):
+def _hedge_run(df: pd.DataFrame, atr_n: int, mode: str, cost_bps: float, ladder: str, sides: str,
+               cost_pts: float = 0.0):
     S, formed, _ = _hedge_stances(df, atr_n, mode, ladder, sides)
-    loss = _stance_loss(df, atr_n, S, formed, cost_bps)
+    loss = _stance_loss(df, atr_n, S, formed, cost_bps, cost_pts)
     W, ETA, V, SURPRISE, TRADE = _adahedge_loop(loss, with_trade=True)
     # the committee's position: the stance the weighted experts hold at the
     # close of t, in [-1, 1], times the weight on trading at all
@@ -904,26 +925,27 @@ def _hedge_run(df: pd.DataFrame, atr_n: int, mode: str, cost_bps: float, ladder:
 
 
 def _hedge_cached(df: pd.DataFrame, atr_n: int, mode: str, cost_bps: float, ladder: str = "hedge",
-                  sides: str = "both", dfkey=None):
-    """One learner run per (bars, ladder, mode, ATR length, cost, scored
+                  sides: str = "both", dfkey=None, cost_pts: float = 0.0):
+    """One learner run per (bars, ladder, mode, ATR length, costs, scored
     sides): the entry channel, the exit channel and the learned direction
     all read the same weights."""
     sides = hedge_scored_sides(ladder, sides)
-    return _cached(df, ("hedge", ladder, mode, int(atr_n), float(cost_bps), sides),
-                   lambda: _hedge_run(df, atr_n, mode, cost_bps, ladder, sides), dfkey)
+    return _cached(df, ("hedge", ladder, mode, int(atr_n), float(cost_bps), sides, float(cost_pts)),
+                   lambda: _hedge_run(df, atr_n, mode, cost_bps, ladder, sides, cost_pts), dfkey)
 
 
 def hedge_weights(df: pd.DataFrame, atr_n: int, mode: str = "trend", cost_bps: float = 0.0,
-                  ladder: str = "hedge", sides: str = "both") -> np.ndarray:
+                  ladder: str = "hedge", sides: str = "both", cost_pts: float = 0.0) -> np.ndarray:
     """T x n_experts learner weights over `hedge_ladder(mode, ladder)`, row t
     computed from bars <= t (the last HEDGE_MEMORY of them). `sides` is the
     template's: on a position-sized ladder the experts are scored on the
-    legs it can trade (see `hedge_scored_sides`)."""
-    return _hedge_cached(df, atr_n, mode, cost_bps, ladder, sides)[0]
+    legs it can trade (see `hedge_scored_sides`). `cost_pts` is the per-unit
+    cost in price points (see `_stance_loss`)."""
+    return _hedge_cached(df, atr_n, mode, cost_bps, ladder, sides, cost_pts=cost_pts)[0]
 
 
 def hedge_diagnostics(df: pd.DataFrame, atr_n: int, mode: str = "trend", cost_bps: float = 0.0,
-                      ladder: str = "hedge", sides: str = "both") -> dict:
+                      ladder: str = "hedge", sides: str = "both", cost_pts: float = 0.0) -> dict:
     """What the learner did, bar by bar, for notebooks and dashboards:
     `weights` (expert weights, columns follow_10 / fade_20 / ... and, on the
     wide ladder, follow_kel20x2 / fade_kel40x2 ...), `loss` (the expert
@@ -935,7 +957,8 @@ def hedge_diagnostics(df: pd.DataFrame, atr_n: int, mode: str = "trend", cost_bp
     against cash, in [0, 1]) and `position` (the committee's position, see
     `hedge_position`; both informational on the plain ladder, which does
     not size by them). Nothing here changes the strategy."""
-    W, ETA, V, SURPRISE, TRADE, POSITION, loss = _hedge_cached(df, atr_n, mode, cost_bps, ladder, sides)
+    W, ETA, V, SURPRISE, TRADE, POSITION, loss = _hedge_cached(df, atr_n, mode, cost_bps, ladder, sides,
+                                                               cost_pts=cost_pts)
     experts = [e.label for e in hedge_ladder(mode, ladder)]
     idx = df.index
     return {
@@ -950,7 +973,7 @@ def hedge_diagnostics(df: pd.DataFrame, atr_n: int, mode: str = "trend", cost_bp
 
 
 def hedge_position(df: pd.DataFrame, atr_n: int, mode: str = "trend", cost_bps: float = 0.0,
-                   ladder: str = "hedge", sides: str = "both") -> np.ndarray:
+                   ladder: str = "hedge", sides: str = "both", cost_pts: float = 0.0) -> np.ndarray:
     """Per-bar position of the learner's committee, in [-1, 1]: the stance
     the weighted experts hold at the close of the bar (sum of weight times
     stance, +1 every expert long, -1 every expert short, 0 flat or split),
@@ -962,13 +985,13 @@ def hedge_position(df: pd.DataFrame, atr_n: int, mode: str = "trend", cost_bps: 
     The sign is not used: the template trades the break of its channel,
     which the committee, by construction, is not yet in. NaN until the
     learner is formed."""
-    p = _hedge_cached(df, atr_n, mode, cost_bps, ladder, sides)[5].copy()
+    p = _hedge_cached(df, atr_n, mode, cost_bps, ladder, sides, cost_pts=cost_pts)[5].copy()
     p[:min(len(p), hedge_warmup(atr_n, ladder))] = np.nan
     return p
 
 
 def hedge_direction(df: pd.DataFrame, atr_n: int, cost_bps: float = 0.0, ladder: str = "hedge",
-                    sides: str = "both") -> np.ndarray:
+                    sides: str = "both", cost_pts: float = 0.0) -> np.ndarray:
     """Per-bar signed conviction of the learner over the follow and fade
     experts, in [-1, 1], for direction_logic 'learned': its sign is the
     direction (> 0 follow the next break, else fade it, from the net side
@@ -983,11 +1006,12 @@ def hedge_direction(df: pd.DataFrame, atr_n: int, cost_bps: float = 0.0, ladder:
     buying new highs and buying dips both pay) is a full position, and a
     committee that is split, flat or losing to cash is a small one."""
     experts = hedge_ladder("learned", ladder)
-    W = hedge_weights(df, atr_n, "learned", cost_bps, ladder, sides)
+    W = hedge_weights(df, atr_n, "learned", cost_bps, ladder, sides, cost_pts)
     esides = np.array([float(e.side) for e in experts])
     net = np.clip(W @ esides, -1.0, 1.0)      # the rows of W sum to 1 up to rounding
     if hedge_position_sized(ladder):
-        d = np.where(net < 0.0, -1.0, 1.0) * np.abs(hedge_position(df, atr_n, "learned", cost_bps, ladder, sides))
+        d = np.where(net < 0.0, -1.0, 1.0) * np.abs(hedge_position(df, atr_n, "learned", cost_bps, ladder, sides,
+                                                                   cost_pts))
     else:
         d = net
     d[:min(len(d), hedge_warmup(atr_n, ladder))] = np.nan
@@ -995,7 +1019,7 @@ def hedge_direction(df: pd.DataFrame, atr_n: int, cost_bps: float = 0.0, ladder:
 
 
 def hedge_active(df: pd.DataFrame, atr_n: int, mode: str, cost_bps: float = 0.0,
-                 ladder: str = "hedge", sides: str = "both") -> np.ndarray:
+                 ladder: str = "hedge", sides: str = "both", cost_pts: float = 0.0) -> np.ndarray:
     """Per-bar size, in [0, 1], of a `trend` or `countertrend` template on a
     position-sized ladder: the magnitude of its committee's position (the
     direction array is +/- this, see `_compute_indicators`). Following
@@ -1004,17 +1028,17 @@ def hedge_active(df: pd.DataFrame, atr_n: int, mode: str, cost_bps: float = 0.0,
     of trading at full size off a channel the learner has given up on. 1
     everywhere on the plain ladder. NaN until the learner is formed."""
     if hedge_position_sized(ladder):
-        return np.abs(hedge_position(df, atr_n, mode, cost_bps, ladder, sides))
+        return np.abs(hedge_position(df, atr_n, mode, cost_bps, ladder, sides, cost_pts))
     a = np.ones(len(df))      # exactly 1, not the rows of W summed to within an ulp
     a[:min(len(a), hedge_warmup(atr_n, ladder))] = np.nan
     return a
 
 
 def hedge_channel(df: pd.DataFrame, atr_n: int, mode: str = "trend", scale: float = 1.0,
-                  cost_bps: float = 0.0, ladder: str = "hedge", sides: str = "both"):
+                  cost_bps: float = 0.0, ladder: str = "hedge", sides: str = "both", cost_pts: float = 0.0):
     """Weight-averaged channel over the expert ladder (each expert's bands at
     `scale` times its lookback), NaN until the learner is formed."""
-    W = hedge_weights(df, atr_n, mode, cost_bps, ladder, sides)
+    W = hedge_weights(df, atr_n, mode, cost_bps, ladder, sides, cost_pts)
     experts = hedge_ladder(mode, ladder)
     T = len(df)
     up = np.zeros(T); lo = np.zeros(T)
@@ -1040,7 +1064,9 @@ REGIME_INDICATORS = {
     "adx":  dict(fn=lambda df, n: adx(df, n), n=14, threshold=25.0, thresholds=[20.0, 25.0, 30.0]),
     "cti":  dict(fn=lambda df, n: cti(df["Close"], n).abs(), n=20, threshold=0.5, thresholds=[0.4, 0.5, 0.6]),
     "chop": dict(fn=lambda df, n: 100.0 - choppiness(df, n), n=14, threshold=50.0, thresholds=[38.2, 50.0, 61.8]),
-    "vr":   dict(fn=lambda df, n: variance_ratio(df["Close"], n), n=60, threshold=1.0, thresholds=[0.9, 1.0, 1.1]),
+    # `cash_fn`: the form a cash asset uses instead of `fn` (see is_cash_asset)
+    "vr":   dict(fn=lambda df, n: variance_ratio(df["Close"], n), n=60, threshold=1.0, thresholds=[0.9, 1.0, 1.1],
+                 cash_fn=lambda df, n: variance_ratio(df["Close"], n, log_returns=True)),
 }
 
 
@@ -1098,6 +1124,11 @@ class StrategyTemplate:
     vol_target: float = 0.0      # annualized vol the entry is sized to; 0 = risk_pct on the ATR stop
     vol_target_n: int = 60       # bars of close-to-close returns in the realized-vol estimate
     cost_bps: float = 5.0        # per side, commission + slippage, in basis points of notional
+    # the instrument: run settings like cost_bps, never tuned by the walk-forward
+    point_value: float = 1.0     # currency per 1.0 of price per unit (share 1, Brent lot 1000, ES 50)
+    cost_per_unit: float = 0.0   # currency per unit per side (commission + slippage in ticks), on top of cost_bps
+    margin_per_unit: float = 0.0  # initial margin per unit, the leverage cap's basis; 0 = none (cap on notional)
+    whole_units: bool = False    # floor every size to whole units (contracts); a size below 1 opens nothing
 
     def with_params(self, **kwargs) -> "StrategyTemplate":
         d = asdict(self)
@@ -1126,6 +1157,8 @@ class StrategyTemplate:
         assert self.regime_filter in REGIME_FILTERS
         assert self.bias_filter in BIAS_FILTERS
         assert self.sides in SIDES
+        assert self.point_value > 0, "point_value must be positive"
+        assert self.cost_per_unit >= 0 and self.margin_per_unit >= 0
 
 
 # --------------------------------------------------------------------------
@@ -1166,18 +1199,37 @@ def _to_arr(x) -> np.ndarray:
     return np.ascontiguousarray(np.asarray(x, dtype=np.float64))
 
 
-def _channel_arrays(df, kind, n, k, atr_n, dfkey=None, mode="trend", role="entry", cost_bps=0.0, sides="both"):
+def _channel_arrays(df, kind, n, k, atr_n, dfkey=None, mode="trend", role="entry", cost_bps=0.0, sides="both",
+                    cost_pts=0.0):
     def build():
-        up, lo, mid = channel(df, kind, n, k, atr_n, mode=mode, role=role, cost_bps=cost_bps, sides=sides)
+        up, lo, mid = channel(df, kind, n, k, atr_n, mode=mode, role=role, cost_bps=cost_bps, sides=sides,
+                              cost_pts=cost_pts)
         return (_to_arr(up), _to_arr(lo), _to_arr(mid))
     if kind in HEDGE_CHANNELS:
         # no lookback / width: keyed on the ladder (the kind), direction mode
-        # (signed rewards), ATR length, entry/exit role, the cost the experts
+        # (signed rewards), ATR length, entry/exit role, the costs the experts
         # are charged and the sides they are scored on
-        spec = ("channel", kind, role, mode, atr_n, float(cost_bps), sides)
+        spec = ("channel", kind, role, mode, atr_n, float(cost_bps), sides, float(cost_pts))
     else:
         spec = ("channel", kind, n, k if kind != "donchian" else 0.0, atr_n if kind == "keltner" else 0)
     return _cached(df, spec, build, dfkey)
+
+
+def is_cash_asset(tpl: StrategyTemplate) -> bool:
+    """A cash asset (no `margin_per_unit`: a share, an ETF) or a future or
+    spread (`margin_per_unit` given). Two rules read the price differently:
+
+    * the volatility target: a cash asset sizes on the std of its percentage
+      returns (one share's dollar vol is that times the price, the rule a
+      share has always been sized by); a future on the std of its price
+      changes in points (its quoted level is back-adjusted or goes through
+      zero, so a percentage of it means nothing, while one lot's dollar vol
+      is exactly point_value x that std);
+    * the variance-ratio regime filter (`vr`): on log returns for a cash
+      asset, on point changes for a future.
+
+    Everything else works on price differences for both."""
+    return not tpl.margin_per_unit > 0
 
 
 def _compute_indicators(df: pd.DataFrame, tpl: StrategyTemplate, dfkey=None) -> dict:
@@ -1203,8 +1255,10 @@ def _compute_indicators(df: pd.DataFrame, tpl: StrategyTemplate, dfkey=None) -> 
     # template share one channel and one direction in the cache as they share one
     # learner
     sides = hedge_scored_sides(ladder, tpl.sides)
+    # the per-unit cost in price points, the unit the learner scores in
+    cost_pts = float(tpl.cost_per_unit) / float(tpl.point_value)
     up, lo, _ = _channel_arrays(df, tpl.channel_type, tpl.n_entry, tpl.channel_k, tpl.atr_n, dfkey, mode, "entry",
-                                tpl.cost_bps, sides)
+                                tpl.cost_bps, sides, cost_pts)
     use("upper", up)
     use("lower", lo)
     use("atr", _cached(df, ("atr", tpl.atr_n), lambda: _to_arr(atr(df, tpl.atr_n)), dfkey))
@@ -1212,22 +1266,24 @@ def _compute_indicators(df: pd.DataFrame, tpl: StrategyTemplate, dfkey=None) -> 
     # per-bar direction: +1 follow the break, -1 fade it; learned from the
     # follow/fade expert ladder (NaN while the learner is unformed), else constant
     if mode == "learned":
-        use("direction", _cached(df, ("hedge_dir", ladder, tpl.atr_n, float(tpl.cost_bps), sides),
-                                 lambda: hedge_direction(df, tpl.atr_n, tpl.cost_bps, ladder, sides), dfkey))
+        use("direction", _cached(df, ("hedge_dir", ladder, tpl.atr_n, float(tpl.cost_bps), sides, cost_pts),
+                                 lambda: hedge_direction(df, tpl.atr_n, tpl.cost_bps, ladder, sides, cost_pts),
+                                 dfkey))
     elif tpl.channel_type in HEDGE_CHANNELS and hedge_position_sized(ladder):
         # a fixed direction on a position-sized ladder: sized by the committee's
         # position (on a bar where that is exactly 0 the loop reads the +0.0 as the
         # fade logic and sizes the fill to nothing, as a learned tie does)
         sign = 1.0 if mode == "trend" else -1.0
-        use("direction", _cached(df, ("hedge_active", ladder, mode, tpl.atr_n, float(tpl.cost_bps), sides),
-                                 lambda: sign * hedge_active(df, tpl.atr_n, mode, tpl.cost_bps, ladder, sides),
+        use("direction", _cached(df, ("hedge_active", ladder, mode, tpl.atr_n, float(tpl.cost_bps), sides, cost_pts),
+                                 lambda: sign * hedge_active(df, tpl.atr_n, mode, tpl.cost_bps, ladder, sides,
+                                                             cost_pts),
                                  dfkey))
     else:
         ind["direction"] = np.full(n, 1.0 if mode == "trend" else -1.0)
 
     if tpl.exit_style == "channel":
         upx, lox, midx = _channel_arrays(df, tpl.channel_type, tpl.n_exit, tpl.channel_k, tpl.atr_n, dfkey, mode, "exit",
-                                         tpl.cost_bps, sides)
+                                         tpl.cost_bps, sides, cost_pts)
         use("upper_x", upx)
         use("lower_x", lox)
         use("mid_x", midx)
@@ -1235,7 +1291,11 @@ def _compute_indicators(df: pd.DataFrame, tpl: StrategyTemplate, dfkey=None) -> 
     if tpl.regime_filter != "none":
         spec = REGIME_INDICATORS[tpl.regime_indicator]
         rn = tpl.regime_n if tpl.regime_n > 0 else spec["n"]
-        use("regime", _cached(df, ("regime", tpl.regime_indicator, rn), lambda: _to_arr(spec["fn"](df, rn)), dfkey))
+        # a cash asset reads the indicator on its returns where that differs
+        # (the variance ratio on log returns), a future or spread on point changes
+        cash = is_cash_asset(tpl) and "cash_fn" in spec
+        fn = spec["cash_fn"] if cash else spec["fn"]
+        use("regime", _cached(df, ("regime", tpl.regime_indicator, rn, cash), lambda: _to_arr(fn(df, rn)), dfkey))
         ind["regime_threshold"] = (
             tpl.regime_threshold if not np.isnan(tpl.regime_threshold) else spec["threshold"]
         )
@@ -1245,10 +1305,19 @@ def _compute_indicators(df: pd.DataFrame, tpl: StrategyTemplate, dfkey=None) -> 
                                 lambda: _to_arr(atr(df, tpl.atr_n).rolling(tpl.vol_lookback).rank(pct=True)), dfkey))
 
     if tpl.vol_target > 0:
-        # realized per-bar vol (NOT annualized, so the cached array does not
-        # depend on periods_per_year()); the target is scaled to per-bar in backtest()
-        use("rvol", _cached(df, ("rvol", tpl.vol_target_n),
-                            lambda: _to_arr(df["Close"].pct_change().rolling(tpl.vol_target_n).std()), dfkey))
+        # realized per-bar vol, NOT annualized (the cached array does not
+        # depend on periods_per_year(); the target is scaled to per-bar in
+        # backtest()), measured the way the instrument is (is_cash_asset):
+        if is_cash_asset(tpl):
+            # a cash asset: std of pct changes, the share's own return vol
+            use("rvol", _cached(df, ("rvol", tpl.vol_target_n),
+                                lambda: _to_arr(df["Close"].pct_change().rolling(tpl.vol_target_n).std()), dfkey))
+        else:
+            # a future or spread: std of close differences in PRICE POINTS,
+            # defined at any price level and the same after a constant is
+            # added to every price (a back-adjusted or through-zero series)
+            use("rvol", _cached(df, ("rvol_pts", tpl.vol_target_n),
+                                lambda: _to_arr(df["Close"].diff().rolling(tpl.vol_target_n).std()), dfkey))
 
     if tpl.bias_filter == "sma":
         use("bias", _cached(df, ("sma", tpl.bias_n), lambda: _to_arr(sma(df["Close"], tpl.bias_n)), dfkey))
@@ -1264,7 +1333,7 @@ def _compute_indicators(df: pd.DataFrame, tpl: StrategyTemplate, dfkey=None) -> 
 ENTRY_CODES = {"stop": 0, "close_confirm": 1, "pullback": 2}
 EXIT_CODES = {"channel": 0, "atr_trail": 1, "target_stop": 2, "time_stop": 3}
 REGIME_CODES = {"none": 0, "trend_only": 1, "range_only": 2}
-REASONS = ["stop", "channel", "midline", "target", "time", "stop_same_bar"]
+REASONS = ["stop", "channel", "midline", "target", "time", "stop_same_bar", "ruin"]
 
 # The order log (backtest(..., log_orders=True)): what the loop had WORKING on
 # a bar and what it did on it, read out of the loop itself rather than rebuilt
@@ -1313,15 +1382,33 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
               has_vol, vol_low, vol_high, has_bias, allow_long, allow_short,
               atr_mult_stop, atr_mult_target, atr_mult_trail, pullback_atr_mult,
               pullback_valid_bars, max_hold_bars, risk_pct, max_leverage, vol_target_bar, cost_rate,
+              point_value, cost_per_unit, margin_per_unit, whole_units,
               initial_equity, first_trade_bar, log_orders):
     """The bar loop. Plain numpy code so numba can compile it unchanged;
     the pure-Python version is used when numba is not installed.
 
-    Sizing: `risk_pct` of cash lost at the ATR stop, or, when `vol_target_bar`
-    > 0, a notional of cash * vol_target_bar / rvol[i-1] (both per-bar vols);
-    scaled by the learner's conviction |direction[i-1]| when the direction is
-    learned (direction is a constant +/-1 otherwise); capped at `max_leverage`
-    either way and fixed for the life of the trade.
+    Sizing, in units (shares or lots; `point_value` currency per point per
+    unit): `risk_pct` of cash lost at the ATR stop, or, when `vol_target_bar`
+    > 0, the units whose dollar vol is cash * vol_target_bar, i.e. cash *
+    vol_target_bar / (rvol[i-1] * point_value) with rvol in price points
+    when a margin is given (a future or spread), cash * vol_target_bar /
+    (rvol[i-1] * |fill| * point_value) with rvol the pct vol otherwise (a
+    cash asset; see `is_cash_asset`) (both per-bar vols); scaled by the learner's conviction |direction[i-1]|
+    when the direction is learned (direction is a constant +/-1 otherwise);
+    capped at `max_leverage` * cash of margin (units * margin_per_unit) when
+    a margin is given, else of notional (units * point_value * |price|);
+    fixed for the life of the trade. Nothing on the margined path divides by
+    a price, so a price at or below zero is an ordinary price (the cash path
+    is for positive prices only: `validate_instrument`).
+
+    Costs per side: cost_rate * notional + cost_per_unit * units. P&L:
+    side * units * point_value * (price change). `whole_units` floors the
+    size to an integer after the cap (a contract is indivisible).
+
+    Ruin: a close that leaves the equity at or below zero (a gap through the
+    stop beyond the margin) liquidates the position at that close (reason
+    "ruin"), floors the cash at zero and ends the run flat: the equity is 0
+    from there on, never negative, so no return flips sign.
 
     Bars before `first_trade_bar` are indicator warm-up only: nothing is
     entered on them (and no order rests on them), so the walk-forward can
@@ -1372,9 +1459,41 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
     last_a = 0.0
     pos_trend = True      # direction logic the OPEN trade was entered under
     pend_trend = True     # ... and the resting pullback order
+    ruined = False
 
     equity[0] = initial_equity
     for i in range(1, n):
+        # ---- ruin: the previous close left nothing ----
+        if ruined:
+            equity[i] = 0.0
+            continue
+        if equity[i - 1] <= 0.0:
+            if position != 0:
+                # liquidated at that close; the loss beyond the cash is the broker's
+                gross = position * shares * point_value * (close[i - 1] - entry_price)
+                xcost = cost_rate * shares * point_value * abs(close[i - 1]) + cost_per_unit * shares
+                cash += gross - xcost
+                t_entry[n_trades] = entry_bar
+                t_exit[n_trades] = i - 1
+                t_side[n_trades] = position
+                t_entry_px[n_trades] = entry_price
+                t_exit_px[n_trades] = close[i - 1]
+                t_shares[n_trades] = shares
+                t_pnl[n_trades] = gross - xcost - entry_cost
+                t_cost[n_trades] = entry_cost + xcost
+                t_reason[n_trades] = 6
+                if log_orders:
+                    m = _olog(o_i, o_f, m, i - 1, _O_EXIT_FILL, position, 6, close[i - 1], shares, t_pnl[n_trades])
+                n_trades += 1
+                position = 0
+                shares = 0.0
+            cash = 0.0
+            equity[i - 1] = 0.0
+            equity[i] = 0.0
+            pend_active = False
+            ruined = True
+            continue
+
         # direction in force for NEW signals on bar i (constant unless 'learned')
         is_trend = direction[i - 1] > 0.0
         # `a_ok`: every indicator this template uses is fully formed on bar i-1
@@ -1465,8 +1584,8 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
                             reason = 3
 
             if reason >= 0:
-                gross = position * shares * (exit_price - entry_price)
-                xcost = cost_rate * shares * exit_price
+                gross = position * shares * point_value * (exit_price - entry_price)
+                xcost = cost_rate * shares * point_value * abs(exit_price) + cost_per_unit * shares
                 cash += gross - xcost
                 t_entry[n_trades] = entry_bar
                 t_exit[n_trades] = i
@@ -1498,7 +1617,7 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
                 m = _olog(o_i, o_f, m, i, _O_PB_CANCEL, pend_side, 0 if i < first_trade_bar else 1,
                           pend_level, 0.0, 0.0)
             pend_active = False  # don't leave a stale resting order behind
-            equity[i] = cash + (position * shares * (close[i] - entry_price) if position != 0 else 0.0)
+            equity[i] = cash + (position * shares * point_value * (close[i] - entry_price) if position != 0 else 0.0)
             continue
 
         # ---- filters (previous bar's fully-formed values) ----
@@ -1614,20 +1733,31 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
         if fill_side != 0:
             stop_dist = atr_mult_stop * a
             if vol_target_bar > 0.0:
-                # constant-volatility notional: the stop still sits atr_mult_stop
+                # constant dollar volatility: the dollar vol wanted over the
+                # dollar vol of one unit; the stop still sits atr_mult_stop
                 # ATRs away, but the loss there is no longer risk_pct of equity
-                qty = cash * (vol_target_bar / rvol[i - 1]) / fill_px
+                # (rvol in price points; for a cash asset it is the pct vol,
+                # and one unit's dollar vol is that times the fill price)
+                if margin_per_unit > 0.0:
+                    qty = cash * vol_target_bar / (rvol[i - 1] * point_value)
+                else:
+                    qty = cash * vol_target_bar / (rvol[i - 1] * abs(fill_px) * point_value)
             else:
-                qty = cash * risk_pct / stop_dist
+                qty = cash * risk_pct / (stop_dist * point_value)
             # scaled by the learner's conviction in the logic the trade is
             # entered under: the net side weight in its favour on the bar
             # before the fill (1 unless the direction is learned). A pullback
             # limit placed under a logic the learner has since abandoned
             # sizes to 0 and opens nothing, like a zero ATR size would.
             qty *= max(direction[i - 1] * (1.0 if fill_trend else -1.0), 0.0)
-            qty = min(qty, max_leverage * cash / fill_px)
+            # the leverage cap's basis per unit: the margin when one is given
+            # (a spread has no notional), else the notional at the fill
+            basis = margin_per_unit if margin_per_unit > 0.0 else point_value * abs(fill_px)
+            qty = min(qty, max_leverage * cash / basis) if basis > 0.0 else 0.0
+            if whole_units:
+                qty = np.floor(qty)
             if qty > 0:
-                entry_cost = cost_rate * qty * fill_px
+                entry_cost = cost_rate * qty * point_value * abs(fill_px) + cost_per_unit * qty
                 cash -= entry_cost
                 position = fill_side
                 pos_trend = fill_trend
@@ -1677,8 +1807,8 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
             hit = (position == 1 and low[i] <= sb_level) or (position == -1 and high[i] >= sb_level)
             if hit:
                 sb_px = min(fill_px, sb_level) if position == 1 else max(fill_px, sb_level)
-                gross = position * shares * (sb_px - entry_price)
-                xcost = cost_rate * shares * sb_px
+                gross = position * shares * point_value * (sb_px - entry_price)
+                xcost = cost_rate * shares * point_value * abs(sb_px) + cost_per_unit * shares
                 cash += gross - xcost
                 t_entry[n_trades] = entry_bar
                 t_exit[n_trades] = i
@@ -1705,7 +1835,31 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
                 trail_extreme = min(trail_extreme, low[i])
 
         # ---- mark to market at the close of bar i ----
-        equity[i] = cash + (position * shares * (close[i] - entry_price) if position != 0 else 0.0)
+        equity[i] = cash + (position * shares * point_value * (close[i] - entry_price) if position != 0 else 0.0)
+
+    # ---- ruin on the last bar: the loop above would have closed it on the next ----
+    if n > 1 and equity[n - 1] <= 0.0 and not ruined:
+        if position != 0:
+            gross = position * shares * point_value * (close[n - 1] - entry_price)
+            xcost = cost_rate * shares * point_value * abs(close[n - 1]) + cost_per_unit * shares
+            cash += gross - xcost
+            t_entry[n_trades] = entry_bar
+            t_exit[n_trades] = n - 1
+            t_side[n_trades] = position
+            t_entry_px[n_trades] = entry_price
+            t_exit_px[n_trades] = close[n - 1]
+            t_shares[n_trades] = shares
+            t_pnl[n_trades] = gross - xcost - entry_cost
+            t_cost[n_trades] = entry_cost + xcost
+            t_reason[n_trades] = 6
+            if log_orders:
+                m = _olog(o_i, o_f, m, n - 1, _O_EXIT_FILL, position, 6, close[n - 1], shares, t_pnl[n_trades])
+            n_trades += 1
+            position = 0
+            shares = 0.0
+        cash = 0.0
+        equity[n - 1] = 0.0
+        pend_active = False
 
     # the trailing state is returned too, so the live signal layer in live.py can
     # read the CURRENT position and resting order out of the same loop the
@@ -1754,22 +1908,90 @@ def _orders_frame(o_i: np.ndarray, o_f: np.ndarray, idx_arr: np.ndarray) -> pd.D
     ))
 
 
+def validate_instrument(df: pd.DataFrame, tpl: StrategyTemplate) -> None:
+    """Refuse a run whose sizing or costs would read a price that is not
+    there. An instrument that trades at or below zero anywhere (a calendar
+    spread) has no notional: the leverage cap needs `margin_per_unit` and the
+    costs must be per unit (`cost_per_unit`, with `cost_bps` = 0). On a share
+    a price at or below zero is a bad print: `data.load_yfinance` drops such
+    bars, a CSV of a cash asset should not carry them. Cheap (one reduction),
+    so `backtest` runs it every call."""
+    if not tpl.point_value > 0:
+        raise ValueError(f"point_value must be positive, got {tpl.point_value}")
+    low = float(np.nanmin(df[["Open", "High", "Low", "Close"]].to_numpy(dtype=float))) if len(df) else 1.0
+    if low <= 0:
+        if not tpl.margin_per_unit > 0:
+            raise ValueError(
+                f"a price at or below zero (lowest {low:g}). On a share that is a bad print: drop the bar. "
+                "On a spread there is no notional, so the leverage cap needs margin_per_unit (initial "
+                "margin per unit, in currency); size costs with cost_per_unit and set cost_bps to 0")
+        if tpl.cost_bps > 0:
+            raise ValueError(
+                f"a price at or below zero (lowest {low:g}) with cost_bps {tpl.cost_bps:g}: a basis-point cost is "
+                "a fraction of a notional this instrument does not have; use cost_per_unit with cost_bps = 0")
+
+
+def instrument_warnings(tpl: StrategyTemplate) -> list:
+    """Settings that run but are probably not what a futures trader means:
+    printed by the entry points before the pool, never raised."""
+    out = []
+    if tpl.margin_per_unit > 0 and tpl.max_leverage > 1:
+        out.append(f"with margin_per_unit the leverage cap is margin / equity, and max_leverage "
+                   f"{tpl.max_leverage:g} lets the margin exceed the equity; 0.5 or less is a realistic cap")
+    if tpl.point_value != 1 and not tpl.margin_per_unit > 0:
+        out.append(f"point_value {tpl.point_value:g} without margin_per_unit: the leverage cap is on the "
+                   "notional at the quoted price, which on a back-adjusted futures series is an artificial "
+                   "level; give the contract's margin")
+    if tpl.point_value != 1 and tpl.cost_bps > 0:
+        out.append(f"point_value {tpl.point_value:g} with cost_bps {tpl.cost_bps:g}: a future is costed per "
+                   "contract (cost_per_unit, cost_bps 0); a basis-point cost on a back-adjusted price is arbitrary")
+    return out
+
+
+def typical_units(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: float = 100_000.0) -> float:
+    """The size, in units, the engine's rule gives an entry of `tpl` on a
+    median bar of `df` (median ATR or realized vol, median |close|), before
+    the learner's conviction and `whole_units`: what a flat run with
+    `whole_units` needs to be told it floors to 0."""
+    close = df["Close"].to_numpy(dtype=float)
+    if tpl.vol_target > 0:
+        if is_cash_asset(tpl):
+            pct = float(np.nanmedian(df["Close"].pct_change().rolling(tpl.vol_target_n).std().to_numpy()))
+            sigma = pct * float(np.nanmedian(np.abs(close)))
+        else:
+            sigma = float(np.nanmedian(df["Close"].diff().rolling(tpl.vol_target_n).std().to_numpy()))
+        qty = initial_equity * tpl.vol_target / np.sqrt(periods_per_year()) / (sigma * tpl.point_value)
+    else:
+        a = float(np.nanmedian(atr(df, tpl.atr_n).to_numpy()))
+        qty = initial_equity * tpl.risk_pct / (tpl.atr_mult_stop * a * tpl.point_value)
+    basis = tpl.margin_per_unit if tpl.margin_per_unit > 0 else tpl.point_value * float(np.nanmedian(np.abs(close)))
+    if basis > 0:
+        qty = min(qty, tpl.max_leverage * initial_equity / basis)
+    return float(qty) if np.isfinite(qty) else 0.0
+
+
 def backtest(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: float = 100_000.0,
              first_trade_bar: int = 0, log_orders: bool = False) -> dict:
     """Run `tpl` over `df` (must have Open/High/Low/Close). Returns a dict:
         equity   : pd.Series of end-of-bar equity, indexed like df
         returns  : pd.Series of per-bar simple returns of equity
         entries  : np.ndarray (1 on bars where a new trade was opened)
-        trades   : list of trade dicts
+        trades   : list of trade dicts (`shares` = units: shares or lots,
+                   `pnl` and `cost` in currency)
         stats    : summary performance stats
         orders   : the order log as a DataFrame (see ORDER_KINDS) when
                    `log_orders`, else None
 
     `first_trade_bar` > 0 uses the first bars as indicator warm-up only: the
     equity stays at `initial_equity` and no trade can open before that bar.
+
+    Prices may be zero or negative (see `validate_instrument`): every rule
+    works on price differences, and adding a constant to every price leaves
+    the trades, the P&L and the equity unchanged.
     """
     n = len(df)
     first_trade_bar = int(max(first_trade_bar, 0))
+    validate_instrument(df, tpl)
     close = _to_arr(df["Close"])
     open_ = _to_arr(df["Open"])
     high = _to_arr(df["High"])
@@ -1791,7 +2013,9 @@ def backtest(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: float = 10
         tpl.sides != "short_only", tpl.sides != "long_only",
         float(tpl.atr_mult_stop), float(tpl.atr_mult_target), float(tpl.atr_mult_trail), float(tpl.pullback_atr_mult),
         int(tpl.pullback_valid_bars), int(tpl.max_hold_bars), float(tpl.risk_pct), float(tpl.max_leverage),
-        float(vol_target_bar), tpl.cost_bps / 1e4, float(initial_equity), first_trade_bar, bool(log_orders),
+        float(vol_target_bar), tpl.cost_bps / 1e4,
+        float(tpl.point_value), float(tpl.cost_per_unit), float(tpl.margin_per_unit), bool(tpl.whole_units),
+        float(initial_equity), first_trade_bar, bool(log_orders),
     )
     (equity, entries, t_entry, t_exit, t_side, t_entry_px, t_exit_px, t_shares, t_pnl, t_cost,
      t_reason, n_trades, f_position, f_shares, f_entry_price, f_stop, f_target, f_trail,
@@ -1813,7 +2037,9 @@ def backtest(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: float = 10
         for k in range(n_trades)
     ]
     rets = np.zeros(n)
-    rets[1:] = equity[1:] / equity[:-1] - 1.0
+    # a ruined run sits at 0: one -100 % bar, then flat (never 0/0 or a sign flip)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rets[1:] = np.where(equity[:-1] > 0.0, equity[1:] / equity[:-1] - 1.0, 0.0)
     equity_s = pd.Series(equity, index=idx)
     returns = pd.Series(rets, index=idx)
     stats = performance_stats(equity, trades, initial_equity, rets, t_pnl[:n_trades],
@@ -1826,7 +2052,7 @@ def backtest(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: float = 10
             entry_bar=int(f_entry_bar), entry_date=pd.Timestamp(idx_arr[int(f_entry_bar)]),
             entry_cost=float(f_entry_cost), hard_stop=float(f_stop), target=float(f_target),
             trail_extreme=float(f_trail), bars_held=int(n - 1 - int(f_entry_bar)),
-            unrealized=float(f_position * f_shares * (close[-1] - f_entry_price)),
+            unrealized=float(f_position * f_shares * tpl.point_value * (close[-1] - f_entry_price)),
             is_trend=bool(f_pos_trend),
         )
     pending_order = None
@@ -1865,7 +2091,8 @@ def performance_stats(equity, trades: list, initial_equity: float, rets=None, pn
     n_bars = len(eq)
     if rets is None:
         rets = np.zeros(n_bars)
-        rets[1:] = eq[1:] / eq[:-1] - 1.0
+        with np.errstate(divide="ignore", invalid="ignore"):
+            rets[1:] = np.where(eq[:-1] > 0.0, eq[1:] / eq[:-1] - 1.0, 0.0)
     if pnls is None:
         pnls = np.array([t.get("pnl", 0.0) for t in trades], dtype=float)
     if bars_held is None:

@@ -117,8 +117,10 @@ def _window_record(w: dict) -> dict:
 
 def run_manifest(df: pd.DataFrame, results: dict, port: dict, nested: dict, fam: dict, args, cfg: dict) -> dict:
     """Everything a replay needs, as a plain dict (see `save_run`)."""
+    csv = getattr(args, "csv", None)
     data = dict(
-        source="yfinance" if args.real else "synthetic", ticker=args.real, start=args.start,
+        source="csv" if csv else ("yfinance" if args.real else "synthetic"),
+        ticker=args.real or (os.path.splitext(os.path.basename(csv))[0] if csv else None), path=csv, start=args.start,
         interval=cfg["interval"], bars=args.bars, seed=args.seed, trend_prob=args.trend_prob,
         trend_drift=args.trend_drift, n_bars=int(len(df)), first=df.index[0], last=df.index[-1],
         file=DATA_FILE,

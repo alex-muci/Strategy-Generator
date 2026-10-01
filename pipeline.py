@@ -55,12 +55,13 @@ def resolve_interval(interval: str, synthetic: bool) -> str:
 
 
 def load_real(ticker: str, start: str, interval: str = "1d", now=None,
-              session_close: tuple[str, str] | None = None) -> pd.DataFrame:
+              session_close: tuple[str, str] | None = None, drop_nonpositive: bool = True) -> pd.DataFrame:
     """yfinance history WITHOUT the bar that is still forming. Research on a
     half-finished last bar is research on a price nobody could have traded.
     `session_close` is the listing exchange's (HH:MM, zone); default New York."""
     kw = {} if session_close is None else dict(session_close=session_close)
-    return drop_forming_bar(load_yfinance(ticker, start=start, interval=interval), interval, now=now, **kw)
+    return drop_forming_bar(load_yfinance(ticker, start=start, interval=interval, drop_nonpositive=drop_nonpositive),
+                            interval, now=now, **kw)
 
 
 def cscv_partitions_for(T: int) -> int:
@@ -77,8 +78,41 @@ def eval_config(args, interval: str) -> dict:
         metric=args.metric, selection=args.selection, wide_grid=args.wide_grid,
         cost_bps=args.cost_bps, risk_pct=args.risk_pct, max_leverage=args.max_leverage,
         vol_target=args.vol_target, vol_target_n=args.vol_target_n,
+        point_value=args.point_value, cost_per_unit=args.cost_per_unit, margin_per_unit=args.margin_per_unit,
+        whole_units=bool(getattr(args, "whole_units", False)),
         cpcv_groups=args.cpcv_groups, cpcv_k=args.cpcv_k,
     )
+
+
+def instrument_of(c: dict, asset: str | None = None) -> dict:
+    """The instrument settings of a research config, with the defaults of a
+    cash share for configs written before they existed; `asset` picks up the
+    per-asset overrides of `instrument_map` (a dashboard book that mixes
+    shares and a future) and, when those give a margin, zero bps costs."""
+    out = dict(point_value=float(c.get("point_value", 1.0) or 1.0),
+               cost_per_unit=float(c.get("cost_per_unit", 0.0) or 0.0),
+               margin_per_unit=float(c.get("margin_per_unit", 0.0) or 0.0),
+               whole_units=bool(c.get("whole_units", False)))
+    over = (c.get("instrument_map") or {}).get(asset) if asset is not None else None
+    if over:
+        # a mapped asset is its own instrument: what the map leaves out is a
+        # cash share's, not the run-wide futures settings (SPY=1 in a Brent
+        # book must not inherit the Brent margin and per-lot cost)
+        out.update(point_value=1.0, cost_per_unit=0.0, margin_per_unit=0.0)
+        out.update({k: (bool(v) if k == "whole_units" else float(v)) for k, v in over.items() if k in out})
+        if out["margin_per_unit"] > 0:
+            out["cost_bps"] = 0.0
+    return out
+
+
+def instrument_text(c: dict) -> str:
+    """One phrase describing a non-default instrument, empty for a cash share."""
+    ins = instrument_of(c)
+    if ins == dict(point_value=1.0, cost_per_unit=0.0, margin_per_unit=0.0, whole_units=False):
+        return ""
+    return (f"point value {ins['point_value']:g} per unit, {ins['cost_per_unit']:g} per unit per side, "
+            f"margin {ins['margin_per_unit']:g} per unit"
+            + (", whole units" if ins["whole_units"] else ""))
 
 
 def sizing_text(c: dict) -> str:
@@ -86,8 +120,11 @@ def sizing_text(c: dict) -> str:
     have no vol_target keys: they were run with the ATR-stop rule)."""
     vt = float(c.get("vol_target", 0.0) or 0.0)
     if vt > 0:
-        return f"{vt:.0%} annualized vol target per entry ({c.get('vol_target_n', 60)}-bar realized vol)"
-    return f"{c['risk_pct']:.1%} of equity risked per trade"
+        text = f"{vt:.0%} annualized vol target per entry ({c.get('vol_target_n', 60)}-bar realized vol, in price points)"
+    else:
+        text = f"{c['risk_pct']:.1%} of equity risked per trade"
+    ins = instrument_text(c)
+    return f"{text}; instrument: {ins}" if ins else text
 
 
 # --------------------------------------------------------------------------
@@ -112,9 +149,10 @@ def _init_worker_from_file(path: str, cfg: dict) -> None:
         init_worker(pickle.load(f), cfg)
 
 
-def _costed(tpl, c: dict):
-    return tpl.with_params(cost_bps=c["cost_bps"], risk_pct=c["risk_pct"], max_leverage=c["max_leverage"],
-                           vol_target=c["vol_target"], vol_target_n=c["vol_target_n"])
+def _costed(tpl, c: dict, asset: str | None = None):
+    return tpl.with_params(**(dict(cost_bps=c["cost_bps"], risk_pct=c["risk_pct"], max_leverage=c["max_leverage"],
+                                   vol_target=c["vol_target"], vol_target_n=c["vol_target_n"])
+                              | instrument_of(c, asset)))
 
 
 def _wfa_kwargs(c: dict) -> dict:
@@ -127,7 +165,7 @@ def evaluate_slot(job):
     name, asset, tpl = job
     c = _CFG
     df = _DATA[asset]
-    tpl = _costed(tpl, c)
+    tpl = _costed(tpl, c, asset)
     wfa = evaluate_template(
         df, tpl, param_grid_for(tpl, wide=c["wide_grid"]),
         train_bars=c["train_bars"], test_bars=c["test_bars"],
@@ -285,17 +323,27 @@ def finalist_stats(results: dict, selected: list, fam: dict, n_boot: int = 1000)
 # curves against a benchmark
 # --------------------------------------------------------------------------
 
-def curve_stats(r: pd.Series) -> dict:
-    eq = (1 + r).cumprod()
+def curve_stats(r: pd.Series, additive: bool = False) -> dict:
+    """Sharpe, CAGR and max drawdown of a return stream. `additive` returns
+    (the one-unit benchmark's, P&L over a fixed initial equity) add up to
+    their curve; compounding them would describe neither the P&L nor an
+    investment. For them `cagr` is the simple annual P&L over the initial
+    equity and `max_dd` the deepest fall from a running peak, also over the
+    initial equity (how a futures account measures both): the summed curve
+    can cross zero, where a ratio to the peak or a compounded rate means
+    nothing."""
+    eq = benchmark_curve(r, additive)
     n = len(r)
     if n < 2:
         return dict(sharpe=0.0, cagr=0.0, max_dd=0.0, n_bars=n)
-    return dict(
-        sharpe=annualized_sharpe(r),
-        cagr=float(eq.iloc[-1] ** (periods_per_year() / n) - 1) if eq.iloc[-1] > 0 else -1.0,
-        max_dd=max_drawdown(eq),
-        n_bars=n,
-    )
+    if additive:
+        v = np.concatenate([[1.0], eq.to_numpy(dtype=float)])
+        cagr = float((v[-1] - 1.0) * periods_per_year() / n)
+        max_dd = float((v - np.maximum.accumulate(v)).min())
+    else:
+        cagr = float(eq.iloc[-1] ** (periods_per_year() / n) - 1) if eq.iloc[-1] > 0 else -1.0
+        max_dd = max_drawdown(eq)
+    return dict(sharpe=annualized_sharpe(r), cagr=cagr, max_dd=max_dd, n_bars=n)
 
 
 def against_benchmark(r: pd.Series, bh: pd.Series) -> dict:
@@ -312,9 +360,37 @@ def against_benchmark(r: pd.Series, bh: pd.Series) -> dict:
     return dict(beta=beta, corr=float(np.corrcoef(x, y)[0, 1]), info_ratio=annualized_sharpe(y - beta * x))
 
 
-def benchmark_stats(bh_returns: pd.Series, rets: pd.DataFrame, port: dict, nested: dict) -> dict:
-    """Buy-and-hold over the same out-of-sample bars, and the two portfolios
-    measured against it.
+BENCH_BUY_HOLD = "buy and hold"
+BENCH_ONE_UNIT = "hold 1 unit"
+
+
+def benchmark_returns(df: pd.DataFrame, point_value: float = 1.0, initial_equity: float = 100_000.0,
+                      margin_per_unit: float = 0.0):
+    """(kind, per-bar returns) of the benchmark nobody optimized. Holding the
+    asset is a return series only while its price is positive and is the
+    price of what is held; an instrument that trades at or below zero (a
+    spread), or a margined future (whose quoted level, back-adjusted or
+    rolled, is not the price of an investment: its percentage change is not
+    the contract's return), is benchmarked by the P&L of holding one unit on
+    the initial equity: additive, on an arbitrary scale (Sharpe, beta,
+    correlation and the information ratio are scale-free; CAGR and drawdown
+    are not)."""
+    close = df["Close"]
+    if (df["Low"] > 0).all() and not margin_per_unit > 0:
+        return BENCH_BUY_HOLD, close.pct_change()
+    return BENCH_ONE_UNIT, float(point_value) * close.diff() / float(initial_equity)
+
+
+def benchmark_curve(r: pd.Series, additive: bool = False) -> pd.Series:
+    """Growth of 1 from per-bar returns: compounded, or summed for an additive stream."""
+    return 1 + r.cumsum() if additive else (1 + r).cumprod()
+
+
+def benchmark_stats(bh_returns: pd.Series, rets: pd.DataFrame, port: dict, nested: dict,
+                    kind: str = BENCH_BUY_HOLD) -> dict:
+    """Buy-and-hold over the same out-of-sample bars (or, for an instrument
+    that trades through zero, holding one unit: `benchmark_returns`), and the
+    two portfolios measured against it. `kind` names which.
 
     Every template here was walked forward, selected and stress-tested; the
     asset itself was not, so it is the one curve with no selection bias at
@@ -324,12 +400,17 @@ def benchmark_stats(bh_returns: pd.Series, rets: pd.DataFrame, port: dict, neste
     portfolio is just the asset's own drift, and the information ratio how
     much is left once that is removed."""
     bh = bh_returns.reindex(rets.index).fillna(0.0)
+    additive = kind == BENCH_ONE_UNIT
     tpl_sharpes = rets.apply(annualized_sharpe)
     out = dict(
+        kind=kind,
+        additive=additive,
         returns=bh,
-        buy_hold=curve_stats(bh),
+        buy_hold=curve_stats(bh, additive),
         n_templates=int(rets.shape[1]),
-        n_templates_beat_bh=int((tpl_sharpes > annualized_sharpe(bh)).sum()),
+        # a template that never traded has a Sharpe of 0: sitting flat "beats" a losing
+        # benchmark without being evidence of anything, so only templates that traded count
+        n_templates_beat_bh=int(((tpl_sharpes > annualized_sharpe(bh)) & rets.ne(0.0).any()).sum()),
         static=None, nested=None, buy_hold_nested_period=None,
     )
     pr = port["portfolio_returns"]
@@ -338,5 +419,5 @@ def benchmark_stats(bh_returns: pd.Series, rets: pd.DataFrame, port: dict, neste
     nr = nested["portfolio_returns"]
     if len(nr) > 2:
         out["nested"] = curve_stats(nr) | against_benchmark(nr, bh)
-        out["buy_hold_nested_period"] = curve_stats(bh.reindex(nr.index).fillna(0.0))
+        out["buy_hold_nested_period"] = curve_stats(bh.reindex(nr.index).fillna(0.0), additive)
     return out
