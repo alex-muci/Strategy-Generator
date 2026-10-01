@@ -1212,6 +1212,17 @@ def _channel_arrays(df, kind, n, k, atr_n, dfkey=None, mode="trend", role="entry
     return _cached(df, spec, build, dfkey)
 
 
+def rvol_is_pct(tpl: StrategyTemplate) -> bool:
+    """Which realized vol the volatility target sizes on. A cash asset (no
+    `margin_per_unit`) uses the std of its percentage returns: one share's
+    dollar vol is that times the price, the rule a share has always been
+    sized by. A future or spread (`margin_per_unit` given) uses the std of
+    its price changes in points: its quoted level is back-adjusted or goes
+    through zero, so a percentage of it means nothing, while one lot's dollar
+    vol is exactly point_value x that std."""
+    return not tpl.margin_per_unit > 0
+
+
 def _compute_indicators(df: pd.DataFrame, tpl: StrategyTemplate, dfkey=None) -> dict:
     """All indicator arrays needed by `tpl`, plus a boolean `ready` array:
     ready[i] is True when every indicator used by this template is fully
@@ -1281,13 +1292,19 @@ def _compute_indicators(df: pd.DataFrame, tpl: StrategyTemplate, dfkey=None) -> 
                                 lambda: _to_arr(atr(df, tpl.atr_n).rolling(tpl.vol_lookback).rank(pct=True)), dfkey))
 
     if tpl.vol_target > 0:
-        # realized per-bar vol in PRICE POINTS (std of close differences, not
-        # of pct changes: defined at any price level, and the same after a
-        # constant is added to every price); NOT annualized, so the cached
-        # array does not depend on periods_per_year(); the target is scaled
-        # to per-bar in backtest()
-        use("rvol", _cached(df, ("rvol_pts", tpl.vol_target_n),
-                            lambda: _to_arr(df["Close"].diff().rolling(tpl.vol_target_n).std()), dfkey))
+        # realized per-bar vol, NOT annualized (the cached array does not
+        # depend on periods_per_year(); the target is scaled to per-bar in
+        # backtest()), measured the way the instrument is (rvol_is_pct):
+        if rvol_is_pct(tpl):
+            # a cash asset: std of pct changes, the share's own return vol
+            use("rvol", _cached(df, ("rvol", tpl.vol_target_n),
+                                lambda: _to_arr(df["Close"].pct_change().rolling(tpl.vol_target_n).std()), dfkey))
+        else:
+            # a future or spread: std of close differences in PRICE POINTS,
+            # defined at any price level and the same after a constant is
+            # added to every price (a back-adjusted or through-zero series)
+            use("rvol", _cached(df, ("rvol_pts", tpl.vol_target_n),
+                                lambda: _to_arr(df["Close"].diff().rolling(tpl.vol_target_n).std()), dfkey))
 
     if tpl.bias_filter == "sma":
         use("bias", _cached(df, ("sma", tpl.bias_n), lambda: _to_arr(sma(df["Close"], tpl.bias_n)), dfkey))
@@ -1361,12 +1378,15 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
     unit): `risk_pct` of cash lost at the ATR stop, or, when `vol_target_bar`
     > 0, the units whose dollar vol is cash * vol_target_bar, i.e. cash *
     vol_target_bar / (rvol[i-1] * point_value) with rvol in price points
-    (both per-bar vols); scaled by the learner's conviction |direction[i-1]|
+    when a margin is given (a future or spread), cash * vol_target_bar /
+    (rvol[i-1] * |fill| * point_value) with rvol the pct vol otherwise (a
+    cash asset; see `rvol_is_pct`) (both per-bar vols); scaled by the learner's conviction |direction[i-1]|
     when the direction is learned (direction is a constant +/-1 otherwise);
     capped at `max_leverage` * cash of margin (units * margin_per_unit) when
     a margin is given, else of notional (units * point_value * |price|);
-    fixed for the life of the trade. Nothing here divides by a price, so a
-    price at or below zero is an ordinary price.
+    fixed for the life of the trade. Nothing on the margined path divides by
+    a price, so a price at or below zero is an ordinary price (the cash path
+    is for positive prices only: `validate_instrument`).
 
     Costs per side: cost_rate * notional + cost_per_unit * units. P&L:
     side * units * point_value * (price change). `whole_units` floors the
@@ -1703,7 +1723,12 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
                 # constant dollar volatility: the dollar vol wanted over the
                 # dollar vol of one unit; the stop still sits atr_mult_stop
                 # ATRs away, but the loss there is no longer risk_pct of equity
-                qty = cash * vol_target_bar / (rvol[i - 1] * point_value)
+                # (rvol in price points; for a cash asset it is the pct vol,
+                # and one unit's dollar vol is that times the fill price)
+                if margin_per_unit > 0.0:
+                    qty = cash * vol_target_bar / (rvol[i - 1] * point_value)
+                else:
+                    qty = cash * vol_target_bar / (rvol[i - 1] * abs(fill_px) * point_value)
             else:
                 qty = cash * risk_pct / (stop_dist * point_value)
             # scaled by the learner's conviction in the logic the trade is
@@ -1917,7 +1942,11 @@ def typical_units(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: float
     `whole_units` needs to be told it floors to 0."""
     close = df["Close"].to_numpy(dtype=float)
     if tpl.vol_target > 0:
-        sigma = float(np.nanmedian(df["Close"].diff().rolling(tpl.vol_target_n).std().to_numpy()))
+        if rvol_is_pct(tpl):
+            pct = float(np.nanmedian(df["Close"].pct_change().rolling(tpl.vol_target_n).std().to_numpy()))
+            sigma = pct * float(np.nanmedian(np.abs(close)))
+        else:
+            sigma = float(np.nanmedian(df["Close"].diff().rolling(tpl.vol_target_n).std().to_numpy()))
         qty = initial_equity * tpl.vol_target / np.sqrt(periods_per_year()) / (sigma * tpl.point_value)
     else:
         a = float(np.nanmedian(atr(df, tpl.atr_n).to_numpy()))

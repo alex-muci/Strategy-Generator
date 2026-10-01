@@ -89,8 +89,11 @@ def parse_args(argv=None):
     p.add_argument("--cost-per-unit", type=float, default=0.0,
                    help="commission+slippage per unit per side in currency, on top of --cost-bps")
     p.add_argument("--margin-per-unit", type=float, default=0.0,
-                   help="initial margin per unit in currency; when given, --max-leverage caps margin / equity "
-                        "(so set it at or below 1). Required for prices at or below zero")
+                   help="initial margin per unit in currency. Give it for every future or spread: it makes the "
+                        "series a future (--max-leverage caps margin / equity, so set it at or below 1; the vol "
+                        "target sizes on price-point changes; the benchmark is one unit's P&L). Without it the "
+                        "series is a cash asset (cap on notional, vol target on %% returns). Required for prices "
+                        "at or below zero")
     p.add_argument("--whole-units", action="store_true",
                    help="floor every size to whole units (contracts); a size below one opens nothing. "
                         "Recommended for futures: research then trades what the live orders round to")

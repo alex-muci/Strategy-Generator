@@ -202,7 +202,12 @@ class VolTargetSizingTests(unittest.TestCase):
 
     @staticmethod
     def _rvol(df, n):
-        # the engine's realized vol: per-bar std of close DIFFERENCES (price points)
+        # the engine's realized vol on a cash asset: per-bar std of pct changes
+        return df["Close"].pct_change().rolling(n).std()
+
+    @staticmethod
+    def _rvol_pts(df, n):
+        # ... and on a future or spread (a margin given): std of close DIFFERENCES (price points)
         return df["Close"].diff().rolling(n).std()
 
     def _flat_entries(self, res):
@@ -217,52 +222,55 @@ class VolTargetSizingTests(unittest.TestCase):
         self.assertNotIn("rvol", b["indicators"])
 
     def test_entry_dollar_vol_is_the_target_times_equity(self):
-        """units x point_value x sigma_points = vol_target_bar x equity: the
-        position's dollar volatility is the target, whatever the price level."""
+        """The position's dollar volatility is the target x equity under both
+        rules: a cash asset's units x price x pct vol, a margined future's
+        units x point_value x sigma_points (whatever its price level)."""
         import strategy as S
-        tpl = StrategyTemplate("t", vol_target=0.15, vol_target_n=60, cost_bps=0.0, max_leverage=1e9)
-        res = backtest(self.df, tpl, first_trade_bar=self.K)
-        rv = self._rvol(self.df, 60)
-        eq = res["equity"]
-        checked = 0
-        for i, t in self._flat_entries(res):
-            dollar_vol = t["shares"] * tpl.point_value * rv.iloc[i - 1] / eq.iloc[i - 1]
-            self.assertAlmostEqual(dollar_vol, 0.15 / np.sqrt(S.periods_per_year()), places=8,
-                                   msg=str(t["entry_date"]))
-            checked += 1
-        self.assertGreater(checked, 5)
+        target_bar = 0.15 / np.sqrt(S.periods_per_year())
+        cash = StrategyTemplate("t", vol_target=0.15, vol_target_n=60, cost_bps=0.0, max_leverage=1e9)
+        lot = cash.with_params(point_value=1000.0, margin_per_unit=1.0)
+        for tpl, rv, per_unit in ((cash, self._rvol(self.df, 60), lambda t, i, rv: t["entry_price"] * rv.iloc[i - 1]),
+                                  (lot, self._rvol_pts(self.df, 60), lambda t, i, rv: 1000.0 * rv.iloc[i - 1])):
+            res = backtest(self.df, tpl, first_trade_bar=self.K)
+            eq = res["equity"]
+            checked = 0
+            for i, t in self._flat_entries(res):
+                self.assertAlmostEqual(t["shares"] * per_unit(t, i, rv) / eq.iloc[i - 1], target_bar, places=8,
+                                       msg=f"{tpl.margin_per_unit} {t['entry_date']}")
+                checked += 1
+            self.assertGreater(checked, 5)
 
     def test_a_target_equal_to_the_realized_vol_gives_unit_notional(self):
-        """The whole point: at the asset's own vol the strategy holds ~1x, the
-        buy-and-hold scale. The asset's own annualized vol at the fill is its
-        point vol over the fill price, annualized."""
+        """The whole point: at the asset's own (pct) vol a cash asset is held at
+        exactly 1x notional, the buy-and-hold scale."""
         import strategy as S
         base = StrategyTemplate("t", vol_target=0.15, vol_target_n=60, cost_bps=0.0, max_leverage=1e9)
         first = backtest(self.df, base, first_trade_bar=self.K)
         i0, t0 = self._flat_entries(first)[0]
-        rv = self._rvol(self.df, 60)
-        own_vol = float(rv.iloc[i0 - 1] / t0["entry_price"] * np.sqrt(S.periods_per_year()))
+        own_vol = float(self._rvol(self.df, 60).iloc[i0 - 1] * np.sqrt(S.periods_per_year()))
         res = backtest(self.df, base.with_params(vol_target=own_vol), first_trade_bar=self.K)
         np.testing.assert_array_equal(res["entries"], first["entries"])
         t = [tr for tr in res["trades"] if tr["entry_date"] == t0["entry_date"]][0]
         self.assertAlmostEqual(t["shares"] * t["entry_price"] / res["equity"].iloc[i0 - 1], 1.0, places=8)
 
-    def test_units_are_close_to_the_old_pct_vol_rule_on_a_cash_asset(self):
-        """On a positive-price asset sigma_points ~ sigma_pct x price, so the
-        points rule sizes within a few percent of the pct-of-notional rule it
-        replaced (the change that made the rule work at any price level)."""
+    def test_a_cash_asset_is_sized_on_its_pct_vol_and_a_future_on_points(self):
+        """Without a margin the rule is the pct-of-notional one shares have always
+        used (units = equity x target / pct vol / fill price); with a margin it
+        is the points rule. The two differ on a trending share, which is why
+        the cash asset keeps the pct rule."""
         import strategy as S
+        target_bar = 0.15 / np.sqrt(S.periods_per_year())
         tpl = StrategyTemplate("t", vol_target=0.15, vol_target_n=60, cost_bps=0.0, max_leverage=1e9)
         res = backtest(self.df, tpl, first_trade_bar=self.K)
-        rv_pct = self.df["Close"].pct_change().rolling(60).std()
+        rv_pct = self._rvol(self.df, 60)
         eq = res["equity"]
-        ratios = []
-        for i, t in self._flat_entries(res):
-            old_units = eq.iloc[i - 1] * (0.15 / np.sqrt(S.periods_per_year())) / rv_pct.iloc[i - 1] / t["entry_price"]
-            ratios.append(t["shares"] / old_units)
-        self.assertGreater(len(ratios), 5)
-        self.assertLess(max(abs(r - 1.0) for r in ratios), 0.15)
-        self.assertLess(abs(float(np.median(ratios)) - 1.0), 0.05)
+        entries = self._flat_entries(res)
+        self.assertGreater(len(entries), 5)
+        for i, t in entries:
+            old_units = eq.iloc[i - 1] * target_bar / rv_pct.iloc[i - 1] / t["entry_price"]
+            self.assertAlmostEqual(t["shares"] / old_units, 1.0, places=10)
+        fut = backtest(self.df, tpl.with_params(margin_per_unit=1.0), first_trade_bar=self.K)
+        self.assertNotEqual([t["shares"] for t in fut["trades"]], [t["shares"] for t in res["trades"]])
 
     def test_when_you_trade_does_not_depend_on_how_much(self):
         base = StrategyTemplate("t", cost_bps=0.0, max_leverage=1e9)

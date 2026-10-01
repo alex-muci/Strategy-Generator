@@ -40,9 +40,10 @@ python main.py --family online                      # 288 templates on the onlin
 python main.py --family online_wide                 # 8 templates: the learned direction on a wider ladder, sized by its own position
 python main.py --real SPY --start 2005-01-01 --family default --jobs 8
 python main.py --real SPY --start 2005-01-01 --family quick --sides long_only   # one-sided family (an asset with a drift)
-python main.py --real SPY --start 2005-01-01 --family quick --vol-target 0.1  # use vol-target rather than ATR-stop (see Position sizing section section)
+python main.py --real SPY --start 2005-01-01 --family quick --vol-target 0.1  # use vol-target rather than ATR-stop (see Position sizing)
 python main.py --real QQQ --start 2010-01-01 --train 500 --test 125   # rolling window (default): each window re-optimizes on the last 500 bars only
-python main.py --real GC=F --train 750 --test 250 --anchored --selection best   # anchored: training (window expands from bar 0)
+python main.py --real GC=F --train 750 --test 250 --anchored --selection best --point-value 100 --margin-per-unit 10000 --cost-per-unit 5 --cost-bps 0 --max-leverage 0.5 --whole-units   # anchored: training window expands from bar 0; a future, so a margin (see Cash assets vs futures)
+python main.py --csv brent_backadj.csv --point-value 1000 --margin-per-unit 6000 --cost-per-unit 15 --cost-bps 0 --max-leverage 0.5 --whole-units --vol-target 0.15   # an outright Brent future from a back-adjusted file
 python main.py --csv brent_z25z26.csv --point-value 1000 --margin-per-unit 3000 --cost-per-unit 15 --cost-bps 0 --max-leverage 0.5   # a futures spread from a file (prices through zero; see Futures and spreads)
 python main.py --trend-prob 0.8 --trend-drift 0.002  # synthetic data with a KNOWN trend edge
 ```
@@ -376,16 +377,25 @@ from the command line (never tuned by the walk-forward):
   the `atr_mult_stop` ATR stop is `--risk-pct` of equity (1 %):
   `units = equity x risk_pct / (atr_mult_stop x ATR x point_value)`.
 * **Volatility target** (`--vol-target 0.15`): the units whose dollar
-  volatility is the target: `units = equity x target_bar / (sigma x
-  point_value)`, where `target_bar` is the annualized target scaled to one
-  bar and `sigma` the standard deviation of close-to-close **changes in
-  price points** over `--vol-target-n` bars (60). The dollar vol wanted
-  (target x equity) over the dollar vol of one unit (point value x sigma).
-  On a share this is the familiar notional = equity x target / pct vol to
-  within a few percent (sigma ~ pct vol x price); on a spread, whose pct
-  vol does not exist, it is the only form there is. The ATR stop stays
-  where it was, so the loss at the stop is now `atr_mult_stop x ATR x
-  point_value x units` rather than `risk_pct` of equity.
+  volatility is the target x equity, i.e. the dollar vol wanted over the
+  dollar vol of one unit, `target_bar` being the annualized target scaled
+  to one bar and the realized vol taken over `--vol-target-n` bars (60).
+  How one unit's dollar vol is measured depends on the instrument (see
+  **Cash assets vs futures and spreads** below):
+  * **cash asset** (no `--margin-per-unit`): `units = equity x target_bar /
+    (pct_vol x fill_price x point_value)`, `pct_vol` the std of
+    close-to-close **percentage returns**: the classic notional = equity x
+    target / pct vol. On SPY a 15 % target at SPY's own 15 % vol holds
+    exactly 1x notional.
+  * **future or spread** (`--margin-per-unit` given): `units = equity x
+    target_bar / (sigma_points x point_value)`, `sigma_points` the std of
+    close-to-close **changes in price points**. A back-adjusted or
+    through-zero price has no meaningful percentage return, but one lot's
+    dollar vol is exactly point value x its point vol.
+
+  The ATR stop stays where it was, so the loss at the stop is now
+  `atr_mult_stop x ATR x point_value x units` rather than `risk_pct` of
+  equity.
 
 A unit is a share (`--point-value 1`, the default) or a lot (`--point-value
 1000` for Brent, 50 for ES). Neither rule divides by a price.
@@ -412,7 +422,55 @@ wants. Two things keep a strategy's realized vol below the target: time
 spent flat, and the leverage cap, which binds all the time on a quiet
 asset (a 15 % target on a 5 % vol asset asks for 3x).
 
-### Futures and spreads (prices at or below zero)
+### Cash assets vs futures and spreads
+
+The engine runs two kinds of instrument, and **`--margin-per-unit` is the
+switch between them**. Leave it out and the series is a cash asset; give it
+and the series is a future (or a futures spread).
+
+| | cash asset (SPY, QQQ, GLD, a stock) | future or spread (Brent, ES, a calendar spread) |
+|---|---|---|
+| how to run it | `--real SPY` (defaults) | `--point-value`, **`--margin-per-unit`**, `--cost-per-unit`, `--cost-bps 0`, `--whole-units` |
+| a unit | one share (`--point-value 1`) | one lot (`--point-value 1000` for Brent: $1000 per $1/bbl) |
+| costs | `--cost-bps` of the traded notional | `--cost-per-unit` per lot per side |
+| leverage cap (`--max-leverage`) | on **notional**: units x price / equity (2 = 2x long the index) | on **margin**: lots x margin / equity (0.5 = half the account posted as margin) |
+| vol-target sizing | on **% returns** (pct vol x price) | on **price changes** (point vol x point value) |
+| prices at or below zero | refused (a bad print; dropped by the yfinance loader) | allowed (a spread trades through zero) |
+| benchmark | buy and hold, compounded | P&L of holding one lot on the initial equity, summed |
+
+**Why the margin.** A future's price is not the price of anything you pay
+for. You post a margin, and your P&L is the price change times the point
+value. On a back-adjusted series the price level is shifted by every past
+roll, and a spread's "price" is a difference that can be zero. Any rule
+that reads the level (a cap on notional, a cost in basis points, a
+percentage return) is then arbitrary. The margin is what your broker
+actually holds against a lot, so it is the one honest leverage basis. Pass
+it for **every** future, an outright as well as a spread; without it a
+future is run as if it were a share.
+
+**Example: Brent outright on a $100,000 account.** ICE Brent is 1,000
+barrels a lot, so `--point-value 1000`. At $80/bbl one lot controls $80,000
+of oil, and a $1 move is $1,000 of P&L. Say the exchange's initial margin
+is about $6,000 a lot (check the current figure: it moves with volatility).
+With `--margin-per-unit 6000 --max-leverage 0.5` the cap is $50,000 of
+margin, at most 8 lots (8 x 6,000 = 48,000). That is $640,000 of oil, 6.4x
+the account in notional terms, which is why the cap should sit at 0.5 or
+below: a $12 gap against 8 lots ($96,000) nearly wipes the account (see
+**Ruin**). A sizing rule usually binds well before the cap. At 1 % risk on a
+3-ATR stop with a $2 ATR, the rule wants $1,000 / (3 x 2 x 1,000) = 0.17
+lots, which `--whole-units` floors to **0**: `main.py` warns about this
+before the run. Raise `--risk-pct`, use `--vol-target`, or trade a
+smaller contract.
+
+**Example: a Brent calendar spread (Dec25-Dec26).** It is quoted front
+minus back, say +$1.50, and can go negative. Its "notional" (1.50 x 1,000 =
+$1,500) says nothing about risk, and a percentage return through zero does
+not exist. Exchanges margin spreads at a fraction of an outright, say
+$3,000, so `--margin-per-unit 3000 --max-leverage 0.5` allows up to 16
+spreads, and every number the engine computes comes from point changes x
+1,000.
+
+#### Futures and spreads (prices at or below zero)
 
 A futures calendar spread (Brent Dec25-Dec26, say) is quoted front minus
 back and trades through zero. Nothing needs to be added to its prices to
@@ -421,9 +479,11 @@ differences (channels, ATR, stops, targets, every regime indicator, the
 learner's stances and losses, the P&L), so adding any constant to every
 price, including one that makes the whole series negative, leaves the
 trades, the P&L and the equity unchanged, and `tests/test_instrument.py`
-proves it for every switch and both sizing rules. The three things that
-used to read the price level -- the leverage cap, the volatility-target
-size and the costs -- are described in currency instead:
+proves it for every switch and both sizing rules (with a margin given: a
+cash asset's leverage cap, bps costs and pct-vol target read the price
+level, as they should for a share). The three things that would read the
+price level -- the leverage cap, the volatility-target size and the costs
+-- are described in currency instead:
 
 | flag | meaning | Brent spread example |
 |---|---|---|
@@ -432,7 +492,8 @@ size and the costs -- are described in currency instead:
 | `--margin-per-unit` | initial margin per unit, the leverage cap's basis | 3000 (check the exchange) |
 | `--whole-units` | floor every size to whole contracts; below one, nothing opens | on, for any future |
 
-Give all four for **any future**, not only a spread: a back-adjusted
+Give all four for **any future**, not only a spread (the margin is what
+makes the engine treat the series as a future): a back-adjusted
 continuous contract has positive prices at an artificial level, so a cost in
 basis points of that price and a cap on its notional are both arbitrary
 (both entry points warn when a point value comes without a margin or with

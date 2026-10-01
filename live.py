@@ -389,10 +389,13 @@ def _size(equity: float, tpl: StrategyTemplate, ind: dict, n: int, price: float,
     if not (a > 0):
         return 0.0
     if tpl.vol_target > 0:
-        rv = float(ind["rvol"][n - 1])     # per-bar, in price points
+        rv = float(ind["rvol"][n - 1])     # per-bar: pct for a cash asset, price points with a margin
         if not (rv > 0):
             return 0.0
-        qty = equity * (tpl.vol_target / np.sqrt(periods_per_year())) / (rv * pv)
+        unit_vol = rv * pv if tpl.margin_per_unit > 0 else rv * abs(price) * pv
+        if not (unit_vol > 0):
+            return 0.0
+        qty = equity * (tpl.vol_target / np.sqrt(periods_per_year())) / unit_vol
     else:
         qty = equity * tpl.risk_pct / (tpl.atr_mult_stop * a * pv)
     qty *= max(float(ind["direction"][n - 1]) * (1.0 if is_trend else -1.0), 0.0)
