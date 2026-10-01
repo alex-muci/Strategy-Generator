@@ -21,6 +21,7 @@ from strategy import (  # noqa: E402
     hedge_weights, hedge_channel, hedge_warmup, hedge_direction, hedge_experts, hedge_diagnostics, donchian,
     HEDGE_LADDER, HEDGE_MEMORY, HEDGE_HORIZONS, _adahedge_loop, _hedge_loss,
     hedge_ladder, hedge_ladder_for, HedgeExpert, HEDGE_LADDERS, HEDGE_CHANNELS, HEDGE_EXIT_SCALE,
+    hedge_learner, HEDGE_SLOW_MEMORY, HEDGE_SLOW_HORIZONS,
     HEDGE_WIDE_K, hedge_position, hedge_position_sized, hedge_scored_sides, _allowed, _hedge_stances,
     hedge_active, _window_mean, EXIT_STYLES, _hedge_cached,
     sma, atr,
@@ -642,7 +643,7 @@ class WideLadderTests(unittest.TestCase):
 
     def test_the_ladder_is_fixed_in_advance_and_labelled(self):
         spec = HEDGE_LADDERS["hedge_wide"]
-        self.assertEqual(HEDGE_CHANNELS, ("hedge", "hedge_wide"))
+        self.assertEqual(HEDGE_CHANNELS, ("hedge", "hedge_wide", "hedge_slow", "hedge_wide_slow"))
         self.assertEqual([e.label for e in hedge_ladder("trend")], [f"follow_{n}" for n in HEDGE_LADDER])
         self.assertEqual(len(spec), 2 * len(HEDGE_LADDER))
         for mode in ("trend", "countertrend", "learned"):
@@ -668,6 +669,31 @@ class WideLadderTests(unittest.TestCase):
         # the wide experts do not stretch the warm-up: the 80-bar rung still leads it
         self.assertEqual(hedge_warmup(20, "hedge_wide"), hedge_warmup(20))
         self.assertEqual(hedge_warmup(20), HEDGE_MEMORY + 2 * max(HEDGE_LADDER))
+
+    def test_slow_ladders_are_the_same_experts_with_a_long_memory(self):
+        self.assertEqual(HEDGE_LADDERS["hedge_slow"], HEDGE_LADDERS["hedge"])
+        self.assertEqual(HEDGE_LADDERS["hedge_wide_slow"], HEDGE_LADDERS["hedge_wide"])
+        self.assertEqual(hedge_learner("hedge"), (HEDGE_MEMORY, HEDGE_HORIZONS))
+        self.assertEqual(hedge_learner("hedge_slow"), (HEDGE_SLOW_MEMORY, HEDGE_SLOW_HORIZONS))
+        self.assertTrue(hedge_position_sized("hedge_wide_slow") and not hedge_position_sized("hedge_slow"))
+        self.assertEqual(hedge_warmup(20, "hedge_slow"), HEDGE_SLOW_MEMORY + 2 * max(HEDGE_LADDER))
+        # the fast ladders are what they were: the slow memory is the only difference
+        df = synthetic_ohlc(1400, seed=3)
+        for fast, slow in (("hedge", "hedge_slow"), ("hedge_wide", "hedge_wide_slow")):
+            loss, _, _ = _hedge_loss(df, 20, "learned", 5.0, fast)
+            loss_s, _, _ = _hedge_loss(df, 20, "learned", 5.0, slow)
+            np.testing.assert_array_equal(loss, loss_s)
+            np.testing.assert_array_equal(hedge_weights(df, 20, "learned", 5.0, fast),
+                                          _adahedge_loop(loss, HEDGE_MEMORY)[0])
+            np.testing.assert_array_equal(hedge_weights(df, 20, "learned", 5.0, slow),
+                                          _adahedge_loop(loss, HEDGE_SLOW_MEMORY, HEDGE_SLOW_HORIZONS)[0])
+        d = hedge_diagnostics(df, 20, "learned", 5.0, "hedge_wide_slow")
+        self.assertEqual(list(d["eta"].columns), list(HEDGE_SLOW_HORIZONS))
+        # a window warmed on hedge_warmup bars matches the full-history run
+        warm = hedge_warmup(20, "hedge_slow")
+        full = hedge_weights(df, 20, "learned", 5.0, "hedge_slow")
+        part = hedge_weights(df.iloc[300:], 20, "learned", 5.0, "hedge_slow")
+        np.testing.assert_allclose(full[300 + warm:], part[warm:], atol=1e-12)
 
     def test_bands_are_the_channels_the_fitted_templates_trade(self):
         df, close = self.df, self.df["Close"]

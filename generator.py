@@ -101,9 +101,35 @@ FAMILIES = {
         bias_filters=["none"],
         sides=["both"],
     ),
+    # the same two families on the slow ladders: the same experts, a learner
+    # with a three-year memory (strategy.HEDGE_SLOW_MEMORY), for real series
+    # whose experts' edges are too small for the fast learner to tell apart
+    "online_slow": dict(
+        direction_logics=DIRECTION_LOGICS,
+        channel_types=["hedge_slow"],
+        entry_styles=["stop", "close_confirm"],
+        exit_styles=EXIT_STYLES,
+        regimes=[("er", "none"), ("er", "trend_only"), ("er", "range_only"),
+                 ("vr", "trend_only"), ("vr", "range_only"), ("chop", "range_only")],
+        vol_filters=[False],
+        bias_filters=["none", "sma"],
+        sides=["both"],
+    ),
+    "online_wide_slow": dict(
+        direction_logics=["learned"],
+        channel_types=["hedge_wide_slow"],
+        entry_styles=["stop", "close_confirm"],
+        exit_styles=EXIT_STYLES,
+        regimes=[("er", "none")],
+        vol_filters=[False],
+        bias_filters=["none"],
+        sides=["both"],
+    ),
     "full": dict(
         direction_logics=DIRECTION_LOGICS,
-        channel_types=CHANNEL_TYPES,
+        # the slow ladders are the fast ones' experts with a longer memory, so
+        # they have their own families rather than doubling the hedge part of this one
+        channel_types=[c for c in CHANNEL_TYPES if not c.endswith("_slow")],
         entry_styles=ENTRY_STYLES,
         exit_styles=EXIT_STYLES,
         regimes=_ALL_REGIMES,
@@ -120,6 +146,7 @@ FAMILIES = {
 _SHORT = {
     "trend": "TR", "countertrend": "CT", "learned": "LN",
     "donchian": "don", "keltner": "kel", "bollinger": "bol", "hedge": "hdg", "hedge_wide": "hdw",
+    "hedge_slow": "hds", "hedge_wide_slow": "hws",
     "stop": "stop", "close_confirm": "cls", "pullback": "pb",
     "channel": "chan", "atr_trail": "trail", "target_stop": "tgt", "time_stop": "time",
     "none": "none", "trend_only": "trend", "range_only": "range",

@@ -541,7 +541,35 @@ HEDGE_LADDERS = {
     "hedge_wide": tuple(HedgeExpert("donchian", n) for n in HEDGE_LADDER)
                   + tuple(HedgeExpert("keltner", n, HEDGE_WIDE_K) for n in HEDGE_LADDER),
 }
+# The slow ladders ('hedge_slow', 'hedge_wide_slow'): the same experts as
+# their fast twins, scored by a learner with a LONG memory. On real daily
+# bars (SPY, TLT, GLD, USO 2016-2026) the rungs' edges are a few tenths of a
+# Sharpe apart, and telling two of them apart takes years of bars, not the
+# 20-160 bar lifetimes of HEDGE_HORIZONS: the fast learner re-weights on
+# noise, and chasing the recent winner among follow and fade experts is a
+# momentum bet on strategy returns that loses on a series whose daily moves
+# mean-revert. Memory and lifetimes about three years long (HEDGE_SLOW_*)
+# let the weights settle near the experts' long-run merit; on the regime
+# series the fast ladders were built for they are slower to switch.
+HEDGE_SLOW_MEMORY = 750
+HEDGE_SLOW_HORIZONS = (250, 500, 750)
+HEDGE_LADDERS["hedge_slow"] = HEDGE_LADDERS["hedge"]
+HEDGE_LADDERS["hedge_wide_slow"] = HEDGE_LADDERS["hedge_wide"]
 HEDGE_CHANNELS = tuple(HEDGE_LADDERS)   # the channel types the learner builds
+
+# ladder -> (memory, lifetimes) of its learner
+HEDGE_LEARNERS = {
+    "hedge": (HEDGE_MEMORY, HEDGE_HORIZONS),
+    "hedge_wide": (HEDGE_MEMORY, HEDGE_HORIZONS),
+    "hedge_slow": (HEDGE_SLOW_MEMORY, HEDGE_SLOW_HORIZONS),
+    "hedge_wide_slow": (HEDGE_SLOW_MEMORY, HEDGE_SLOW_HORIZONS),
+}
+
+
+def hedge_learner(ladder: str):
+    """(memory, lifetimes) of the learner a ladder runs."""
+    _ladder_spec(ladder)
+    return HEDGE_LEARNERS[ladder]
 
 # The ladders whose templates are sized by the learner's POSITION (see
 # hedge_position): the experts are scored on the legs the template's `sides`
@@ -550,7 +578,7 @@ HEDGE_CHANNELS = tuple(HEDGE_LADDERS)   # the channel types the learner builds
 # aggregation puts on trading at all. The plain ladder keeps the original
 # rule: both legs scored, a learned direction sized by its net side weight, a
 # fixed one at full size.
-HEDGE_POSITION_SIZED = ("hedge_wide",)
+HEDGE_POSITION_SIZED = ("hedge_wide", "hedge_wide_slow")
 
 
 def hedge_position_sized(ladder: str) -> bool:
@@ -589,7 +617,7 @@ def hedge_warmup(atr_n: int, ladder: str = "hedge") -> int:
       * the ATR on r-1 is: atr_n true ranges, each needing the close before
         it, so r >= atr_n + 1."""
     experts = _ladder_spec(ladder)
-    return int(HEDGE_MEMORY + max(max(e.lead(atr_n) for e in experts), int(atr_n) + 1))
+    return int(hedge_learner(ladder)[0] + max(max(e.lead(atr_n) for e in experts), int(atr_n) + 1))
 
 
 def _ladder_spec(ladder: str):
@@ -941,7 +969,8 @@ def _hedge_run(df: pd.DataFrame, atr_n: int, mode: str, cost_bps: float, ladder:
                cost_pts: float = 0.0):
     S, formed, _ = _hedge_stances(df, atr_n, mode, ladder, sides)
     loss = _stance_loss(df, atr_n, S, formed, cost_bps, cost_pts)
-    W, ETA, V, SURPRISE, TRADE = _adahedge_loop(loss, with_trade=True)
+    memory, horizons = hedge_learner(ladder)
+    W, ETA, V, SURPRISE, TRADE = _adahedge_loop(loss, memory, horizons, with_trade=True)
     # the committee's position: the stance the weighted experts hold at the
     # close of t, in [-1, 1], times the weight on trading at all
     POSITION = TRADE * np.clip((W * S).sum(axis=1), -1.0, 1.0)
@@ -988,8 +1017,8 @@ def hedge_diagnostics(df: pd.DataFrame, atr_n: int, mode: str = "trend", cost_bp
     return {
         "weights": pd.DataFrame(W, index=idx, columns=experts),
         "loss": pd.DataFrame(loss, index=idx, columns=experts),
-        "eta": pd.DataFrame(ETA, index=idx, columns=list(HEDGE_HORIZONS)),
-        "horizon_weights": pd.DataFrame(V, index=idx, columns=list(HEDGE_HORIZONS)),
+        "eta": pd.DataFrame(ETA, index=idx, columns=list(hedge_learner(ladder)[1])),
+        "horizon_weights": pd.DataFrame(V, index=idx, columns=list(hedge_learner(ladder)[1])),
         "surprise": pd.Series(SURPRISE, index=idx),
         "trade_weight": pd.Series(TRADE, index=idx),
         "position": pd.Series(POSITION, index=idx),
@@ -1099,7 +1128,7 @@ REGIME_INDICATORS = {
 # --------------------------------------------------------------------------
 
 DIRECTION_LOGICS = ["trend", "countertrend", "learned"]
-CHANNEL_TYPES = ["donchian", "keltner", "bollinger", "hedge", "hedge_wide"]
+CHANNEL_TYPES = ["donchian", "keltner", "bollinger", "hedge", "hedge_wide", "hedge_slow", "hedge_wide_slow"]
 ENTRY_STYLES = ["stop", "close_confirm", "pullback"]
 EXIT_STYLES = ["channel", "atr_trail", "target_stop", "time_stop"]
 REGIME_INDICATOR_NAMES = list(REGIME_INDICATORS)
