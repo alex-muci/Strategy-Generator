@@ -1521,11 +1521,9 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
             equity[i] = cash
             continue
         if not fixed_capital and equity[i - 1] <= 0.0:
-            if position != 0 and roll[i - 1] > 0.0 and roll_cost_per_unit > 0.0:
-                # liquidated at that close instead of rolled: the roll charged there is undone
-                rc = roll_cost_per_unit * shares * roll[i - 1]
-                cash += rc
-                entry_cost -= rc
+            # (a roll charged at that close stays charged: the ruin was decided on
+            # the equity net of it, and undoing it could leave a closed account
+            # with cash; one roll on a dead account is the conservative reading)
             if position != 0:
                 # liquidated at that close; a loss beyond the cash is a deficit
                 # the account owes, not the broker's to absorb
@@ -1959,10 +1957,6 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
 
     # ---- ruin on the last bar: the loop above would have closed it on the next ----
     if n > 1 and equity[n - 1] <= 0.0 and not ruined and not fixed_capital:
-        if position != 0 and roll[n - 1] > 0.0 and roll_cost_per_unit > 0.0:
-            rc = roll_cost_per_unit * shares * roll[n - 1]
-            cash += rc
-            entry_cost -= rc
         if position != 0:
             gross = position * shares * point_value * (close[n - 1] - entry_price)
             xcost = cost_rate * shares * point_value * abs(close[n - 1]) + cost_per_unit * shares
@@ -2129,7 +2123,10 @@ def backtest(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: float = 10
     n = len(df)
     first_trade_bar = int(max(first_trade_bar, 0))
     validate_instrument(df, tpl)
-    roll = _to_arr(df["Roll"].fillna(0.0)) if "Roll" in df.columns else np.zeros(n)
+    # the roll bars matter only when a roll costs something (a Roll column of
+    # any dtype is then left alone)
+    roll = (_to_arr(df["Roll"].fillna(0.0)) if "Roll" in df.columns and tpl.roll_cost_per_unit > 0
+            else np.zeros(n))
     close = _to_arr(df["Close"])
     open_ = _to_arr(df["Open"])
     high = _to_arr(df["High"])

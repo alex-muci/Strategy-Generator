@@ -499,15 +499,29 @@ class RuinTests(unittest.TestCase):
         self.assertAlmostEqual(t["pnl"], -170_000.0, delta=1.0)    # 16.7 lots x 1000 x (0.8 - 11.0)
         self.assertAlmostEqual(float(res["equity"].iloc[-1]), 100_000.0 + t["pnl"])
 
-    def test_liquidated_at_a_roll_close_it_does_not_also_roll(self):
-        df = self._gap()
+    def test_a_roll_that_ruins_the_account_stays_charged(self):
+        """The roll cost itself tips the equity below zero: the account is
+        closed at that close with the roll paid (undoing it would leave a
+        closed account with cash), and the deficit is what is left."""
+        df = self._gap().iloc[:60]
+        df.loc[df.index[41], ["Open", "High", "Low", "Close"]] = [11.0, 11.2, 10.8, 11.0]
+        df.loc[df.index[42:], ["Open", "High", "Low", "Close"]] = [11.0, 11.2, 10.8, 11.0]   # no gap at all
         df["Roll"] = 0.0
-        df.iloc[42, df.columns.get_loc("Roll")] = 1.0        # the contract rolls at the close that ruins it
-        res = backtest(df, self._tpl(atr_mult_stop=1e6, risk_pct=1e5, roll_cost_per_unit=400.0), first_trade_bar=30)
+        df.iloc[45, df.columns.get_loc("Roll")] = 1.0
+        res = backtest(df, self._tpl(atr_mult_stop=1e6, risk_pct=1e5, roll_cost_per_unit=20_000.0),
+                       first_trade_bar=30)
         t = res["trades"][0]
-        self.assertEqual(t["reason"], "ruin")
-        self.assertAlmostEqual(t["cost"], 0.0)               # no per-unit cost, and the roll undone
+        self.assertEqual((t["reason"], t["exit_date"]), ("ruin", df.index[45]))
+        self.assertAlmostEqual(t["cost"], 20_000.0 * t["shares"])
+        self.assertLess(float(res["equity"].iloc[-1]), 0.0)
         self.assertAlmostEqual(float(res["equity"].iloc[-1]), 100_000.0 + t["pnl"])
+        self.assertEqual(int(res["entries"][46:].sum()), 0)
+
+    def test_a_roll_column_is_ignored_without_a_roll_cost(self):
+        df = self._gap()
+        df["Roll"] = "yes"                                    # any dtype: not read
+        res = backtest(df, self._tpl(max_leverage=0.05), first_trade_bar=30)
+        self.assertEqual([t["reason"] for t in res["trades"]][:1], ["stop"])
 
     def test_a_ruined_window_is_not_refunded(self):
         """The walk-forward is one account: after a window ends at or below

@@ -169,6 +169,43 @@ class EngineTests(unittest.TestCase):
         finally:
             S._bar_loop_fast = fast
 
+    def test_jit_kernel_matches_pure_python_on_futures_paths(self):
+        """The same, on the paths the share sweep above never reaches: a
+        margined future with per-unit and roll costs on gappy prices (rolls,
+        a target the open gaps through, ruin to a deficit, the last-bar
+        ruin), with and without fixed capital, with the order log on."""
+        import strategy as S
+        if not S.HAVE_NUMBA:
+            self.skipTest("numba not installed")
+        rng = np.random.default_rng(3)
+        df = synthetic_ohlc(600, seed=9).copy()
+        gap = rng.random(len(df)) < 0.03                   # 3 % of bars gap 5 % either way
+        f = np.where(gap, np.exp(rng.normal(0, 0.05, len(df))), 1.0).cumprod()
+        for c in ("Open", "High", "Low", "Close"):
+            df[c] = df[c] * f
+        # a crash and a spike beyond any margin: longs are ruined by one, shorts by the other
+        for k, jump in ((250, 0.4), (420, 2.5), (len(df) - 1, 0.5)):
+            df.iloc[k:, [df.columns.get_loc(c) for c in ("Open", "High", "Low", "Close")]] *= jump
+        df["Roll"] = (rng.random(len(df)) < 0.05).astype(float)
+        fast = S._bar_loop_fast
+        base = dict(point_value=50.0, margin_per_unit=4000.0, cost_bps=0.0, cost_per_unit=2.5,
+                    roll_cost_per_unit=40.0, risk_pct=0.05, max_leverage=2.0)
+        sample = [t.with_params(**base) for t in generate_templates("full")[::241]]
+        sample += [t.with_params(whole_units=True) for t in sample[::3]]
+        try:
+            for tpl in sample:
+                for fixed in (False, True):
+                    S._bar_loop_fast = S._bar_loop
+                    slow = backtest(df, tpl, first_trade_bar=60, log_orders=True, fixed_capital=fixed)
+                    S._bar_loop_fast = fast
+                    quick = backtest(df, tpl, first_trade_bar=60, log_orders=True, fixed_capital=fixed)
+                    np.testing.assert_allclose(slow["equity"].values, quick["equity"].values, rtol=1e-12, atol=1e-6,
+                                               err_msg=f"{tpl.name} fixed={fixed}")
+                    pd.testing.assert_frame_equal(slow["orders"], quick["orders"], check_exact=False, rtol=1e-12)
+                    self.assertEqual([t["reason"] for t in slow["trades"]], [t["reason"] for t in quick["trades"]])
+        finally:
+            S._bar_loop_fast = fast
+
     def test_indicators_ranges(self):
         c = self.df["Close"]
         self.assertTrue(((cti(c, 20).dropna().abs()) <= 1).all())
