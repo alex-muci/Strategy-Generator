@@ -138,6 +138,20 @@ FAMILIES = {
         bias_filters=["none"],
         sides=["both"],
     ),
+    # every hedge ladder in one family, with what the real-data study kept:
+    # fast and slow memory, plain and wide ladder, the trend and learned
+    # directions (countertrend lost on every real series), no regime or bias
+    # filter (the learner is the filter), both sides and long-only
+    "online_core": dict(
+        direction_logics=["trend", "learned"],
+        channel_types=["hedge", "hedge_wide", "hedge_slow", "hedge_wide_slow"],
+        entry_styles=["stop", "close_confirm"],
+        exit_styles=EXIT_STYLES,
+        regimes=[("er", "none")],
+        vol_filters=[False],
+        bias_filters=["none"],
+        sides=["both", "long_only"],
+    ),
     "full": dict(
         direction_logics=DIRECTION_LOGICS,
         # the slow ladders are the fast ones' experts with a longer memory, so

@@ -49,6 +49,7 @@ python main.py --family online_wide                 # 8 templates: the learned d
 python main.py --family online_slow                 # 288 templates: the online family with a three-year learner memory (real series)
 python main.py --family online_wide_slow            # 8 templates: online_wide with the same long memory
 python main.py --family online_stance               # 4 templates: hold the learner committee's own stance (research only, no live orders)
+python main.py --family online_core                 # 128 templates: trend + learned on all four hedge ladders (fast/slow, plain/wide), no regime or bias filter, both sides and long-only
 python main.py --real SPY --start 2005-01-01 --family default --jobs 8
 python main.py --real SPY --start 2005-01-01 --family quick --sides long_only   # one-sided family (an asset with a drift)
 python main.py --real SPY --start 2005-01-01 --family quick --vol-target 0.1  # use vol-target rather than ATR-stop (see Position sizing)
