@@ -158,6 +158,7 @@ Execution model (no look-ahead):
 
 from __future__ import annotations
 from dataclasses import dataclass, asdict, replace
+import math
 import numpy as np
 import pandas as pd
 
@@ -501,7 +502,7 @@ class HedgeExpert:
     def bands(self, df: pd.DataFrame, atr_n: int, scale: float = 1.0):
         """(upper, lower) arrays of the expert's channel at `scale` times its
         lookback (the exit channel is the entry one at HEDGE_EXIT_SCALE)."""
-        m = max(2, int(round(int(self.n) * scale)))
+        m = max(2, int(math.floor(int(self.n) * scale + 0.5)))   # half up: a 5-bar rung exits on 3, not 2
         if self.kind == "donchian":
             up, lo, _ = donchian(df, m)
             return _to_arr(up), _to_arr(lo)
@@ -1332,6 +1333,12 @@ class StrategyTemplate:
         assert self.sides in SIDES
         assert self.point_value > 0, "point_value must be positive"
         assert self.cost_per_unit >= 0 and self.margin_per_unit >= 0 and self.roll_cost_per_unit >= 0
+        if self.entry_style == "stance":
+            # the stance entry holds the learner's committee: it reads no
+            # filter and no fitted channel, so a switch it would ignore is refused
+            assert self.channel_type in HEDGE_CHANNELS, "the stance entry trades a hedge ladder's committee"
+            assert self.regime_filter == "none" and not self.vol_filter and self.bias_filter == "none", \
+                "the stance entry has no regime, vol or bias filter"
 
 
 # --------------------------------------------------------------------------

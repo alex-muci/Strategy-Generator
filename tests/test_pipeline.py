@@ -1182,6 +1182,13 @@ class StanceEntryTests(unittest.TestCase):
         res = backtest(self.df, tpl, first_trade_bar=1300)
         self.assertTrue(all(self.df.index.get_loc(t["entry_date"]) >= 1300 for t in res["trades"]))
 
+    def test_switches_it_would_ignore_are_refused(self):
+        for kw in (dict(regime_filter="trend_only"), dict(bias_filter="sma"), dict(vol_filter=True),
+                   dict(channel_type="donchian")):
+            with self.assertRaises(AssertionError, msg=str(kw)):
+                self._tpl(**kw).validate()
+        self._tpl().validate()
+
     def test_spread_contracts_and_rolls(self):
         """A calendar spread: prices through zero, a margin, whole contracts
         and a roll cost. Adding a constant to every price changes nothing,
@@ -1226,6 +1233,9 @@ class SplitLadderTests(unittest.TestCase):
         self.assertEqual(HedgeExpert("keltner", 20, 2.0, side=1).label, "follow_kel20x2")
         self.assertTrue(all(x.span == x.n for x in HEDGE_SPLIT_FOLLOW))
         self.assertTrue(all(x.span in (1, 3) and x.span < x.n for x in HEDGE_SPLIT_FADE))
+        # the exit channel rounds half up: a 5-bar rung exits on a 3-bar channel
+        np.testing.assert_array_equal(HedgeExpert("donchian", 5).bands(self.df, 20, HEDGE_EXIT_SCALE)[0],
+                                      donchian(self.df, 3)[0].to_numpy())
         # a fade held 1 bar is short on the bar that breaks up, long on the
         # bar that breaks down, flat otherwise; held 3 bars it keeps the most
         # recent break's side for 3 bars

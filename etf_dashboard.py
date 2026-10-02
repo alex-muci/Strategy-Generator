@@ -823,14 +823,16 @@ def _slot_signal(slot: dict, df: pd.DataFrame, cfg: dict, live: dict, args,
     elif stale and args.no_refit:
         notes.append(f"{key}: a refit is due but --no-refit was given")
 
-    if mem["params"] is None:
+    research_only = base.entry_style == "stance"   # live.strategy_state has no orders for it
+    if mem["params"] is None or research_only:
         st = dict(slot=key, asset=slot["asset"], template=slot["template_name"],
                   as_of=df.index[-1], last_close=float(df["Close"].iloc[-1]), atr=np.nan,
                   equity_slot=equity, position=None, shares=0.0,
                   point_value=float(base.point_value), margin_per_unit=float(base.margin_per_unit),
                   entry_price=None, entry_date=None, bars_held=0, unrealized=0.0,
                   n_trades_in_window=0, exit_orders=[], entry_orders=[],
-                  blocked_by=["no parameter set could be fitted"], params={},
+                  blocked_by=["the stance entry is research only: no live orders" if research_only
+                              else "no parameter set could be fitted"], params={},
                   fitted_on=mem["fitted_on"], weight=slot["weight"],
                   bars_since_refit=bars_since(df, mem["fitted_on"]),
                   refit_due=due_for_refit(df, mem["fitted_on"], cfg["test_bars"]),
