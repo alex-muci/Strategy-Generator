@@ -25,7 +25,7 @@ python -m venv env  # assuming 3.12 installed
 ./env/Script/Activate
 pip install -r requirements.txt 
 
-python -m unittest discover -s tests -t . -v # 423 tests (engine, exit ordering, order log, templates, hedge learner and its wide ladder, walk-forward, robustness, selection, data, live signals, replay, both entry points, spreads: shift invariance, point value, per-unit and roll costs, margin cap, ruin, whole units, the ETF trick, a mixed cash + spread book)
+python -m unittest discover -s tests -t . -v # 426 tests (engine, exit ordering, order log, templates, hedge learner and its wide ladder, walk-forward, robustness, selection, data, live signals, replay, both entry points, spreads: shift invariance, point value, per-unit and roll costs, margin cap, ruin, whole units, the ETF trick, a mixed cash + spread book)
 # faster: pip install -r requirements-dev.txt, then, with ./env active,
 python -m pytest -n auto --dist loadscope   # in parallel; loadscope keeps a class (and its one-off setup) on one worker
 python -m pytest -m slow                    # the minutes-long live-order sweeps pytest skips by default
@@ -46,6 +46,9 @@ python main.py --family quick                       # 72 templates (Donchian, ER
 python main.py --family default                     # 768 templates, all switches sampled
 python main.py --family online                      # 288 templates on the online-learned channel (no lookback to fit)
 python main.py --family online_wide                 # 8 templates: the learned direction on a wider ladder, sized by its own position
+python main.py --family online_slow                 # 288 templates: the online family with a three-year learner memory (real series)
+python main.py --family online_wide_slow            # 8 templates: online_wide with the same long memory
+python main.py --family online_stance               # 4 templates: hold the learner committee's own stance (research only, no live orders)
 python main.py --real SPY --start 2005-01-01 --family default --jobs 8
 python main.py --real SPY --start 2005-01-01 --family quick --sides long_only   # one-sided family (an asset with a drift)
 python main.py --real SPY --start 2005-01-01 --family quick --vol-target 0.1  # use vol-target rather than ATR-stop (see Position sizing)
@@ -954,6 +957,36 @@ decision about the asset and is taken on the command line: on an index
 with a drift run it `--sides long_only`. `hedge_diagnostics(...,
 ladder="hedge_wide")` names the experts `follow_10`, `fade_kel20x2`, and
 so on, and adds `trade_weight` and `position`.
+
+#### Real series: the slow ladders and the `stance` entry
+
+`docs/hedge_real_data_study.md` runs every family on real ETFs (SPY, TLT,
+GLD, USO, 2016-2026, `data_dump/`) and on planted-edge series. Two changes
+came out of it; both leave `hedge` and `hedge_wide` bit for bit as they were.
+
+- **`hedge_slow` / `hedge_wide_slow`**: the same experts, a learner with a
+  three-year memory (`HEDGE_SLOW_MEMORY` = 750 bars, lifetimes
+  `HEDGE_SLOW_HORIZONS` = 250, 500, 750; `strategy.HEDGE_LEARNERS` maps a
+  ladder to its learner). On real daily bars the rungs' edges are tenths of
+  a Sharpe apart, and the 20-160 bar lifetimes re-weight on noise: on a
+  series with a planted Sharpe-1.4 edge the fast learner's committee earns
+  0.6 of it, the slow one 1.1. The warm-up is 911 bars instead of 410. The
+  families are `online_slow` and `online_wide_slow`.
+- **`entry_style = "stance"`**: the experts are scored on holding a stance
+  for a while after a break, but a channel template trades something else
+  (a break of the averaged channel, then its exit and a hard stop). A
+  planted fade edge the committee earns a Sharpe of 3 on is worth about 1.3
+  through the countertrend exits. The stance entry holds the committee's own
+  signed stance (`strategy.hedge_stance`), ordered at the next open, in
+  quarters of a full size (`STANCE_STEPS`), with no stop or exit rule (the
+  exit style is inert); it recovers the planted edge (2.9-3.0 on the slow
+  ladders). Cash assets only, and `live.py` refuses it: it is a research
+  entry. The family is `online_stance` (trend and learned, on both slow
+  ladders).
+
+Neither makes the hedge win on the real ETFs: there the follow side is the
+only edge the experts have, and follow-or-fade is not learnable from ten
+years of one asset (see the study).
 
 **A caveat on conviction, for both ladders.** The learner's weights are
 follow-the-leader until the losses prove that flipping costs something,
