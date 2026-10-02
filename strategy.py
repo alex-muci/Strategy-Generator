@@ -158,6 +158,7 @@ Execution model (no look-ahead):
 
 from __future__ import annotations
 from dataclasses import dataclass, asdict, replace
+import math
 import numpy as np
 import pandas as pd
 
@@ -470,17 +471,21 @@ class HedgeExpert:
     n: int = 20
     k: float = 0.0           # band half-width (Keltner only)
     side: int = 1            # +1 follow the break, -1 fade it (stamped by `hedge_ladder`)
+    hold: int = 0            # bars a break stays the stance; 0 = the lookback n (every ladder but
+                             # hedge_split, whose fade experts hold for a few bars: see HEDGE_SPLIT)
 
     @property
     def span(self) -> int:
-        """Bars a break stays the expert's stance: its own lookback, when the
-        break bar leaves the Donchian channel or the SMA window behind a band."""
-        return int(self.n)
+        """Bars a break stays the expert's stance: its `hold` when one is
+        given, else its own lookback, when the break bar leaves the Donchian
+        channel or the SMA window behind a band."""
+        return int(self.hold) if self.hold > 0 else int(self.n)
 
     @property
     def label(self) -> str:
         base = str(int(self.n)) if self.kind == "donchian" else f"kel{int(self.n)}x{self.k:g}"
-        return f"{'follow' if self.side > 0 else 'fade'}_{base}"
+        hold = f"_h{int(self.hold)}" if self.hold > 0 else ""
+        return f"{'follow' if self.side > 0 else 'fade'}_{base}{hold}"
 
     def formed(self, atr_n: int) -> int:
         """Index of the first bar whose bands are fully formed."""
@@ -497,7 +502,7 @@ class HedgeExpert:
     def bands(self, df: pd.DataFrame, atr_n: int, scale: float = 1.0):
         """(upper, lower) arrays of the expert's channel at `scale` times its
         lookback (the exit channel is the entry one at HEDGE_EXIT_SCALE)."""
-        m = max(2, int(round(int(self.n) * scale)))
+        m = max(2, int(math.floor(int(self.n) * scale + 0.5)))   # half up: a 5-bar rung exits on 3, not 2
         if self.kind == "donchian":
             up, lo, _ = donchian(df, m)
             return _to_arr(up), _to_arr(lo)
@@ -541,7 +546,82 @@ HEDGE_LADDERS = {
     "hedge_wide": tuple(HedgeExpert("donchian", n) for n in HEDGE_LADDER)
                   + tuple(HedgeExpert("keltner", n, HEDGE_WIDE_K) for n in HEDGE_LADDER),
 }
+# The slow ladders ('hedge_slow', 'hedge_wide_slow'): the same experts as
+# their fast twins, scored by a learner with a LONG memory. On real daily
+# bars (SPY, TLT, GLD, USO 2016-2026) the rungs' edges are a few tenths of a
+# Sharpe apart, and telling two of them apart takes years of bars, not the
+# 20-160 bar lifetimes of HEDGE_HORIZONS: the fast learner re-weights on
+# noise, and chasing the recent winner among follow and fade experts is a
+# momentum bet on strategy returns that loses on a series whose daily moves
+# mean-revert. Memory and lifetimes about three years long (HEDGE_SLOW_*)
+# let the weights settle near the experts' long-run merit; on the regime
+# series the fast ladders were built for they are slower to switch.
+HEDGE_SLOW_MEMORY = 750
+HEDGE_SLOW_HORIZONS = (250, 500, 750)
+HEDGE_LADDERS["hedge_slow"] = HEDGE_LADDERS["hedge"]
+HEDGE_LADDERS["hedge_wide_slow"] = HEDGE_LADDERS["hedge_wide"]
 HEDGE_CHANNELS = tuple(HEDGE_LADDERS)   # the channel types the learner builds
+
+# ladder -> (memory, lifetimes) of its learner
+HEDGE_LEARNERS = {
+    "hedge": (HEDGE_MEMORY, HEDGE_HORIZONS),
+    "hedge_wide": (HEDGE_MEMORY, HEDGE_HORIZONS),
+    "hedge_slow": (HEDGE_SLOW_MEMORY, HEDGE_SLOW_HORIZONS),
+    "hedge_wide_slow": (HEDGE_SLOW_MEMORY, HEDGE_SLOW_HORIZONS),
+}
+
+
+# The split ladder ('hedge_split'): trend and mean reversion live on
+# different time scales, so they get different experts AND different
+# learners, and a third learner on top decides between them.
+#
+#   * follow group: Donchian and Keltner (SMA +/- 2 ATR) breaks at 20, 40,
+#     80 bars, each held as long as its lookback (the trend rungs of the
+#     other ladders); scored by a SLOW learner, because a trend's edge is
+#     small per bar and persistent.
+#   * fade group: the same two kinds of break at 5, 10, 20 bars, each faded
+#     for 1 or 3 bars only (the hold is decoupled from the lookback: a dip
+#     two ATRs under the 5-bar mean is bought for a day or three, not for 5
+#     bars); scored by a FAST learner, because reversal pays over days and
+#     its episodes (a crash and its rebound, a tariff shock) are short.
+#   * top learner: each group's committee is one meta-expert, scored each
+#     bar on the loss its played weights suffered; the top learner (the same
+#     discounted AdaHedge over lifetimes, with short lifetimes so it can move
+#     into a reversal episode and back out within weeks) weighs the two.
+#     The played weights over the experts are its group weight times the
+#     group's own weights, so everything downstream (the averaged channel,
+#     the net side weight, the position, the stance) reads them unchanged.
+#
+# A 'trend' template on this ladder runs the follow group with its own
+# learner, a 'countertrend' one the fade group with its own; 'learned' runs
+# all three. Like the wide ladder it is position-sized: experts are scored
+# on the legs the template trades, so long-only the fade group is "buy the
+# dip, for a day or three" and the follow group "buy the breakout".
+HEDGE_SPLIT_FOLLOW = tuple(HedgeExpert(kind, n, HEDGE_WIDE_K if kind == "keltner" else 0.0)
+                           for kind in ("donchian", "keltner") for n in (20, 40, 80))
+HEDGE_SPLIT_FADE = tuple(HedgeExpert(kind, n, HEDGE_WIDE_K if kind == "keltner" else 0.0, hold=h)
+                         for kind in ("donchian", "keltner") for n in (5, 10, 20) for h in (1, 3))
+HEDGE_SPLIT_LEARNERS = {             # group -> (memory, lifetimes)
+    "follow": (500, (125, 250, 500)),
+    "fade": (250, (10, 20, 40, 80)),
+    "top": (120, (10, 20, 40)),
+}
+HEDGE_SPLIT = ("hedge_split",)
+HEDGE_LADDERS["hedge_split"] = HEDGE_SPLIT_FOLLOW + HEDGE_SPLIT_FADE
+HEDGE_CHANNELS = tuple(HEDGE_LADDERS)
+HEDGE_LEARNERS["hedge_split"] = HEDGE_SPLIT_LEARNERS["top"]
+
+
+def hedge_learner(ladder: str):
+    """(memory, lifetimes) of the learner a ladder runs (on the split
+    ladder: of its top learner; see HEDGE_SPLIT_LEARNERS for the groups')."""
+    _ladder_spec(ladder)
+    return HEDGE_LEARNERS[ladder]
+
+
+def _split_group_warmup(atr_n: int, group: str) -> int:
+    experts = HEDGE_SPLIT_FOLLOW if group == "follow" else HEDGE_SPLIT_FADE
+    return int(HEDGE_SPLIT_LEARNERS[group][0] + max(max(e.lead(atr_n) for e in experts), int(atr_n) + 1))
 
 # The ladders whose templates are sized by the learner's POSITION (see
 # hedge_position): the experts are scored on the legs the template's `sides`
@@ -550,7 +630,7 @@ HEDGE_CHANNELS = tuple(HEDGE_LADDERS)   # the channel types the learner builds
 # aggregation puts on trading at all. The plain ladder keeps the original
 # rule: both legs scored, a learned direction sized by its net side weight, a
 # fixed one at full size.
-HEDGE_POSITION_SIZED = ("hedge_wide",)
+HEDGE_POSITION_SIZED = ("hedge_wide", "hedge_wide_slow", "hedge_split")
 
 
 def hedge_position_sized(ladder: str) -> bool:
@@ -589,7 +669,13 @@ def hedge_warmup(atr_n: int, ladder: str = "hedge") -> int:
       * the ATR on r-1 is: atr_n true ranges, each needing the close before
         it, so r >= atr_n + 1."""
     experts = _ladder_spec(ladder)
-    return int(HEDGE_MEMORY + max(max(e.lead(atr_n) for e in experts), int(atr_n) + 1))
+    if ladder in HEDGE_SPLIT:
+        # the top learner replays HEDGE_SPLIT_LEARNERS['top'] rounds of the
+        # groups' played losses, and the round of bar t uses the group weights
+        # of bar t-1, exact once the slower group's are
+        return int(max(_split_group_warmup(atr_n, "follow"), _split_group_warmup(atr_n, "fade")) + 1
+                   + HEDGE_SPLIT_LEARNERS["top"][0])
+    return int(hedge_learner(ladder)[0] + max(max(e.lead(atr_n) for e in experts), int(atr_n) + 1))
 
 
 def _ladder_spec(ladder: str):
@@ -605,6 +691,16 @@ def hedge_ladder(mode: str, ladder: str = "hedge") -> list:
     both (learned, so the learner can switch between following and fading
     as well as between channels)."""
     spec = _ladder_spec(ladder)
+    if ladder in HEDGE_SPLIT:
+        follow = [replace(e, side=1) for e in HEDGE_SPLIT_FOLLOW]
+        fade = [replace(e, side=-1) for e in HEDGE_SPLIT_FADE]
+        if mode == "trend":
+            return follow
+        if mode == "countertrend":
+            return fade
+        if mode == "learned":
+            return follow + fade
+        raise ValueError(f"unknown hedge mode {mode}")
     if mode == "trend":
         return [replace(e, side=1) for e in spec]
     if mode == "countertrend":
@@ -941,11 +1037,60 @@ def _hedge_run(df: pd.DataFrame, atr_n: int, mode: str, cost_bps: float, ladder:
                cost_pts: float = 0.0):
     S, formed, _ = _hedge_stances(df, atr_n, mode, ladder, sides)
     loss = _stance_loss(df, atr_n, S, formed, cost_bps, cost_pts)
-    W, ETA, V, SURPRISE, TRADE = _adahedge_loop(loss, with_trade=True)
+    if ladder in HEDGE_SPLIT:
+        W, ETA, V, SURPRISE, TRADE = _split_learner(loss, mode)
+    else:
+        memory, horizons = hedge_learner(ladder)
+        W, ETA, V, SURPRISE, TRADE = _adahedge_loop(loss, memory, horizons, with_trade=True)
     # the committee's position: the stance the weighted experts hold at the
     # close of t, in [-1, 1], times the weight on trading at all
     POSITION = TRADE * np.clip((W * S).sum(axis=1), -1.0, 1.0)
     return W, ETA, V, SURPRISE, TRADE, POSITION, loss
+
+
+def _split_learner(loss: np.ndarray, mode: str):
+    """The split ladder's learners over its T x N loss matrix (columns in
+    `hedge_ladder(mode, 'hedge_split')` order: the follow group, then the
+    fade group). A fixed direction runs its one group with that group's
+    learner. 'learned' runs both, then the top learner over the two
+    committees: its loss on bar t is the loss the group's weights of bar t-1
+    (the weights it played) suffered on bar t, neutral 0.5 on bar 0, so the
+    top weights of bar t, like every learner's, use nothing after bar t.
+    Returns (W, ETA, V, SURPRISE, TRADE) as `_adahedge_loop(...,
+    with_trade=True)`: W the played weights over all experts (top weight x
+    group weight), ETA / V the top learner's (or the group's), SURPRISE the
+    played mixture's loss minus the best expert's, TRADE the top learner's
+    played mixture against cash."""
+    nf = len(HEDGE_SPLIT_FOLLOW)
+    if mode == "trend":
+        return _adahedge_loop(loss, *HEDGE_SPLIT_LEARNERS["follow"], with_trade=True)
+    if mode == "countertrend":
+        return _adahedge_loop(loss, *HEDGE_SPLIT_LEARNERS["fade"], with_trade=True)
+    Wf = _adahedge_loop(loss[:, :nf], *HEDGE_SPLIT_LEARNERS["follow"])[0]
+    Wr = _adahedge_loop(loss[:, nf:], *HEDGE_SPLIT_LEARNERS["fade"])[0]
+    T = loss.shape[0]
+    top_loss = np.full((T, 2), 0.5)
+    top_loss[1:, 0] = (Wf[:-1] * loss[1:, :nf]).sum(axis=1)
+    top_loss[1:, 1] = (Wr[:-1] * loss[1:, nf:]).sum(axis=1)
+    top_loss = np.clip(top_loss, 0.0, 1.0)     # a convex mix of losses in [0, 1], up to rounding
+    U, ETA, V, _, TRADE = _adahedge_loop(top_loss, *HEDGE_SPLIT_LEARNERS["top"], with_trade=True)
+    W = np.concatenate([U[:, :1] * Wf, U[:, 1:] * Wr], axis=1)
+    played = np.full(T, 0.5)
+    played[1:] = (W[:-1] * loss[1:]).sum(axis=1)
+    SURPRISE = np.maximum(played - loss.min(axis=1), 0.0)
+    return W, ETA, V, SURPRISE, TRADE
+
+
+def hedge_group_weights(df: pd.DataFrame, atr_n: int, cost_bps: float = 0.0, sides: str = "both",
+                        cost_pts: float = 0.0) -> pd.DataFrame:
+    """The split ladder's top weights, bar by bar: columns `follow` and
+    `fade` (the share of the played weight on each group, summing to 1).
+    NaN until the learner is formed."""
+    W = hedge_weights(df, atr_n, "learned", cost_bps, "hedge_split", sides, cost_pts)
+    nf = len(HEDGE_SPLIT_FOLLOW)
+    g = pd.DataFrame({"follow": W[:, :nf].sum(axis=1), "fade": W[:, nf:].sum(axis=1)}, index=df.index)
+    g.iloc[:min(len(g), hedge_warmup(atr_n, "hedge_split"))] = np.nan
+    return g
 
 
 def _hedge_cached(df: pd.DataFrame, atr_n: int, mode: str, cost_bps: float, ladder: str = "hedge",
@@ -985,11 +1130,14 @@ def hedge_diagnostics(df: pd.DataFrame, atr_n: int, mode: str = "trend", cost_bp
                                                                cost_pts=cost_pts)
     experts = [e.label for e in hedge_ladder(mode, ladder)]
     idx = df.index
+    horizons = hedge_learner(ladder)[1]
+    if ladder in HEDGE_SPLIT and mode != "learned":
+        horizons = HEDGE_SPLIT_LEARNERS["follow" if mode == "trend" else "fade"][1]
     return {
         "weights": pd.DataFrame(W, index=idx, columns=experts),
         "loss": pd.DataFrame(loss, index=idx, columns=experts),
-        "eta": pd.DataFrame(ETA, index=idx, columns=list(HEDGE_HORIZONS)),
-        "horizon_weights": pd.DataFrame(V, index=idx, columns=list(HEDGE_HORIZONS)),
+        "eta": pd.DataFrame(ETA, index=idx, columns=list(horizons)),
+        "horizon_weights": pd.DataFrame(V, index=idx, columns=list(horizons)),
         "surprise": pd.Series(SURPRISE, index=idx),
         "trade_weight": pd.Series(TRADE, index=idx),
         "position": pd.Series(POSITION, index=idx),
@@ -1099,8 +1247,9 @@ REGIME_INDICATORS = {
 # --------------------------------------------------------------------------
 
 DIRECTION_LOGICS = ["trend", "countertrend", "learned"]
-CHANNEL_TYPES = ["donchian", "keltner", "bollinger", "hedge", "hedge_wide"]
-ENTRY_STYLES = ["stop", "close_confirm", "pullback"]
+CHANNEL_TYPES = ["donchian", "keltner", "bollinger", "hedge", "hedge_wide", "hedge_slow", "hedge_wide_slow",
+                 "hedge_split"]
+ENTRY_STYLES = ["stop", "close_confirm", "pullback", "stance"]
 EXIT_STYLES = ["channel", "atr_trail", "target_stop", "time_stop"]
 REGIME_INDICATOR_NAMES = list(REGIME_INDICATORS)
 REGIME_FILTERS = ["none", "trend_only", "range_only"]
@@ -1184,6 +1333,12 @@ class StrategyTemplate:
         assert self.sides in SIDES
         assert self.point_value > 0, "point_value must be positive"
         assert self.cost_per_unit >= 0 and self.margin_per_unit >= 0 and self.roll_cost_per_unit >= 0
+        if self.entry_style == "stance":
+            # the stance entry holds the learner's committee: it reads no
+            # filter and no fitted channel, so a switch it would ignore is refused
+            assert self.channel_type in HEDGE_CHANNELS, "the stance entry trades a hedge ladder's committee"
+            assert self.regime_filter == "none" and not self.vol_filter and self.bias_filter == "none", \
+                "the stance entry has no regime, vol or bias filter"
 
 
 # --------------------------------------------------------------------------
@@ -1355,10 +1510,10 @@ def _compute_indicators(df: pd.DataFrame, tpl: StrategyTemplate, dfkey=None) -> 
 # Backtest engine (single asset, bar-by-bar for correct stateful exits)
 # --------------------------------------------------------------------------
 
-ENTRY_CODES = {"stop": 0, "close_confirm": 1, "pullback": 2}
+ENTRY_CODES = {"stop": 0, "close_confirm": 1, "pullback": 2, "stance": 3}   # stance never reaches the bar loop (_stance_backtest)
 EXIT_CODES = {"channel": 0, "atr_trail": 1, "target_stop": 2, "time_stop": 3}
 REGIME_CODES = {"none": 0, "trend_only": 1, "range_only": 2}
-REASONS = ["stop", "channel", "midline", "target", "time", "stop_same_bar", "ruin"]
+REASONS = ["stop", "channel", "midline", "target", "time", "stop_same_bar", "ruin", "stance"]
 
 # The order log (backtest(..., log_orders=True)): what the loop had WORKING on
 # a bar and what it did on it, read out of the loop itself rather than rebuilt
@@ -2099,6 +2254,172 @@ def typical_units(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: float
     return float(qty) if np.isfinite(qty) else 0.0
 
 
+STANCE_STEPS = 4      # the 'stance' entry trades its committee's stance in quarters of a full size
+
+
+def hedge_stance(df: pd.DataFrame, atr_n: int, mode: str = "learned", cost_bps: float = 0.0,
+                 ladder: str = "hedge", sides: str = "both", cost_pts: float = 0.0) -> np.ndarray:
+    """Per-bar signed stance of the learner's committee at the close, in
+    [-1, 1]: the weighted experts' stances summed (weight times +1 long, -1
+    short, 0 flat), times the trade weight on a position-sized ladder (that
+    is `hedge_position`). This, not a break of the averaged channel, is what
+    the learner is scored on and what its regret bound is about. NaN until
+    the learner is formed."""
+    sides_s = hedge_scored_sides(ladder, sides)
+    if hedge_position_sized(ladder):
+        return hedge_position(df, atr_n, mode, cost_bps, ladder, sides, cost_pts)
+    W = hedge_weights(df, atr_n, mode, cost_bps, ladder, sides_s, cost_pts)
+    S, _, _ = _hedge_stances(df, atr_n, mode, ladder, sides_s)
+    p = np.clip((W * S).sum(axis=1), -1.0, 1.0)
+    p[:min(len(p), hedge_warmup(atr_n, ladder))] = np.nan
+    return p
+
+
+def _stance_backtest(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: float, first_trade_bar: int,
+                     log_orders: bool, fixed_capital: bool) -> dict:
+    """The `stance` entry style: hold the side of the learner's committee
+    (`hedge_stance`) instead of trading a break of its averaged channel.
+
+    The experts are scored on holding a stance for a while after a break;
+    the channel templates trade something else (a break of the weight-
+    averaged channel, then a channel, trail, target or time exit and a hard
+    ATR stop), and a planted edge shows the gap: a fade edge the committee
+    earns a Sharpe of 3 on is worth about 1 through the countertrend exits.
+    Here the template trades what the learner learned:
+
+    * the side is the sign of the committee's stance at the close of bar
+      i-1 (flat when it is exactly 0, or on a side `sides` forbids), and
+      the order goes at the open of bar i, so nothing is filled on
+      information of its own bar;
+    * the position is the stance, rounded to quarters (STANCE_STEPS), times
+      the risk or vol-target units of `backtest` (risk_pct at atr_mult_stop
+      ATRs, or vol_target) at the bar it changes, capped at max_leverage;
+      it is re-sized when the rounded stance moves (the trade is closed and
+      a new one opened, the cost charged on the units actually traded), so
+      the trade list holds one row per stretch of constant size;
+    * there is no stop, target or exit channel: the exit IS the learner
+      changing its mind, so exit_style and its parameters are inert.
+
+    Costs, point value, fixed capital, the returns and the instrument rules
+    follow `backtest`: on a future or spread (`margin_per_unit`) the leverage
+    cap is on margin and the vol target reads the volatility in price
+    points, `whole_units` floors every size, and a position held through a
+    `Roll` close pays `roll_cost_per_unit` (booked on the trade). Returns the
+    dict `backtest` returns; `orders` is an empty frame (no resting orders
+    exist)."""
+    validate_instrument(df, tpl)
+    n = len(df)
+    first_trade_bar = int(max(first_trade_bar, 0))
+    open_ = _to_arr(df["Open"]); close = _to_arr(df["Close"])
+    ind = _compute_indicators(df, tpl, _df_key(df, close))
+    ladder = hedge_ladder_for(tpl.channel_type)
+    cost_pts = float(tpl.cost_per_unit) / float(tpl.point_value)
+    mode = "learned" if tpl.direction_logic == "learned" else tpl.direction_logic
+    dfkey = _df_key(df, close)
+    p = _cached(df, ("hedge_stance", ladder, mode, tpl.atr_n, float(tpl.cost_bps), tpl.sides, cost_pts),
+                lambda: hedge_stance(df, tpl.atr_n, mode, tpl.cost_bps, ladder, tpl.sides, cost_pts), dfkey)
+    allow_long, allow_short = _allowed(tpl.sides)
+    # the target, a signed fraction of one full size in quarters: the stance
+    # moves a little every bar, and re-trading every wiggle would pay the
+    # spread for nothing; a quarter of the size is the smallest step traded
+    q = np.where(np.isnan(p), 0.0, np.round(p * STANCE_STEPS) / STANCE_STEPS)
+    q = np.where((q > 0) & ~allow_long, 0.0, q)
+    q = np.where((q < 0) & ~allow_short, 0.0, q)
+    ready = ind["ready"] & ~np.isnan(p)
+    atr_v = ind["atr"]; rvol = ind.get("rvol")
+    vol_target_bar = float(tpl.vol_target) / np.sqrt(periods_per_year()) if tpl.vol_target > 0 else 0.0
+    pv = float(tpl.point_value); cost_rate = tpl.cost_bps / 1e4
+    margin = float(tpl.margin_per_unit)
+    roll = (_to_arr(df["Roll"].fillna(0.0)) if "Roll" in df.columns and tpl.roll_cost_per_unit > 0
+            else np.zeros(n))
+    equity = np.full(n, float(initial_equity)); entries = np.zeros(n)
+    cash = float(initial_equity)
+    pos = 0; shares = 0.0; e_bar = -1; e_px = 0.0; e_cost = 0.0; trades = []
+
+    def close_trade(i, px, charge=True):
+        nonlocal cash, pos, shares
+        xc = (cost_rate * shares * pv * abs(px) + tpl.cost_per_unit * shares) if charge else 0.0
+        cash -= xc
+        pnl = pos * shares * pv * (px - e_px) - e_cost - xc
+        trades.append(dict(entry_date=df.index[e_bar], side=int(pos), entry_price=float(e_px), shares=float(shares),
+                           cost=float(e_cost + xc), exit_date=df.index[i], exit_price=float(px), reason="stance",
+                           pnl=float(pnl), bars_held=int(i - e_bar)))
+        pos = 0; shares = 0.0
+
+    level = 0.0                      # the quantised stance the position was sized for
+    for i in range(1, n):
+        # the open of bar i: the position marked from the last close, then the order
+        if pos != 0:
+            cash += pos * shares * pv * (open_[i] - close[i - 1])
+        if i < first_trade_bar:
+            want = 0.0
+        elif ready[i - 1]:
+            want = float(q[i - 1])
+        else:
+            want = level
+        if want != level:
+            new_side = int(np.sign(want))
+            qty = 0.0
+            if new_side != 0 and atr_v[i - 1] > 0 and (vol_target_bar <= 0 or (rvol is not None and rvol[i - 1] > 0)):
+                base = initial_equity if fixed_capital else cash
+                if vol_target_bar > 0:
+                    # rvol in price points on a margined instrument, else the pct vol
+                    unit_vol = rvol[i - 1] * pv if margin > 0 else rvol[i - 1] * abs(open_[i]) * pv
+                    qty = base * vol_target_bar / unit_vol if unit_vol > 0 else 0.0
+                else:
+                    qty = base * tpl.risk_pct / (tpl.atr_mult_stop * atr_v[i - 1] * pv)
+                qty *= abs(want)
+                basis = margin if margin > 0 else pv * abs(open_[i])   # the leverage cap's basis per unit
+                qty = min(qty, tpl.max_leverage * base / basis) if basis > 0 and base > 0 else 0.0
+                if tpl.whole_units:
+                    qty = float(np.floor(qty))
+            if new_side == pos and pos != 0 and qty == shares:
+                pass                                            # the same whole units: nothing to trade
+            elif new_side == pos and pos != 0 and qty > 0:
+                # same side, new size: the trade is closed and a new one opened at
+                # the open, charged on the units actually traded
+                d = abs(qty - shares)
+                c = cost_rate * d * pv * abs(open_[i]) + tpl.cost_per_unit * d
+                close_trade(i, open_[i], charge=False)
+                cash -= c
+                pos = new_side; shares = float(qty); e_bar = i; e_px = float(open_[i]); e_cost = c
+                entries[i] = 1.0
+            else:
+                if pos != 0:
+                    close_trade(i, open_[i])
+                if qty > 0:
+                    pos = new_side; shares = float(qty); e_bar = i; e_px = float(open_[i])
+                    e_cost = cost_rate * shares * pv * abs(e_px) + tpl.cost_per_unit * shares
+                    cash -= e_cost; entries[i] = 1.0
+            level = want if pos != 0 else 0.0
+        if pos != 0:
+            cash += pos * shares * pv * (close[i] - open_[i])
+            if roll[i] > 0.0 and tpl.roll_cost_per_unit > 0.0:
+                rc = tpl.roll_cost_per_unit * shares * roll[i]    # held through a roll at this close
+                cash -= rc
+                e_cost += rc
+        equity[i] = cash
+    rets = np.zeros(n)
+    if fixed_capital:
+        rets[1:] = np.diff(equity) / float(initial_equity)
+    else:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            rets[1:] = np.where(equity[:-1] > 0.0, equity[1:] / equity[:-1] - 1.0, 0.0)
+    idx = df.index
+    open_position = None
+    if pos != 0:
+        open_position = dict(side=int(pos), shares=float(shares), entry_price=float(e_px), entry_bar=int(e_bar),
+                             entry_date=pd.Timestamp(idx[e_bar]), entry_cost=float(e_cost), hard_stop=np.nan,
+                             target=np.nan, trail_extreme=np.nan, bars_held=int(n - 1 - e_bar),
+                             unrealized=float(pos * shares * pv * (close[-1] - e_px)), is_trend=True)
+    pnls = np.array([t["pnl"] for t in trades]); held = np.array([t["bars_held"] for t in trades], dtype=float)
+    stats = performance_stats(equity, trades, initial_equity, rets, pnls, held)
+    orders = _orders_frame(np.zeros((0, 4), dtype=np.int64), np.zeros((0, 3)), idx.to_numpy()) if log_orders else None
+    return {"equity": pd.Series(equity, index=idx), "returns": pd.Series(rets, index=idx), "entries": entries,
+            "trades": trades, "stats": stats, "open_position": open_position, "pending_order": None,
+            "last_atr": float(atr_v[-1]) if n else np.nan, "indicators": ind, "orders": orders}
+
+
 def backtest(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: float = 100_000.0,
              first_trade_bar: int = 0, log_orders: bool = False, fixed_capital: bool = False) -> dict:
     """Run `tpl` over `df` (must have Open/High/Low/Close). Returns a dict:
@@ -2128,6 +2449,8 @@ def backtest(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: float = 10
     works on price differences, and adding a constant to every price leaves
     the trades, the P&L and the equity unchanged.
     """
+    if tpl.entry_style == "stance":
+        return _stance_backtest(df, tpl, initial_equity, first_trade_bar, log_orders, fixed_capital)
     n = len(df)
     first_trade_bar = int(max(first_trade_bar, 0))
     validate_instrument(df, tpl)

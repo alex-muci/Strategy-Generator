@@ -101,10 +101,80 @@ FAMILIES = {
         bias_filters=["none"],
         sides=["both"],
     ),
+    # the same two families on the slow ladders: the same experts, a learner
+    # with a three-year memory (strategy.HEDGE_SLOW_MEMORY), for real series
+    # whose experts' edges are too small for the fast learner to tell apart
+    "online_slow": dict(
+        direction_logics=DIRECTION_LOGICS,
+        channel_types=["hedge_slow"],
+        entry_styles=["stop", "close_confirm"],
+        exit_styles=EXIT_STYLES,
+        regimes=[("er", "none"), ("er", "trend_only"), ("er", "range_only"),
+                 ("vr", "trend_only"), ("vr", "range_only"), ("chop", "range_only")],
+        vol_filters=[False],
+        bias_filters=["none", "sma"],
+        sides=["both"],
+    ),
+    "online_wide_slow": dict(
+        direction_logics=["learned"],
+        channel_types=["hedge_wide_slow"],
+        entry_styles=["stop", "close_confirm"],
+        exit_styles=EXIT_STYLES,
+        regimes=[("er", "none")],
+        vol_filters=[False],
+        bias_filters=["none"],
+        sides=["both"],
+    ),
+    # the learner's committee traded directly (entry_style 'stance': hold its
+    # side, sized by its stance, no channel break, stop or exit rule), on the
+    # slow ladders; follow-only and learned, nothing to fit
+    "online_stance": dict(
+        direction_logics=["trend", "learned"],
+        channel_types=["hedge_slow", "hedge_wide_slow"],
+        entry_styles=["stance"],
+        exit_styles=["channel"],
+        regimes=[("er", "none")],
+        vol_filters=[False],
+        bias_filters=["none"],
+        sides=["both"],
+    ),
+    # every hedge ladder in one family, with what the real-data study kept:
+    # fast and slow memory, plain and wide ladder, the trend and learned
+    # directions (countertrend lost on every real series), no regime or bias
+    # filter (the learner is the filter), both sides and long-only
+    "online_core": dict(
+        direction_logics=["trend", "learned"],
+        channel_types=["hedge", "hedge_wide", "hedge_slow", "hedge_wide_slow"],
+        entry_styles=["stop", "close_confirm"],
+        exit_styles=EXIT_STYLES,
+        regimes=[("er", "none")],
+        vol_filters=[False],
+        bias_filters=["none"],
+        sides=["both", "long_only"],
+    ),
+    # the split ladder (strategy.HEDGE_SPLIT): a follow group of 20-80 bar
+    # breaks held as long as their lookback under a slow learner, a fade group
+    # of 5-20 bar breaks held 1 or 3 bars under a fast one, and a top learner
+    # between the two; every direction (countertrend is the fade group alone),
+    # the break entries and the committee traded directly ('stance', whose
+    # exit is the learner, so one template rather than one per exit style)
+    "online_split": dict(
+        direction_logics=DIRECTION_LOGICS,
+        channel_types=["hedge_split"],
+        entry_styles=["stop", "close_confirm", "stance"],
+        exit_styles=EXIT_STYLES,
+        regimes=[("er", "none")],
+        vol_filters=[False],
+        bias_filters=["none"],
+        sides=["both"],
+    ),
     "full": dict(
         direction_logics=DIRECTION_LOGICS,
-        channel_types=CHANNEL_TYPES,
-        entry_styles=ENTRY_STYLES,
+        # the slow ladders are the fast ones' experts with a longer memory, so
+        # they have their own families rather than doubling the hedge part of
+        # this one; the split ladder needs more warm-up than a short test series has
+        channel_types=[c for c in CHANNEL_TYPES if not c.endswith("_slow") and c != "hedge_split"],
+        entry_styles=[e for e in ENTRY_STYLES if e != "stance"],
         exit_styles=EXIT_STYLES,
         regimes=_ALL_REGIMES,
         vol_filters=VOL_FILTERS,
@@ -120,7 +190,8 @@ FAMILIES = {
 _SHORT = {
     "trend": "TR", "countertrend": "CT", "learned": "LN",
     "donchian": "don", "keltner": "kel", "bollinger": "bol", "hedge": "hdg", "hedge_wide": "hdw",
-    "stop": "stop", "close_confirm": "cls", "pullback": "pb",
+    "hedge_slow": "hds", "hedge_wide_slow": "hws", "hedge_split": "hsp",
+    "stop": "stop", "close_confirm": "cls", "pullback": "pb", "stance": "stance",
     "channel": "chan", "atr_trail": "trail", "target_stop": "tgt", "time_stop": "time",
     "none": "none", "trend_only": "trend", "range_only": "range",
     "sma": "sma",
@@ -156,6 +227,8 @@ def generate_templates(
     for dl, ch, es, ex, (rind, rf), vf, bf, sd in combos:
         if rf == "none":
             rind = "er"  # canonical: indicator is irrelevant without a filter
+        if es == "stance":
+            ex = "channel"  # canonical: the stance entry has no exit rule, the learner is its exit
         key = (dl, ch, es, ex, rind, rf, vf, bf, sd)
         if key in seen:
             continue
