@@ -25,7 +25,7 @@ python -m venv env  # assuming 3.12 installed
 ./env/Script/Activate
 pip install -r requirements.txt 
 
-python -m unittest discover -s tests -t . -v # 434 tests (engine, exit ordering, order log, templates, hedge learner and its wide ladder, walk-forward, robustness, selection, data, live signals, replay, both entry points, spreads: shift invariance, point value, per-unit and roll costs, margin cap, ruin, whole units, the ETF trick, a mixed cash + spread book)
+python -m unittest discover -s tests -t . -v # 436 tests (engine, exit ordering, order log, templates, hedge learner and its wide ladder, walk-forward, robustness, selection, data, live signals, replay, both entry points, spreads: shift invariance, point value, per-unit and roll costs, margin cap, ruin, whole units, the ETF trick, a mixed cash + spread book)
 # faster: pip install -r requirements-dev.txt, then, with ./env active,
 python -m pytest -n auto --dist loadscope   # in parallel; loadscope keeps a class (and its one-off setup) on one worker
 python -m pytest -m slow                    # the minutes-long live-order sweeps pytest skips by default

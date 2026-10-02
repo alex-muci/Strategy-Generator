@@ -378,6 +378,53 @@ class RunReplayTests(unittest.TestCase):
         finally:
             shutil.rmtree(copy, ignore_errors=True)
 
+    def test_naive_runs_stay_naive(self):
+        self.assertIsNone(self.loaded["df"].index.tz)
+        self.assertIsNone(self.loaded["manifest"]["boundaries"][0].tz)
+        self.assertIsNone(self.loaded["portfolio_returns"].index.tz)
+        self.assertIsNone(self.loaded["selected_returns"].index.tz)
+
+    def test_tz_aware_runs_are_read_in_utc(self):
+        """A run whose bars were stamped in New York (offsets -05:00 and
+        -04:00 across DST, which parse to plain objects unless read as UTC)
+        loads with UTC stamps everywhere and replays exactly."""
+        zone = "America/New_York"
+        copy = tempfile.mkdtemp(prefix="replay-tz-")
+        try:
+            for f in (R.DATA_FILE, R.PORTFOLIO_RETURNS, R.SELECTED_RETURNS):
+                d = pd.read_csv(os.path.join(self.dir, f), index_col=0, parse_dates=True,
+                                float_precision="round_trip")
+                d.index = d.index.tz_localize(zone)
+                d.to_csv(os.path.join(copy, f), float_format="%.17g",
+                         index_label=None if f == R.DATA_FILE else "date")
+            with open(os.path.join(self.dir, R.MANIFEST), encoding="utf-8") as f:
+                m = json.load(f)
+            aware = lambda x: pd.Timestamp(x).tz_localize(zone).isoformat()
+            for spec in m["templates"].values():
+                for w in spec["windows"]:
+                    for k in ("train_start", "train_end", "test_start", "test_end"):
+                        w[k] = aware(w[k])
+            for sel in m["nested"]["selections"]:
+                sel["period_start"] = aware(sel["period_start"])
+            m["boundaries"] = [aware(b) for b in m["boundaries"]]
+            m["data"]["first"], m["data"]["last"] = aware(m["data"]["first"]), aware(m["data"]["last"])
+            with open(os.path.join(copy, R.MANIFEST), "w", encoding="utf-8") as f:
+                json.dump(m, f)
+            run = R.load_run(copy)
+            want = self.loaded["df"].index.tz_localize(zone).tz_convert("UTC")
+            self.assertEqual(str(run["df"].index.tz), "UTC")
+            self.assertTrue(run["df"].index.equals(want))
+            pd.testing.assert_frame_equal(run["df"].reset_index(drop=True),
+                                          self.loaded["df"].reset_index(drop=True), check_exact=True)
+            self.assertEqual(str(run["manifest"]["boundaries"][0].tz), "UTC")
+            self.assertEqual(str(run["portfolio_returns"].index.tz), "UTC")
+            self.assertEqual(str(run["selected_returns"].index.tz), "UTC")
+            for which, r in _quiet(R.replay_run, copy, "all").items():
+                self.assertTrue(r["check"]["ok"], (which, r["check"]))
+                self.assertEqual(r["check"]["max_abs_return_diff"], 0.0, which)
+        finally:
+            shutil.rmtree(copy, ignore_errors=True)
+
 
 class EmptyPortfolioTests(unittest.TestCase):
     """Nothing qualifies: the static portfolio is empty and the nested one
