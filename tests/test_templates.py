@@ -67,8 +67,9 @@ PERTURB = {
 
 def _family_size(spec: dict) -> int:
     regimes = {("er", rf) if rf == "none" else (ri, rf) for ri, rf in spec["regimes"]}
-    return (len(spec["direction_logics"]) * len(spec["channel_types"]) * len(spec["entry_styles"])
-            * len(spec["exit_styles"]) * len(regimes) * len(spec["vol_filters"]) * len(spec["bias_filters"])
+    # a stance entry has one canonical exit (see generate_templates)
+    entries_exits = sum(1 if es == "stance" else len(spec["exit_styles"]) for es in spec["entry_styles"])
+    return (len(spec["direction_logics"]) * len(spec["channel_types"]) * entries_exits * len(regimes) * len(spec["vol_filters"]) * len(spec["bias_filters"])
             * len(spec.get("sides", ["both"])))
 
 

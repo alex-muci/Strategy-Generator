@@ -174,3 +174,58 @@ test on other assets, not a result.
   assets (futures across sectors) and longer history, with the families run
   as a multi-asset book. Pooling the learner across assets is the natural
   next step for the hedge (section 2).
+
+## 5. Split ladder: short-hold fades, long follows, a top learner
+
+Hypothesis (Alex): mean reversion pays on shorter horizons than trend, even
+on SPY (the 2020 crash and rebound, the 2025 tariff shock), so the fade
+experts should hold for days, not for their lookback, and should be
+learned separately from the follow experts. `hedge_split` does that (see the
+README): a follow group (20-80 bar breaks, held for their lookback, slow
+learner), a fade group (5-20 bar breaks, held 1 or 3 bars, fast learner),
+and a top learner (lifetimes 10-40) between the two committees.
+
+**It does what it is built to do.** On a series with a planted switch
+from trend to mean reversion and back (`regime_series`, 1000 bars each),
+the fade share of the weight moves from under 0.3 to about 0.9 inside the
+mean-reverting stretch, within 0-27 bars of the switch, and back. On AR(1)
+returns the fade share rises monotonically as the autocorrelation goes from
++0.4 (0.37) to -0.4 (0.61).
+
+**On the daily ETFs it does not add anything.** Committee P&L from 2019
+(stance x next close-to-close return, 5 bps on turnover), Sharpe:
+
+| | SPY | TLT | GLD | USO | avg |
+|---|---|---|---|---|---|
+| follow group alone | 0.13 | 0.02 | 0.34 | 0.47 | 0.24 |
+| fade group alone | -0.15 | -0.10 | -0.39 | -0.39 | -0.26 |
+| fixed 50/50 | 0.06 | 0.01 | 0.13 | 0.27 | 0.12 |
+| top learner (shipped, 10-40) | -0.42 | 0.10 | 0.41 | 0.65 | 0.18 |
+| top learner, slower (20-80) | -0.33 | 0.02 | 0.35 | 0.61 | 0.16 |
+| buy and hold | 0.88 | -0.11 | 0.92 | 0.38 | |
+
+The top learner beats a fixed mix and beats following alone on GLD and USO,
+by moving out of the follow group in episodes it is losing, but it is badly
+anti-timed on SPY: in Feb-Jun 2020 the fade group made +4.7 % and the
+follow group lost 1.8 %, and the switching committee lost 19.6 %. The
+reversal episodes on SPY are shorter than the lag of any learner fast enough
+to follow them; that is the core problem with recognising short regimes from
+their own P&L.
+
+Walk-forward, `online_split`, median template OOS Sharpe by direction (stance
+entry / break entries):
+
+| | two-sided avg | long-only avg |
+|---|---|---|
+| trend (follow group) | 0.17 / 0.14 | 0.39 / 0.36 |
+| learned (all three learners) | 0.16 / 0.15 | 0.31 / 0.25 |
+| countertrend (fade group) | -0.47 / -0.27 | 0.02 / 0.14 |
+
+Nested portfolio, long-only: SPY 0.04, TLT -0.79, GLD 0.75, USO 0.49 (buy
+and hold 0.81, -0.09, 0.85, 0.33). Daily bars carry no short-hold fade edge
+on these four assets (section 4 of the thread: fixed fade rules lose at
+every hold from 1 to 40 bars after costs), so a learner cannot find one;
+the design is for data that has one (intraday bars, a calendar spread).
+One execution caveat there: the experts are scored close to close, the
+stance entry fills at the next open, so a 1-bar fade whose edge is in the
+overnight gap is scored on returns the template cannot earn.
