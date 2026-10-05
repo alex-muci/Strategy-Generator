@@ -29,6 +29,16 @@ from strategy import (  # noqa: E402
     sma, atr,
 )
 from generator import generate_templates, param_grid_for  # noqa: E402
+
+# the online family as it was before the redesign (every direction on the plain ladder, six regime
+# filters, an SMA bias or none): the tests below check the plain ladder through it
+OLD_ONLINE = dict(
+    direction_logics=["trend", "countertrend", "learned"], channel_types=["hedge"],
+    entry_styles=["stop", "close_confirm"],
+    regimes=[("er", "none"), ("er", "trend_only"), ("er", "range_only"),
+             ("vr", "trend_only"), ("vr", "range_only"), ("chop", "range_only")],
+    bias_filters=["none", "sma"],
+)
 from walkforward import (  # noqa: E402
     walk_forward, grid_combos, smooth_scores, warmup_bars, summarize_walk_forward,
 )
@@ -552,11 +562,11 @@ class HedgeChannelTests(unittest.TestCase):
         self.assertTrue((lo.to_numpy()[warm:] >= los.min(axis=1) - 1e-9).all())
 
     def test_no_lookback_in_the_grid(self):
-        for tpl in generate_templates("online"):
+        for tpl in generate_templates("online", **OLD_ONLINE):
             grid = param_grid_for(tpl)
             for key in ("n_entry", "n_exit", "channel_k"):
                 self.assertNotIn(key, grid, tpl.name)
-        tpl = generate_templates("online")[0]
+        tpl = generate_templates("online", **OLD_ONLINE)[0]
         self.assertEqual(param_grid_for(tpl), {})
         res = walk_forward(self.df, tpl, param_grid_for(tpl), train_bars=400, test_bars=100)
         self.assertEqual(len(res["oos_returns"]), len(self.df) - 400)
@@ -979,7 +989,8 @@ class WideLadderTests(unittest.TestCase):
             np.testing.assert_array_equal(wide, hedge_direction(df, 20, 5.0, "hedge_wide", sd))
         # the family: the learned direction over the wide ladder, two entries by four
         # exits, and nothing stacked on top of the learner
-        fam = generate_templates("online_wide")
+        fam = generate_templates("online", direction_logics=["learned"], channel_types=["hedge_wide"],
+                                 entry_styles=["stop", "close_confirm"])
         self.assertEqual(len(fam), 8)
         self.assertEqual({t.direction_logic for t in fam}, {"learned"})
         self.assertEqual({t.channel_type for t in fam}, {"hedge_wide"})
@@ -1328,7 +1339,9 @@ class SplitLadderTests(unittest.TestCase):
                 part = backtest(df.iloc[:1300], tpl, fixed_capital=True)
                 np.testing.assert_allclose(full["equity"].to_numpy()[:1300], part["equity"].to_numpy(), atol=1e-8)
                 self.assertTrue(all(df.index.get_loc(t["entry_date"]) > warm for t in full["trades"]))
-        names = [t.name for t in generate_templates("online_split")]
+        names = [t.name for t in generate_templates(
+            "online", direction_logics=["trend", "countertrend", "learned"],
+            entry_styles=["stop", "close_confirm", "stance"])]
         self.assertEqual(len(names), 27)
         self.assertEqual(sum("-stance-" in n for n in names), 3)
         self.assertFalse(any(t.channel_type == "hedge_split" for t in generate_templates("full")))

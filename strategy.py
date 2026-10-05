@@ -1228,6 +1228,571 @@ def hedge_channel(df: pd.DataFrame, atr_n: int, mode: str = "trend", scale: floa
     return upper, lower, (upper + lower) / 2
 
 
+# --------------------------------------------------------------------------
+# The forecast channels: an online-learned trend + reversion forecaster
+# --------------------------------------------------------------------------
+# The hedge ladders learn WHICH expert to follow. The forecast channels ask
+# the smaller question the data can actually answer, and trade the answer as
+# a position: how much do I expect the next bar to move, in units of its own
+# volatility, and is that worth holding?
+#
+# Why not learn more. Online learning cannot create an edge; it can only size
+# and switch between edges, and what it can learn is limited by the signal to
+# noise: a coefficient's standard error over N_eff bars is ~1/sqrt(N_eff), so
+# a forecaster with a per-bar IC of 0.02 (a daily trend) needs ~10,000 bars to
+# tell it from zero, one with an IC of 0.10 (a calendar spread's reversion)
+# ~400. So the forecaster takes the literature's slow trend as a strong PRIOR
+# that the data can only slowly argue with (SLOW, B_TREND, LAMBDA_SLOW), and
+# learns freely only the fast-scale behaviour (FAST: reversion on a spread,
+# short-term momentum, or nothing) where the SNR can be high. Indicators are
+# combined with EQUAL weights inside a band (forecast-combination puzzle:
+# Rapach-Strauss-Zhou 2010; Carver; Schmidhuber 2021), never fitted one by one.
+#
+#   * features : the Schmidhuber (2021) trend kernel, phi_T(t) = sum_{k=0..3T}
+#                w_T(k) (C[t-k] - C[t-k-1]) / sigma_t with w_T(k) = (k+1)
+#                exp(-2k/T), scaled so that sum w^2 = 1 (unit variance on a
+#                random walk: phi is a t-statistic), clipped to +-2.5. SLOW
+#                is the mean of phi_T over SLOW_SCALES (16..128), FAST the
+#                mean over FAST_SCALES (4, 8); each composite is clipped to
+#                +-2. No further normalisation: phi is already a unit-variance
+#                t-statistic on a random walk, and a trailing RMS would only
+#                add NORM_N - 1 bars of warm-up.
+#                Why a kernel: every trend indicator is a linear kernel on
+#                the past returns (Levine & Pedersen 2016), and the ones that
+#                put full weight on the latest return (price minus a moving
+#                average, an n-bar change, a Donchian position) churn: today's
+#                return moves them, and the position, by a large step every
+#                bar. Schmidhuber's (k+1) e^(-2k/T) rises from a small weight
+#                at lag 0, so a day's return moves it little. Measured on
+#                SPY / TLT / GLD / USO the position of the five-indicator
+#                composite this replaced turned over ~0.10 of a full size per
+#                bar, the kernel's ~0.02, and a cost of 5 bp a side eats most
+#                of an edge worth a Sharpe of 0.3 at the first rate.
+#                The technical indicators (ER, |CTI|, chop, VR, MMI, Hurst)
+#                stay where they are informative, in the context R.
+#                Everything is built on price DIFFERENCES (and on the std of
+#                differences, sigma), so a spread that crosses zero, or a
+#                series with a constant added, gives the same features.
+#   * context  : `forecast_ctx` adds R, the mean percentile rank (over
+#                NORM_N bars, in (-1, 1)) of six trendiness indicators (ER,
+#                |CTI|, 100 - chop, VR, 100 - MMI, Hurst), and the products
+#                SLOW*R and FAST*R: how much to trust each band in the
+#                current regime. ADX is left out: its Wilder smoothing is
+#                recursive and never exact.
+#   * target   : y_t = (O[t+2] - O[t+1]) / sigma_t, clipped to +-4: what the
+#                stance engine earns on a position decided at the close of t
+#                (filled at the open of t+1, held to the open of t+2). The
+#                forecast at bar t may use only the pairs (x_s, y_s) with
+#                s <= t - 2, the last of which is known at the open of t.
+#   * learner  : a discounted ridge regression toward the prior, recomputed
+#                every bar over the last FC_MEMORY pairs with weights
+#                gamma^k (gamma = 1 - 1/FC_HORIZON): the coefficients with an
+#                infinite precision stay AT their prior (and their share of
+#                the forecast is taken off y before the rest is fitted).
+#                The fast and interaction coefficients have a prior precision
+#                LAMBDA_FAST = 2500 pseudo-bars, a prior sd of 1/sqrt(2500) =
+#                0.02: the trend prior's own scale. With the gain sqrt(periods
+#                per year) / SR_FULL ~ 40 from forecast to position, a
+#                coefficient's posterior noise IS position noise (a beta of
+#                0.02 on a feature of size 1 is already a full size), so the
+#                prior must be about as tight as the effects expected on daily
+#                data. A spread's reversion (IC ~0.1-0.15, a beta several
+#                times that) still overcomes it within a few hundred bars.
+#   * position : p_t = clip(f_t sqrt(periods_per_year) / SR_FULL, -1, 1), a
+#                forecast implying an annual Sharpe of SR_FULL being a full
+#                vol-target size (fractional Kelly). The stance engine holds
+#                it with a no-trade buffer (FC_BUFFER, Carver) instead of the
+#                hedge stance's quarters.
+#
+# Every number at bar t is an exact function of a fixed number of past bars
+# (rolling windows computed window by window, as `_window_mean` does: pandas'
+# running sums drift with the start of the series), so `forecast_warmup` bars
+# of history reproduce a full-history run to the last digits, which the
+# walk-forward's warm-up buffer relies on. The one exception is the buffer's
+# held level, a clamp of the target that remembers where it was: two runs
+# started apart agree again the first time the target moves out of the band
+# of both, and `walkforward.warmup_bars` adds FC_SETTLE bars for that.
+
+FORECAST_CHANNELS = ("forecast", "forecast_ctx")
+SIGMA_N = 60                       # bars of close differences in the volatility
+FAST_SCALES = (4, 8)               # speeds below 8-16 bars have decayed as trend signals since 2009 (arXiv 2607.01550)
+SLOW_SCALES = (16, 32, 64, 128)
+NORM_N = 250                       # trailing window of the RMS and the percentile ranks
+FC_MEMORY = 500                    # pairs the ridge looks at
+FC_HORIZON = 250                   # lifetime of the discount, gamma = 1 - 1/FC_HORIZON
+B_TREND = 0.02                     # prior trend coefficient: IC ~0.02, an annual Sharpe of ~0.3 (the per-asset literature)
+LAMBDA_SLOW = 1000.0               # prior precisions, in pseudo-bars
+LAMBDA_FAST = 2500.0              # prior sd 0.02 for a fast or interaction coefficient (see the learner note above)
+SR_FULL = 0.4                      # the annual Sharpe a forecast must imply to be held at a full size
+FC_BUFFER = 0.1                    # no-trade band around the held level, in full sizes
+FC_SETTLE = 100                    # extra bars for the buffer's held level to forget its start (see above)
+MMI_N = 100
+HURST_N = 100
+HURST_QMAX = 10
+KERNEL_CLIP = 2.5
+
+
+def _fc_sigma_loop(c, n):
+    """Std (ddof 1) of the close differences over the n bars ending at t,
+    every window on its own. NaN before the first full window (n + 1 closes)
+    and where the std is not positive."""
+    T = c.shape[0]
+    out = np.full(T, np.nan)
+    for t in range(n, T):
+        m = 0.0
+        for j in range(t - n + 1, t + 1):
+            m += c[j] - c[j - 1]
+        m /= n
+        v = 0.0
+        for j in range(t - n + 1, t + 1):
+            d = c[j] - c[j - 1] - m
+            v += d * d
+        v /= (n - 1)
+        if v > 0.0:
+            out[t] = np.sqrt(v)
+    return out
+
+
+def _fc_cti_loop(c, n, start):
+    """Pearson correlation of the n closes ending at t with time, each window
+    from its own centred sums (0 where either variance is 0). NaN before bar
+    `start`."""
+    T = c.shape[0]
+    out = np.full(T, np.nan)
+    xbar = (n - 1) / 2.0
+    sxx = 0.0
+    for k in range(n):
+        sxx += (k - xbar) * (k - xbar)
+    for t in range(max(start, n - 1), T):
+        ybar = 0.0
+        for k in range(n):
+            ybar += c[t - n + 1 + k]
+        ybar /= n
+        sxy = 0.0
+        syy = 0.0
+        for k in range(n):
+            dy = c[t - n + 1 + k] - ybar
+            sxy += (k - xbar) * dy
+            syy += dy * dy
+        den = np.sqrt(sxx * syy)
+        out[t] = sxy / den if den > 0.0 else 0.0
+    return out
+
+
+def _fc_kernel_loop(c, sig, T):
+    """Schmidhuber's trend kernel at scale T (see the module comment): the
+    lag-k difference weighted by (k+1) exp(-2k/T) / norm for k = 0..3T, over
+    sigma_t, clipped to +-KERNEL_CLIP. Each bar is its own sum, in order. NaN
+    until the 3T + 1 differences and sigma are formed."""
+    n = c.shape[0]
+    out = np.full(n, np.nan)
+    L = int(3 * T)
+    w = np.empty(L + 1)
+    ss = 0.0
+    for k in range(L + 1):
+        w[k] = (k + 1.0) * np.exp(-2.0 * k / T)
+        ss += w[k] * w[k]
+    nrm = np.sqrt(ss)
+    for t in range(max(L + 1, SIGMA_N), n):
+        sg = sig[t]
+        if not sg > 0.0:
+            continue
+        a = 0.0
+        for k in range(L + 1):
+            a += w[k] * (c[t - k] - c[t - k - 1])
+        v = a / nrm / sg
+        out[t] = min(KERNEL_CLIP, max(-KERNEL_CLIP, v))
+    return out
+
+
+def _fc_rank_loop(x, n):
+    """Percentile rank of x[t] among the n values ending at t (ties count
+    half), mapped to (-1, 1); NaN until n formed values."""
+    T = x.shape[0]
+    out = np.full(T, np.nan)
+    for t in range(n - 1, T):
+        less = 0.0
+        eq = 0.0
+        ok = True
+        for j in range(t - n + 1, t + 1):
+            if np.isnan(x[j]):
+                ok = False
+                break
+            if x[j] < x[t]:
+                less += 1.0
+            elif x[j] == x[t]:
+                eq += 1.0
+        if ok:
+            out[t] = 2.0 * (less + 0.5 * eq) / n - 1.0
+    return out
+
+
+def _fc_regime_loop(h, l, c, which, n):
+    """The exact-window trendiness indicators of the context, oriented higher
+    = more trending: 0 ER, 1 |CTI|, 2 100 - chop, 3 variance ratio (on
+    differences, q = 5), 4 100 - MMI, 5 Hurst. NaN where undefined."""
+    T = c.shape[0]
+    out = np.full(T, np.nan)
+    if which == 1:
+        return np.abs(_fc_cti_loop(c, n, 0))
+    if which == 0:
+        for t in range(n, T):
+            ab = 0.0
+            for j in range(t - n + 1, t + 1):
+                ab += abs(c[j] - c[j - 1])
+            if ab > 0.0:
+                out[t] = min(1.0, abs(c[t] - c[t - n]) / ab)
+    elif which == 2:
+        lg = np.log10(float(n))
+        for t in range(n, T):
+            tr = 0.0
+            hh = h[t]
+            ll = l[t]
+            for j in range(t - n + 1, t + 1):
+                tr += max(h[j] - l[j], max(abs(h[j] - c[j - 1]), abs(l[j] - c[j - 1])))
+                if h[j] > hh:
+                    hh = h[j]
+                if l[j] < ll:
+                    ll = l[j]
+            if hh - ll > 0.0 and tr > 0.0:
+                ci = 100.0 * np.log10(tr / (hh - ll)) / lg
+                out[t] = 100.0 - min(100.0, max(0.0, ci))
+    elif which == 3:
+        q = 5
+        for t in range(n + q - 1, T):
+            m1 = 0.0
+            mq = 0.0
+            for j in range(t - n + 1, t + 1):
+                m1 += c[j] - c[j - 1]
+                mq += c[j] - c[j - q]
+            m1 /= n
+            mq /= n
+            v1 = 0.0
+            vq = 0.0
+            for j in range(t - n + 1, t + 1):
+                d1 = c[j] - c[j - 1] - m1
+                dq = c[j] - c[j - q] - mq
+                v1 += d1 * d1
+                vq += dq * dq
+            if v1 > 0.0:
+                out[t] = min(5.0, max(0.0, vq / (q * v1)))
+    elif which == 4:
+        w = np.empty(n)
+        for t in range(n, T):
+            for k in range(n):
+                w[k] = c[t - n + 1 + k] - c[t - n + k]
+            med = np.median(w)
+            cnt = 0
+            for k in range(1, n):
+                if (w[k] > med and w[k] > w[k - 1]) or (w[k] < med and w[k] < w[k - 1]):
+                    cnt += 1
+            out[t] = 100.0 - 100.0 * cnt / (n - 1.0)
+    else:
+        qm = HURST_QMAX
+        lq = np.empty(qm)
+        for q in range(1, qm + 1):
+            lq[q - 1] = np.log(float(q))
+        lbar = 0.0
+        for q in range(qm):
+            lbar += lq[q]
+        lbar /= qm
+        sll = 0.0
+        for q in range(qm):
+            sll += (lq[q] - lbar) * (lq[q] - lbar)
+        lv = np.empty(qm)
+        for t in range(n + qm - 1, T):
+            ok = True
+            for q in range(1, qm + 1):
+                m = 0.0
+                for j in range(t - n + 1, t + 1):
+                    m += c[j] - c[j - q]
+                m /= n
+                v = 0.0
+                for j in range(t - n + 1, t + 1):
+                    d = c[j] - c[j - q] - m
+                    v += d * d
+                v /= n
+                if v > 0.0:
+                    lv[q - 1] = np.log(v)
+                else:
+                    ok = False
+                    break
+            if ok:
+                vbar = 0.0
+                for q in range(qm):
+                    vbar += lv[q]
+                vbar /= qm
+                sl = 0.0
+                for q in range(qm):
+                    sl += (lq[q] - lbar) * (lv[q] - vbar)
+                out[t] = sl / sll / 2.0
+    return out
+
+
+def _fc_ridge_loop(X, y, beta0, prec, t_first, mem, gamma):
+    """Per bar t >= t_first: the discounted ridge over the pairs s = t-2 ..
+    t-1-mem (weights gamma^k, k = 0 for s = t-2) of the coefficients whose
+    precision is finite, toward beta0; the others stay at beta0 and their
+    share of the forecast is taken off y. Returns the coefficients (T, d) and
+    the forecast f = beta . x (NaN before t_first or where x is not formed)."""
+    T, d = X.shape
+    beta = np.full((T, d), np.nan)
+    f = np.full(T, np.nan)
+    free = np.empty(d, dtype=np.int64)
+    nf = 0
+    for j in range(d):
+        if np.isfinite(prec[j]):
+            free[nf] = j
+            nf += 1
+    A = np.empty((nf, nf + 1))
+    sol = np.zeros(nf + 1)
+    for t in range(t_first, T):
+        if np.isnan(X[t, 0]):
+            continue
+        for a in range(nf):
+            for b in range(nf + 1):
+                A[a, b] = 0.0
+            A[a, a] = prec[free[a]]
+            A[a, nf] = prec[free[a]] * beta0[free[a]]
+        w = 1.0
+        for k in range(mem):
+            s = t - 2 - k
+            if s < 0:
+                break
+            ok = not np.isnan(y[s])
+            if ok:
+                for j in range(d):
+                    if np.isnan(X[s, j]):
+                        ok = False
+                        break
+            if ok:
+                r = y[s]
+                for j in range(d):
+                    if not np.isfinite(prec[j]):
+                        r -= beta0[j] * X[s, j]
+                for a in range(nf):
+                    xa = w * X[s, free[a]]
+                    for b in range(nf):
+                        A[a, b] += xa * X[s, free[b]]
+                    A[a, nf] += xa * r
+            w *= gamma
+        # Gaussian elimination with partial pivoting (the system is symmetric positive definite)
+        for col in range(nf):
+            piv = col
+            for r_ in range(col + 1, nf):
+                if abs(A[r_, col]) > abs(A[piv, col]):
+                    piv = r_
+            if piv != col:
+                for b in range(nf + 1):
+                    tmp = A[col, b]
+                    A[col, b] = A[piv, b]
+                    A[piv, b] = tmp
+            for r_ in range(col + 1, nf):
+                fac = A[r_, col] / A[col, col]
+                for b in range(col, nf + 1):
+                    A[r_, b] -= fac * A[col, b]
+        for a in range(nf - 1, -1, -1):
+            v = A[a, nf]
+            for b in range(a + 1, nf):
+                v -= A[a, b] * sol[b]
+            sol[a] = v / A[a, a]
+        for j in range(d):
+            beta[t, j] = beta0[j]
+        for a in range(nf):
+            beta[t, free[a]] = sol[a]
+        fv = 0.0
+        for j in range(d):
+            fv += beta[t, j] * X[t, j]
+        f[t] = fv
+    return beta, f
+
+
+def _fc_buffer_loop(p, buf):
+    """The held level under a no-trade buffer: it stays while the target is
+    within `buf` of it, else moves to the near edge of the band (p - sign(p -
+    level) buf), which is min(max(level, p - buf), p + buf). A NaN target
+    holds the level and reports 0 (nothing is formed yet)."""
+    T = p.shape[0]
+    out = np.zeros(T)
+    level = 0.0
+    for t in range(T):
+        if np.isnan(p[t]):
+            continue
+        level = min(max(level, p[t] - buf), p[t] + buf)
+        out[t] = level
+    return out
+
+
+try:
+    from numba import njit as _njit_f
+    _fc_sigma_fast = _njit_f(cache=True, nogil=True)(_fc_sigma_loop)
+    _fc_cti_loop = _njit_f(cache=True, nogil=True)(_fc_cti_loop)      # before the loops that call it
+    _fc_kernel_fast = _njit_f(cache=True, nogil=True)(_fc_kernel_loop)
+    _fc_rank_fast = _njit_f(cache=True, nogil=True)(_fc_rank_loop)
+    _fc_regime_fast = _njit_f(cache=True, nogil=True)(_fc_regime_loop)
+    _fc_ridge_fast = _njit_f(cache=True, nogil=True)(_fc_ridge_loop)
+    _fc_buffer_fast = _njit_f(cache=True, nogil=True)(_fc_buffer_loop)
+except Exception:  # pragma: no cover
+    _fc_sigma_fast = _fc_sigma_loop
+    _fc_kernel_fast = _fc_kernel_loop
+    _fc_rank_fast = _fc_rank_loop
+    _fc_regime_fast = _fc_regime_loop
+    _fc_ridge_fast = _fc_ridge_loop
+    _fc_buffer_fast = _fc_buffer_loop
+
+
+def mmi(close: pd.Series, n: int = MMI_N) -> pd.Series:
+    """Market Meanness Index (financial-hacker): over n close differences r
+    with median m, the percentage of bars where r moved away from m AND
+    further than the bar before (r_i > m and r_i > r_{i-1}, or r_i < m and
+    r_i < r_{i-1}). ~75 for a random walk, lower the more the differences
+    persist, higher the more they revert. Each window on its own; on
+    differences, so defined at any price level."""
+    c = _to_arr(close)
+    return pd.Series(100.0 - _fc_regime_fast(c, c, c, 4, int(n)), index=close.index)
+
+
+def hurst(close: pd.Series, n: int = HURST_N) -> pd.Series:
+    """Hurst exponent over the last n bars: half the slope of log Var(C_t -
+    C_{t-q}) against log q for q = 1..HURST_QMAX. ~0.5 for a random walk,
+    above it persistent (trending), below it mean-reverting. On differences,
+    so scale-free and defined below zero."""
+    c = _to_arr(close)
+    return pd.Series(_fc_regime_fast(c, c, c, 5, int(n)), index=close.index)
+
+
+def forecast_ctx_of(channel_type: str) -> bool:
+    """Whether a forecast channel carries the regime context."""
+    return channel_type == "forecast_ctx"
+
+
+def forecast_warmup(channel_type: str = "forecast", direction_logic: str = "learned") -> int:
+    """Bars before the forecaster's first fully formed target position, which
+    is then exactly what a full-history run computes. The slowest kernel
+    (T = 128) needs 3 T + 1 = 385 closes of differences and sigma needs
+    SIGMA_N + 1 = 61 (the same bars): the features are formed from bar F0 =
+    385. The context's ranks are formed earlier (the Hurst's q = 10
+    differences over 100 bars: bar 109, plus NORM_N - 1 = 358). A direction
+    with nothing to learn (trend on `forecast`: the prior alone) is formed
+    there. Otherwise the ridge needs FC_MEMORY pairs (x_s, y_s) with s <= t
+    - 2, the oldest s >= F0: t >= F0 + FC_MEMORY + 1 = 886."""
+    f0 = max(SIGMA_N, 3 * max(SLOW_SCALES + FAST_SCALES) + 1)
+    if forecast_ctx_of(channel_type):
+        f0 = max(f0, max(MMI_N, HURST_N + HURST_QMAX) + NORM_N - 1)
+    _, _, prec = _forecast_spec(direction_logic, forecast_ctx_of(channel_type))
+    if not np.isfinite(prec).any():
+        return int(f0)
+    return int(f0 + FC_MEMORY + 1)
+
+
+def _forecast_features(df: pd.DataFrame):
+    """(sigma, SLOW, FAST, R, y) for a frame: the ingredients that do not
+    depend on the direction logic (cached per frame by the callers)."""
+    o = _to_arr(df["Open"]); h = _to_arr(df["High"]); l = _to_arr(df["Low"]); c = _to_arr(df["Close"])
+    sig = _fc_sigma_fast(c, SIGMA_N)
+    bands = []
+    for scales in (SLOW_SCALES, FAST_SCALES):
+        acc = np.zeros(len(c))
+        for n in scales:
+            acc = acc + _fc_kernel_fast(c, sig, int(n))
+        bands.append(np.clip(acc / len(scales), -2.0, 2.0))
+    ranks = []
+    for which, n in ((0, 20), (1, 20), (2, 14), (3, 60), (4, MMI_N), (5, HURST_N)):
+        ranks.append(_fc_rank_fast(_fc_regime_fast(h, l, c, which, n), NORM_N))
+    R = np.zeros(len(c))
+    for r in ranks:
+        R = R + r
+    R = R / len(ranks)
+    y = np.full(len(c), np.nan)
+    if len(c) > 2:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            y[:-2] = np.clip((o[2:] - o[1:-1]) / sig[:-2], -4.0, 4.0)
+    return sig, bands[0], bands[1], R, y
+
+
+def _forecast_spec(direction_logic: str, ctx: bool):
+    """Feature names, prior and precision (inf = fixed at the prior, and
+    absent when the prior is 0) of the coefficients of a direction logic (see
+    the module comment)."""
+    names = ["SLOW", "FAST"] + (["SLOW*R", "FAST*R"] if ctx else [])
+    beta0 = np.zeros(len(names))
+    prec = np.full(len(names), np.inf)
+    beta0[0] = B_TREND
+    if direction_logic == "trend":
+        if ctx:
+            prec[2] = LAMBDA_FAST
+    elif direction_logic == "countertrend":
+        beta0[0] = 0.0
+        prec[1] = LAMBDA_FAST
+        if ctx:
+            prec[3] = LAMBDA_FAST
+    elif direction_logic == "learned":
+        prec[0] = LAMBDA_SLOW
+        prec[1] = LAMBDA_FAST
+        if ctx:
+            prec[2] = prec[3] = LAMBDA_FAST
+    else:
+        raise ValueError(f"unknown direction logic {direction_logic}")
+    return names, beta0, prec
+
+
+def _forecast_key(df: pd.DataFrame) -> tuple:
+    # the target reads the Open, which _df_key does not sample
+    return _df_key(df), float(_to_arr(df["Open"]).sum())
+
+
+def _forecast_run(df: pd.DataFrame, channel_type: str, direction_logic: str):
+    ctx = forecast_ctx_of(channel_type)
+    dfkey, osum = _forecast_key(df)
+    sig, slow, fast, R, y = _cached(df, ("fc_feat", osum), lambda: _forecast_features(df), dfkey)
+    names, beta0, prec = _forecast_spec(direction_logic, ctx)
+    X = np.ascontiguousarray(np.column_stack([slow, fast] + ([slow * R, fast * R] if ctx else [])))
+    warm = forecast_warmup(channel_type, direction_logic)
+    beta, f = _fc_ridge_fast(X, y, beta0, prec, warm, FC_MEMORY, 1.0 - 1.0 / FC_HORIZON)
+    p = np.clip(f * np.sqrt(float(periods_per_year())) / SR_FULL, -1.0, 1.0)
+    p[:min(len(p), warm)] = np.nan
+    return names, X, R, beta, f, p
+
+
+def forecast_position(df: pd.DataFrame, channel_type: str = "forecast", direction_logic: str = "learned") -> np.ndarray:
+    """Per-bar target position of a forecast channel at the close, in [-1, 1]
+    of a full size (p_t = clip(f_t sqrt(periods per year) / SR_FULL)); NaN
+    until the forecaster is formed (`forecast_warmup`). The order for it goes
+    at the open of the NEXT bar."""
+    dfkey, osum = _forecast_key(df)
+    return _cached(df, ("fc_pos", channel_type, direction_logic, osum, periods_per_year()),
+                   lambda: _forecast_run(df, channel_type, direction_logic)[5], dfkey)
+
+
+def forecast_diagnostics(df: pd.DataFrame, tpl: "StrategyTemplate") -> dict:
+    """What the forecaster of `tpl` saw and learned, bar by bar: `features`
+    (the columns of x), `R` (the regime context score; computed for both
+    channels, used by `forecast_ctx` only), `betas` (the coefficients in
+    force), `forecast` (f_t) and `position` (the target p_t). Nothing here
+    changes the strategy."""
+    names, X, R, beta, f, p = _forecast_run(df, tpl.channel_type, tpl.direction_logic)
+    idx = df.index
+    return {"features": pd.DataFrame(X, index=idx, columns=names),
+            "R": pd.Series(R, index=idx),
+            "betas": pd.DataFrame(beta, index=idx, columns=names),
+            "forecast": pd.Series(f, index=idx),
+            "position": pd.Series(p, index=idx)}
+
+
+def forecast_stance(p: np.ndarray, sides: str = "both") -> np.ndarray:
+    """The level a forecast channel's stance holds: the target under the
+    FC_BUFFER no-trade band (moved to the near edge of the band when it is
+    left), the forbidden side of `sides` zeroed. 0 where the target is not
+    formed."""
+    q = _fc_buffer_fast(np.ascontiguousarray(p, dtype=np.float64), FC_BUFFER)
+    allow_long, allow_short = _allowed(sides)
+    if not allow_long:
+        q = np.where(q > 0, 0.0, q)
+    if not allow_short:
+        q = np.where(q < 0, 0.0, q)
+    return q
+
+
 # Regime "trendiness" registry. Every entry is oriented so that a HIGHER
 # value means MORE trending; `threshold` is the default split between
 # trend and range, `thresholds` the walk-forward search grid.
@@ -1239,6 +1804,9 @@ REGIME_INDICATORS = {
     # `cash_fn`: the form a cash asset uses instead of `fn` (see is_cash_asset)
     "vr":   dict(fn=lambda df, n: variance_ratio(df["Close"], n), n=60, threshold=1.0, thresholds=[0.9, 1.0, 1.1],
                  cash_fn=lambda df, n: variance_ratio(df["Close"], n, log_returns=True)),
+    # exact-window indicators (see the forecast section): random walk ~25 / ~0.5
+    "mmi":  dict(fn=lambda df, n: 100.0 - mmi(df["Close"], n), n=MMI_N, threshold=25.0, thresholds=[20.0, 25.0, 30.0]),
+    "hurst": dict(fn=lambda df, n: hurst(df["Close"], n), n=HURST_N, threshold=0.5, thresholds=[0.45, 0.5, 0.55]),
 }
 
 
@@ -1248,7 +1816,7 @@ REGIME_INDICATORS = {
 
 DIRECTION_LOGICS = ["trend", "countertrend", "learned"]
 CHANNEL_TYPES = ["donchian", "keltner", "bollinger", "hedge", "hedge_wide", "hedge_slow", "hedge_wide_slow",
-                 "hedge_split"]
+                 "hedge_split", "forecast", "forecast_ctx"]
 ENTRY_STYLES = ["stop", "close_confirm", "pullback", "stance"]
 EXIT_STYLES = ["channel", "atr_trail", "target_stop", "time_stop"]
 REGIME_INDICATOR_NAMES = list(REGIME_INDICATORS)
@@ -1336,9 +1904,12 @@ class StrategyTemplate:
         if self.entry_style == "stance":
             # the stance entry holds the learner's committee: it reads no
             # filter and no fitted channel, so a switch it would ignore is refused
-            assert self.channel_type in HEDGE_CHANNELS, "the stance entry trades a hedge ladder's committee"
+            assert self.channel_type in HEDGE_CHANNELS + FORECAST_CHANNELS,                 "the stance entry trades a hedge ladder's committee or a forecaster's position"
             assert self.regime_filter == "none" and not self.vol_filter and self.bias_filter == "none", \
                 "the stance entry has no regime, vol or bias filter"
+        if self.channel_type in FORECAST_CHANNELS:
+            # a forecaster has a position, not a channel: only the stance can trade it
+            assert self.entry_style == "stance", "a forecast channel is traded by the stance entry only"
 
 
 # --------------------------------------------------------------------------
@@ -1429,6 +2000,20 @@ def _compute_indicators(df: pd.DataFrame, tpl: StrategyTemplate, dfkey=None) -> 
         ready = ready & ~np.isnan(arr)
 
     mode = tpl.direction_logic
+    if tpl.channel_type in FORECAST_CHANNELS:
+        # a forecaster has no channel, direction or exit band (its stance reads
+        # `forecast_position`, which carries its own warm-up): the ATR for the
+        # risk-sized units and the vol target's volatility are all it needs
+        use("atr", _cached(df, ("atr", tpl.atr_n), lambda: _to_arr(atr(df, tpl.atr_n)), dfkey))
+        if tpl.vol_target > 0:
+            if is_cash_asset(tpl):
+                use("rvol", _cached(df, ("rvol", tpl.vol_target_n),
+                                    lambda: _to_arr(df["Close"].pct_change().rolling(tpl.vol_target_n).std()), dfkey))
+            else:
+                use("rvol", _cached(df, ("rvol_pts", tpl.vol_target_n),
+                                    lambda: _to_arr(df["Close"].diff().rolling(tpl.vol_target_n).std()), dfkey))
+        ind["ready"] = ready
+        return ind
     ladder = hedge_ladder_for(tpl.channel_type)
     # the sides the learner scores on (the template's own on a position-sized
     # ladder, both otherwise): canonical, so the three `sides` of a plain-ladder
@@ -2316,15 +2901,25 @@ def _stance_backtest(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: fl
     cost_pts = float(tpl.cost_per_unit) / float(tpl.point_value)
     mode = "learned" if tpl.direction_logic == "learned" else tpl.direction_logic
     dfkey = _df_key(df, close)
-    p = _cached(df, ("hedge_stance", ladder, mode, tpl.atr_n, float(tpl.cost_bps), tpl.sides, cost_pts),
-                lambda: hedge_stance(df, tpl.atr_n, mode, tpl.cost_bps, ladder, tpl.sides, cost_pts), dfkey)
-    allow_long, allow_short = _allowed(tpl.sides)
-    # the target, a signed fraction of one full size in quarters: the stance
-    # moves a little every bar, and re-trading every wiggle would pay the
-    # spread for nothing; a quarter of the size is the smallest step traded
-    q = np.where(np.isnan(p), 0.0, np.round(p * STANCE_STEPS) / STANCE_STEPS)
-    q = np.where((q > 0) & ~allow_long, 0.0, q)
-    q = np.where((q < 0) & ~allow_short, 0.0, q)
+    if tpl.channel_type in FORECAST_CHANNELS:
+        # the forecaster's target position, read at the close of bar i-1 for the
+        # order at the open of bar i, held under the no-trade buffer: it changes
+        # only when it leaves FC_BUFFER of the held level, and then moves to the
+        # near edge of the band (the quarters below would be a buffer of an
+        # eighth round the nearest quarter, and a stance that moves a little
+        # every bar pays the spread for nothing)
+        p = forecast_position(df, tpl.channel_type, tpl.direction_logic)
+        q = forecast_stance(p, tpl.sides)
+    else:
+        p = _cached(df, ("hedge_stance", ladder, mode, tpl.atr_n, float(tpl.cost_bps), tpl.sides, cost_pts),
+                    lambda: hedge_stance(df, tpl.atr_n, mode, tpl.cost_bps, ladder, tpl.sides, cost_pts), dfkey)
+        allow_long, allow_short = _allowed(tpl.sides)
+        # the target, a signed fraction of one full size in quarters: the stance
+        # moves a little every bar, and re-trading every wiggle would pay the
+        # spread for nothing; a quarter of the size is the smallest step traded
+        q = np.where(np.isnan(p), 0.0, np.round(p * STANCE_STEPS) / STANCE_STEPS)
+        q = np.where((q > 0) & ~allow_long, 0.0, q)
+        q = np.where((q < 0) & ~allow_short, 0.0, q)
     ready = ind["ready"] & ~np.isnan(p)
     atr_v = ind["atr"]; rvol = ind.get("rvol")
     vol_target_bar = float(tpl.vol_target) / np.sqrt(periods_per_year()) if tpl.vol_target > 0 else 0.0
@@ -2346,6 +2941,26 @@ def _stance_backtest(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: fl
                            pnl=float(pnl), bars_held=int(i - e_bar)))
         pos = 0; shares = 0.0
 
+    def target_units(want, j, px, cash_now):
+        """Units the engine opens for the target `want` at an open priced `px`,
+        sized on the indicators of bar j (the last close before it): the
+        rule of the loop below, also what `live` publishes for the next bar."""
+        if not (want != 0.0 and atr_v[j] > 0 and (vol_target_bar <= 0 or (rvol is not None and rvol[j] > 0))):
+            return 0.0
+        base = initial_equity if fixed_capital else cash_now
+        if vol_target_bar > 0:
+            # rvol in price points on a margined instrument, else the pct vol
+            unit_vol = rvol[j] * pv if margin > 0 else rvol[j] * abs(px) * pv
+            qty = base * vol_target_bar / unit_vol if unit_vol > 0 else 0.0
+        else:
+            qty = base * tpl.risk_pct / (tpl.atr_mult_stop * atr_v[j] * pv)
+        qty *= abs(want)
+        basis = margin if margin > 0 else pv * abs(px)   # the leverage cap's basis per unit
+        qty = min(qty, tpl.max_leverage * base / basis) if basis > 0 and base > 0 else 0.0
+        if tpl.whole_units:
+            qty = float(np.floor(qty))
+        return float(qty)
+
     level = 0.0                      # the quantised stance the position was sized for
     for i in range(1, n):
         # the open of bar i: the position marked from the last close, then the order
@@ -2359,20 +2974,7 @@ def _stance_backtest(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: fl
             want = level
         if want != level:
             new_side = int(np.sign(want))
-            qty = 0.0
-            if new_side != 0 and atr_v[i - 1] > 0 and (vol_target_bar <= 0 or (rvol is not None and rvol[i - 1] > 0)):
-                base = initial_equity if fixed_capital else cash
-                if vol_target_bar > 0:
-                    # rvol in price points on a margined instrument, else the pct vol
-                    unit_vol = rvol[i - 1] * pv if margin > 0 else rvol[i - 1] * abs(open_[i]) * pv
-                    qty = base * vol_target_bar / unit_vol if unit_vol > 0 else 0.0
-                else:
-                    qty = base * tpl.risk_pct / (tpl.atr_mult_stop * atr_v[i - 1] * pv)
-                qty *= abs(want)
-                basis = margin if margin > 0 else pv * abs(open_[i])   # the leverage cap's basis per unit
-                qty = min(qty, tpl.max_leverage * base / basis) if basis > 0 and base > 0 else 0.0
-                if tpl.whole_units:
-                    qty = float(np.floor(qty))
+            qty = target_units(want, i - 1, open_[i], cash) if new_side != 0 else 0.0
             if new_side == pos and pos != 0 and qty == shares:
                 pass                                            # the same whole units: nothing to trade
             elif new_side == pos and pos != 0 and qty > 0:
@@ -2399,6 +3001,15 @@ def _stance_backtest(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: fl
                 cash -= rc
                 e_cost += rc
         equity[i] = cash
+    # what the NEXT open (bar n) would do, for `live`: the target read at the
+    # close of bar n-1 by the rule above, sized on the last close as the proxy
+    # for the open that does not exist yet
+    formed = bool(n > 0 and ready[n - 1])
+    want_next = 0.0 if n < first_trade_bar else (float(q[n - 1]) if formed else level)
+    qty_next = target_units(want_next, n - 1, close[n - 1], cash) if want_next != level and want_next != 0.0 else 0.0
+    stance_next = dict(formed=formed, want=float(want_next), level=float(level), change=bool(want_next != level),
+                       target_units=float(np.sign(want_next) * qty_next), held_units=float(pos * shares),
+                       price_proxy=float(close[n - 1]) if n else np.nan)
     rets = np.zeros(n)
     if fixed_capital:
         rets[1:] = np.diff(equity) / float(initial_equity)
@@ -2417,7 +3028,8 @@ def _stance_backtest(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: fl
     orders = _orders_frame(np.zeros((0, 4), dtype=np.int64), np.zeros((0, 3)), idx.to_numpy()) if log_orders else None
     return {"equity": pd.Series(equity, index=idx), "returns": pd.Series(rets, index=idx), "entries": entries,
             "trades": trades, "stats": stats, "open_position": open_position, "pending_order": None,
-            "last_atr": float(atr_v[-1]) if n else np.nan, "indicators": ind, "orders": orders}
+            "last_atr": float(atr_v[-1]) if n else np.nan, "indicators": ind, "orders": orders,
+            "stance_next": stance_next}
 
 
 def backtest(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: float = 100_000.0,

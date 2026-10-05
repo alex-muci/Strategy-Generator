@@ -694,3 +694,117 @@ class DeadAtrExitLevelTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StanceOrderTests(unittest.TestCase):
+    """The stance entries (a hedge committee's stance, a forecaster's buffered
+    position) publish ONE market-on-open order for the change of holding, and
+    the engine's next open does exactly that."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.df = synthetic_ohlc(1500, seed=23)
+
+    def _roll(self, tpl, lookback, step=11, start=None, rtol=0.0, equity=100_000.0):
+        """Roll one real bar forward: the engine's holding after the next open
+        must be the held units plus the published order."""
+        seen = dict(flat_to_pos=0, pos_changed=0, held_no_order=0, long_held=0)
+        for t in range(start or lookback + 5, len(self.df) - 1, step):
+            st = strategy_state(self.df.iloc[:t], tpl, equity=equity, lookback_bars=lookback)
+            after = backtest(self.df.iloc[t - lookback:t + 1], tpl, initial_equity=equity)
+            self.assertEqual(st["exit_orders"], [])
+            held = (st["position"] or 0) * st["shares"]
+            orders = st["entry_orders"]
+            self.assertLessEqual(len(orders), 1)
+            for o in orders:
+                self.assertEqual(o["kind"], "market_on_open")
+                self.assertGreater(o["shares"], 0)
+                self.assertIn("last close", o["note"]) if not (tpl.vol_target > 0 and tpl.margin_per_unit > 0) else None
+            want = held + sum(o["side"] * o["shares"] for o in orders)
+            ap = after["open_position"]
+            got = 0.0 if ap is None else ap["side"] * ap["shares"]
+            if rtol == 0.0:
+                self.assertAlmostEqual(got, want, places=8, msg=f"{tpl.name} bar {t}")
+            else:
+                self.assertLessEqual(abs(got - want), rtol * max(abs(want), abs(held), 1.0) + 1e-9,
+                                     f"{tpl.name} bar {t}: engine {got}, published {want}")
+            if held > 0:
+                seen["long_held"] += 1
+            if held == 0 and want != 0:
+                seen["flat_to_pos"] += 1
+            if held != 0 and orders:
+                seen["pos_changed"] += 1
+            if held != 0 and not orders:
+                seen["held_no_order"] += 1
+        return seen
+
+    def test_forecast_template_on_a_margined_instrument_is_exact(self):
+        tpl = StrategyTemplate("fc", direction_logic="learned", channel_type="forecast", entry_style="stance",
+                               cost_bps=0.0, margin_per_unit=1000.0, point_value=10.0, vol_target=0.15,
+                               max_leverage=50.0)
+        seen = self._roll(tpl, lookback=1100, start=1105, step=12)
+        self.assertGreater(seen["flat_to_pos"] + seen["pos_changed"], 5)
+        self.assertGreater(seen["held_no_order"], 5, "the buffer never held")
+
+    def test_trend_forecast_template_flat_and_long(self):
+        tpl = StrategyTemplate("fc", direction_logic="trend", channel_type="forecast", entry_style="stance",
+                               cost_bps=0.0, margin_per_unit=1000.0, point_value=10.0, vol_target=0.15,
+                               max_leverage=50.0)
+        seen = self._roll(tpl, lookback=600, step=5)
+        self.assertGreater(seen["long_held"], 0)
+        self.assertGreater(seen["flat_to_pos"] + seen["pos_changed"], 5)
+
+    def test_hedge_stance_on_a_margined_instrument_is_exact(self):
+        tpl = StrategyTemplate("hs", direction_logic="trend", channel_type="hedge", entry_style="stance",
+                               cost_bps=0.0, margin_per_unit=1000.0, point_value=10.0, vol_target=0.15,
+                               max_leverage=50.0)
+        seen = self._roll(tpl, lookback=700, step=5)
+        self.assertGreater(seen["flat_to_pos"] + seen["pos_changed"], 3)
+
+    def test_cash_asset_matches_within_the_open_to_close_ratio(self):
+        for tpl in (StrategyTemplate("fc", direction_logic="trend", channel_type="forecast", entry_style="stance",
+                                     vol_target=0.15),
+                    StrategyTemplate("hs", direction_logic="trend", channel_type="hedge", entry_style="stance")):
+            seen = self._roll(tpl, lookback=700, step=5, rtol=0.05)
+            self.assertGreater(seen["flat_to_pos"] + seen["pos_changed"] + seen["long_held"], 3, tpl.name)
+
+    def test_no_order_without_a_formed_target_or_a_change(self):
+        from live import _stance_orders
+        tpl = StrategyTemplate("fc", channel_type="forecast", entry_style="stance")
+        base = dict(formed=True, want=0.4, level=0.3, change=True, target_units=10.0, held_units=4.0, price_proxy=100.0)
+        (o,) = _stance_orders(tpl, base)
+        self.assertEqual((o["kind"], o["side"], o["shares"]), ("market_on_open", 1, 6.0))
+        (o,) = _stance_orders(tpl, dict(base, target_units=-3.0, held_units=4.0))
+        self.assertEqual((o["side"], o["shares"]), (-1, 7.0))
+        self.assertEqual(_stance_orders(tpl, dict(base, formed=False)), [])            # target NaN
+        self.assertEqual(_stance_orders(tpl, dict(base, change=False)), [])            # the buffer holds
+        self.assertEqual(_stance_orders(tpl, dict(base, target_units=4.0)), [])        # same units
+
+
+class StanceDashboardTests(unittest.TestCase):
+    def test_a_stance_slot_is_traded_like_any_other(self):
+        """etf_dashboard no longer parks the stance entry as research only: its
+        slot reports the position, publishes its order and reaches trades-to-send."""
+        from dataclasses import asdict
+        from types import SimpleNamespace
+        import etf_dashboard as ED
+        tpl = StrategyTemplate("fc", direction_logic="trend", channel_type="forecast", entry_style="stance",
+                               vol_target=0.15)
+        slot = dict(slot="SPY|fc", asset="SPY", template_name=tpl.name, template=asdict(tpl), weight=1.0,
+                    research={})
+        cfg = dict(train_bars=900, test_bars=125, wide_grid=False, metric="sharpe", selection="plateau",
+                   anchored=False)
+        args = SimpleNamespace(account_equity=1e5, no_refit=False)
+        df = synthetic_ohlc(1500, seed=23)
+        held = None
+        live = dict(slots={}, last_targets={}, runs=0)      # held between runs: one refit, then the window
+        for t in range(1300, 1400, 2):
+            st, _ = ED._slot_signal(slot, df.iloc[:t], cfg, live, args)
+            self.assertNotIn("the stance entry is research only: no live orders", st["blocked_by"])
+            if st["position"]:
+                held = st
+                break
+        self.assertIsNotNone(held, "the fixture never held a position")
+        tg = portfolio_targets([held], {"SPY|fc": 1.0}, 1e5)
+        trades = trade_list(tg["by_asset"], {})
+        self.assertEqual(trades.loc["SPY", "action"], "BUY" if held["position"] == 1 else "SELL")

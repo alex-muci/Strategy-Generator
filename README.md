@@ -44,13 +44,8 @@ still runs every test.
 python main.py --help
 python main.py --family quick                       # 72 templates (Donchian, ER filter)
 python main.py --family default                     # 768 templates, all switches sampled
-python main.py --family online                      # 288 templates on the online-learned channel (no lookback to fit)
-python main.py --family online_wide                 # 8 templates: the learned direction on a wider ladder, sized by its own position
-python main.py --family online_slow                 # 288 templates: the online family with a three-year learner memory (real series)
-python main.py --family online_wide_slow            # 8 templates: online_wide with the same long memory
-python main.py --family online_stance               # 4 templates: hold the learner committee's own stance (research only, no live orders)
-python main.py --family online_core                 # 128 templates: trend + learned on all four hedge ladders (fast/slow, plain/wide), no regime or bias filter, both sides and long-only
-python main.py --family online_split                # 27 templates: short-hold fade group and long follow group, each with its own learner, a top learner between them
+python main.py --family online                      # 9 templates: the split ladder's follow group (trend direction), stop / close-confirm entries by every exit, and the committee's stance traded directly; learned / countertrend remain as overrides
+python main.py --family online_forecast             # 3 templates: the forecast channel (slow trend prior + learned fast-scale term, held as a position under a no-trade buffer) by trend / countertrend / learned
 python main.py --real SPY --start 2005-01-01 --family default --jobs 8
 python main.py --real SPY --start 2005-01-01 --family quick --sides long_only   # one-sided family (an asset with a drift)
 python main.py --real SPY --start 2005-01-01 --family quick --vol-target 0.1  # use vol-target rather than ATR-stop (see Position sizing)
@@ -406,7 +401,7 @@ A **template** is a fixed combination of categorical switches:
 | `channel_type` | `donchian` / `keltner` (EMA +/- k ATR) / `bollinger` (SMA +/- k sd) / `hedge` (online-learned, see below) / `hedge_wide` (the same learner over a wider ladder, sized by its own position, see below) |
 | `entry_style` | `stop` (at the level) / `close_confirm` (close beyond, next open) / `pullback` (after the break, a limit k ATR from the level: back inside the channel when following, deeper beyond it when fading) |
 | `exit_style` | `channel` (Turtle exit; midline target for countertrend) / `atr_trail` / `target_stop` / `time_stop` -- a hard ATR stop is always on |
-| `regime_indicator` | `er` Kaufman Efficiency Ratio / `adx` / `cti` Ehlers Correlation Trend / `chop` Choppiness / `vr` variance ratio (on log returns for a cash asset, on point changes for a future: see Cash assets vs futures and spreads) |
+| `regime_indicator` | `er` Kaufman Efficiency Ratio / `adx` / `cti` Ehlers Correlation Trend / `chop` Choppiness / `mmi` Market Meanness Index (100 - MMI, on differences) / `hurst` Hurst exponent (on differences) / `vr` variance ratio (on log returns for a cash asset, on point changes for a future: see Cash assets vs futures and spreads) |
 | `regime_filter` | `none` / `trend_only` / `range_only` (Ranger's "sideways" mode) |
 | `vol_filter` | skip entries when ATR is in an extreme percentile |
 | `bias_filter` | `sma`: longs only above SMA(200), shorts only below (financial-hacker's market-direction filter) |

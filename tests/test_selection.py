@@ -152,7 +152,7 @@ class ObjectiveTests(unittest.TestCase):
     def test_a_template_with_nothing_to_fit_still_walks_forward(self):
         """The online (hedge) channel learns its lookbacks; with a channel exit
         and no filters its grid is empty -- one trial, zero dimensions."""
-        tpl = next(t for t in generate_templates("online") if not param_grid_for(t))
+        tpl = next(t for t in generate_templates("online", channel_types=["hedge"], entry_styles=["stop", "close_confirm"]) if not param_grid_for(t))
         combos, idx = grid_combos({})
         self.assertEqual((combos, idx.shape), ([{}], (1, 0)))
         out = walk_forward(synthetic_ohlc(900, seed=4), tpl, {}, train_bars=400, test_bars=100)
