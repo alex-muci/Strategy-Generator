@@ -960,6 +960,11 @@ so on, and adds `trade_weight` and `position`.
 `docs/hedge_real_data_study.md` runs every family on real ETFs (SPY, TLT,
 GLD, USO, 2016-2026, `data_dump/`) and on planted-edge series. Two changes
 came out of it; both leave `hedge` and `hedge_wide` bit for bit as they were.
+`docs/online_templates_study.md` follows it up for the `online` and
+`online_forecast` families with a cost sweep, turnover, and synthetic series
+with a known edge, including futures calendar spreads
+(`extra_utils/online_study/`); the stance's no-trade band below came out of
+it.
 
 - **`hedge_slow` / `hedge_wide_slow`**: the same experts, a learner with a
   three-year memory (`HEDGE_SLOW_MEMORY` = 750 bars, lifetimes
