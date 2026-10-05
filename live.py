@@ -279,7 +279,7 @@ def _stance_orders(tpl: StrategyTemplate, sn: dict) -> list:
     engine closes and reopens a stretch of constant size, so the net trade is
     the difference). `sn` is the `stance_next` record of
     `strategy._stance_backtest`'s result: the target level read at the last close by the engine's own rule
-    (quarters of the hedge stance, the forecaster's buffered level), and the
+    (the hedge stance and the forecaster's target, each under its no-trade band), and the
     units it sizes it to. Nothing while the target is not formed or equals the
     level already held (the buffer holds)."""
     if not sn["formed"] or not sn["change"]:

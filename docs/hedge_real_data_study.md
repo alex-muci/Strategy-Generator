@@ -137,8 +137,8 @@ learns, whatever the data.
   lifetimes 250/500/750 (`strategy.HEDGE_LEARNERS`). Families `online_slow`,
   `online_wide_slow`. Warm-up 911 bars instead of 410.
 - `entry_style="stance"` (`strategy._stance_backtest`, `hedge_stance`): hold
-  the committee's signed stance from the next open, in quarters of a full
-  size, no stop or exit rule. Family `online_stance` (trend and learned on
+  the committee's signed stance from the next open, under a no-trade band of
+  0.125 of a full size (`STANCE_BUFFER`), no stop or exit rule. Family `online_stance` (trend and learned on
   the two slow ladders). Research only: cash assets, `live.py` refuses it.
 - `full` excludes both, so it is the family it was.
 

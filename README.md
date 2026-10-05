@@ -974,9 +974,20 @@ came out of it; both leave `hedge` and `hedge_wide` bit for bit as they were.
   (a break of the averaged channel, then its exit and a hard stop). A
   planted fade edge the committee earns a Sharpe of 3 on is worth about 1.3
   through the countertrend exits. The stance entry holds the committee's own
-  signed stance (`strategy.hedge_stance`), ordered at the next open, in
-  quarters of a full size (`STANCE_STEPS`), with no stop or exit rule (the
-  exit style is inert); it recovers the planted edge (2.9-3.0 on the slow
+  signed stance (`strategy.hedge_stance`), ordered at the next open, held
+  under a no-trade band (`STANCE_BUFFER` = 0.125 of a full size: the level
+  stays while the stance is within the band, else moves to its near edge,
+  the forecast channels' mechanism), with no stop or exit rule (the exit
+  style is inert); `walkforward.warmup_bars` adds `STANCE_SETTLE` bars for
+  the held level to forget its start. The band replaced rounding to quarters,
+  which chatters at the x.125 boundaries (a stance of 0.12 / 0.13 flips
+  between 0 and 0.25). Measured (Sharpe from bar 1000, 5 bps a side), quarters
+  vs band 0.1 / 0.15 / 0.2: SPY/TLT/GLD/USO two-sided average 0.21 vs 0.39 /
+  0.39 / 0.40, long-only 0.45 vs 0.49 / 0.49 / 0.48; 8 synthetic generators
+  x 8 seeds (random-walk null and futures spreads with per-tick costs)
+  two-sided -0.03 vs 0.03 / 0.05 / 0.06, long-only 0.06 vs 0.09 for all
+  three. Every width from 0.1 to 0.3 beat quarters; 0.125 is the quarter
+  rule's own tolerance, not the best of the sweep. It recovers the planted edge (2.9-3.0 on the slow
   ladders). It follows `backtest`'s instrument rules (margin cap, whole
   contracts, roll costs, prices through zero), and `live.py` refuses it: it
   is a research entry. The family is `online_stance` (trend and learned, on

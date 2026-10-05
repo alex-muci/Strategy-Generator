@@ -758,14 +758,14 @@ class StanceOrderTests(unittest.TestCase):
         tpl = StrategyTemplate("hs", direction_logic="trend", channel_type="hedge", entry_style="stance",
                                cost_bps=0.0, margin_per_unit=1000.0, point_value=10.0, vol_target=0.15,
                                max_leverage=50.0)
-        seen = self._roll(tpl, lookback=700, step=5)
+        seen = self._roll(tpl, lookback=1200, step=5)       # the stance's warm-up is 1175 bars (STANCE_SETTLE)
         self.assertGreater(seen["flat_to_pos"] + seen["pos_changed"], 3)
 
     def test_cash_asset_matches_within_the_open_to_close_ratio(self):
         for tpl in (StrategyTemplate("fc", direction_logic="trend", channel_type="forecast", entry_style="stance",
                                      vol_target=0.15),
                     StrategyTemplate("hs", direction_logic="trend", channel_type="hedge", entry_style="stance")):
-            seen = self._roll(tpl, lookback=700, step=5, rtol=0.05)
+            seen = self._roll(tpl, lookback=1200, step=5, rtol=0.05)
             self.assertGreater(seen["flat_to_pos"] + seen["pos_changed"] + seen["long_held"], 3, tpl.name)
 
     def test_no_order_without_a_formed_target_or_a_change(self):

@@ -1301,8 +1301,8 @@ def hedge_channel(df: pd.DataFrame, atr_n: int, mode: str = "trend", scale: floa
 #   * position : p_t = clip(f_t sqrt(periods_per_year) / SR_FULL, -1, 1), a
 #                forecast implying an annual Sharpe of SR_FULL being a full
 #                vol-target size (fractional Kelly). The stance engine holds
-#                it with a no-trade buffer (FC_BUFFER, Carver) instead of the
-#                hedge stance's quarters.
+#                it with a no-trade buffer (FC_BUFFER, Carver); the hedge
+#                stance holds its own with the same mechanism (STANCE_BUFFER).
 #
 # Every number at bar t is an exact function of a fixed number of past bars
 # (rolling windows computed window by window, as `_window_mean` does: pandas'
@@ -1779,18 +1779,26 @@ def forecast_diagnostics(df: pd.DataFrame, tpl: "StrategyTemplate") -> dict:
             "position": pd.Series(p, index=idx)}
 
 
-def forecast_stance(p: np.ndarray, sides: str = "both") -> np.ndarray:
-    """The level a forecast channel's stance holds: the target under the
-    FC_BUFFER no-trade band (moved to the near edge of the band when it is
-    left), the forbidden side of `sides` zeroed. 0 where the target is not
-    formed."""
-    q = _fc_buffer_fast(np.ascontiguousarray(p, dtype=np.float64), FC_BUFFER)
+def _buffered_level(p: np.ndarray, buf: float, sides: str = "both") -> np.ndarray:
+    """The level held under a no-trade band of half-width `buf` around the
+    target `p` (it stays while |p - level| <= buf, else moves to the near edge
+    of the band), the forbidden side of `sides` zeroed. 0 where the target is
+    not formed (NaN). Shared by the forecast channels and the hedge stance."""
+    q = _fc_buffer_fast(np.ascontiguousarray(p, dtype=np.float64), float(buf))
     allow_long, allow_short = _allowed(sides)
     if not allow_long:
         q = np.where(q > 0, 0.0, q)
     if not allow_short:
         q = np.where(q < 0, 0.0, q)
     return q
+
+
+def forecast_stance(p: np.ndarray, sides: str = "both") -> np.ndarray:
+    """The level a forecast channel's stance holds: the target under the
+    FC_BUFFER no-trade band (moved to the near edge of the band when it is
+    left), the forbidden side of `sides` zeroed. 0 where the target is not
+    formed."""
+    return _buffered_level(p, FC_BUFFER, sides)
 
 
 # Regime "trendiness" registry. Every entry is oriented so that a HIGHER
@@ -2839,7 +2847,10 @@ def typical_units(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: float
     return float(qty) if np.isfinite(qty) else 0.0
 
 
-STANCE_STEPS = 4      # the 'stance' entry trades its committee's stance in quarters of a full size
+STANCE_BUFFER = 0.125  # the 'stance' entry holds its committee's stance under a no-trade band this wide (full sizes)
+STANCE_SETTLE = 750   # extra bars for that band's held level to forget its start (walkforward.warmup_bars): the
+                      # committee's stance is slow and can sit inside both bands for hundreds of bars; measured on
+                      # 4 ETFs + 3 synthetic series, 600 gave exact returns (300: 1e-4, 500: 1e-5), 750 is margin
 
 
 def hedge_stance(df: pd.DataFrame, atr_n: int, mode: str = "learned", cost_bps: float = 0.0,
@@ -2876,10 +2887,12 @@ def _stance_backtest(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: fl
       i-1 (flat when it is exactly 0, or on a side `sides` forbids), and
       the order goes at the open of bar i, so nothing is filled on
       information of its own bar;
-    * the position is the stance, rounded to quarters (STANCE_STEPS), times
+    * the position is the stance held under a no-trade band of STANCE_BUFFER
+      (the level stays while the stance is within the band, else moves to
+      its near edge), times
       the risk or vol-target units of `backtest` (risk_pct at atr_mult_stop
       ATRs, or vol_target) at the bar it changes, capped at max_leverage;
-      it is re-sized when the rounded stance moves (the trade is closed and
+      it is re-sized when the held level moves (the trade is closed and
       a new one opened, the cost charged on the units actually traded), so
       the trade list holds one row per stretch of constant size;
     * there is no stop, target or exit channel: the exit IS the learner
@@ -2905,21 +2918,29 @@ def _stance_backtest(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: fl
         # the forecaster's target position, read at the close of bar i-1 for the
         # order at the open of bar i, held under the no-trade buffer: it changes
         # only when it leaves FC_BUFFER of the held level, and then moves to the
-        # near edge of the band (the quarters below would be a buffer of an
-        # eighth round the nearest quarter, and a stance that moves a little
-        # every bar pays the spread for nothing)
+        # near edge of the band (a stance that moves a little every bar pays
+        # the spread for nothing)
         p = forecast_position(df, tpl.channel_type, tpl.direction_logic)
         q = forecast_stance(p, tpl.sides)
     else:
         p = _cached(df, ("hedge_stance", ladder, mode, tpl.atr_n, float(tpl.cost_bps), tpl.sides, cost_pts),
                     lambda: hedge_stance(df, tpl.atr_n, mode, tpl.cost_bps, ladder, tpl.sides, cost_pts), dfkey)
-        allow_long, allow_short = _allowed(tpl.sides)
-        # the target, a signed fraction of one full size in quarters: the stance
-        # moves a little every bar, and re-trading every wiggle would pay the
-        # spread for nothing; a quarter of the size is the smallest step traded
-        q = np.where(np.isnan(p), 0.0, np.round(p * STANCE_STEPS) / STANCE_STEPS)
-        q = np.where((q > 0) & ~allow_long, 0.0, q)
-        q = np.where((q < 0) & ~allow_short, 0.0, q)
+        # the target, a signed fraction of one full size, held under the same
+        # no-trade band as the forecast's: the stance moves a little every bar
+        # and re-trading every wiggle would pay the spread for nothing. The
+        # level stays while the stance is within STANCE_BUFFER of it, else
+        # moves to the near edge of the band. This replaced rounding to
+        # quarters (a band of the same 1/8 without memory), which chatters at
+        # the x.125 boundaries (a stance of 0.12 / 0.13 flips between 0 and
+        # 0.25). Measured on TR-hsp-stance, Sharpe from bar 1000 at 5 bps a
+        # side, quarters vs band 0.1 / 0.15 / 0.2: SPY/TLT/GLD/USO two-sided
+        # 0.21 vs 0.39 / 0.39 / 0.40, long-only 0.45 vs 0.49 / 0.49 / 0.48;
+        # 8 synthetic generators x 8 seeds two-sided -0.03 vs 0.03 / 0.05 /
+        # 0.06, long-only 0.06 vs 0.09 for all three (even the unrounded
+        # stance, 0.31 on the ETFs, beat quarters). Every width from 0.1 to 0.3
+        # beat quarters; 0.125 is the quarter rule's own tolerance, not the
+        # best of the sweep.
+        q = _buffered_level(p, STANCE_BUFFER, tpl.sides)
     ready = ind["ready"] & ~np.isnan(p)
     atr_v = ind["atr"]; rvol = ind.get("rvol")
     vol_target_bar = float(tpl.vol_target) / np.sqrt(periods_per_year()) if tpl.vol_target > 0 else 0.0

@@ -26,7 +26,7 @@ from strategy import (  # noqa: E402
     HEDGE_SPLIT_FOLLOW, HEDGE_SPLIT_FADE, HEDGE_SPLIT_LEARNERS, hedge_group_weights,
     HEDGE_WIDE_K, hedge_position, hedge_position_sized, hedge_scored_sides, _allowed, _hedge_stances,
     hedge_active, _window_mean, EXIT_STYLES, _hedge_cached,
-    sma, atr,
+    sma, atr, hedge_stance, _buffered_level, STANCE_BUFFER, STANCE_SETTLE,
 )
 from generator import generate_templates, param_grid_for  # noqa: E402
 
@@ -1156,7 +1156,7 @@ class RobustnessTests(unittest.TestCase):
 
 class StanceEntryTests(unittest.TestCase):
     """entry_style 'stance': the template holds the side of the learner's
-    committee (hedge_stance), in quarters of a full size, ordered at the
+    committee (hedge_stance), held under a no-trade band, ordered at the
     next open."""
 
     @classmethod
@@ -1180,7 +1180,7 @@ class StanceEntryTests(unittest.TestCase):
         if op is not None:
             pnl += op["unrealized"] - op["entry_cost"]
         self.assertAlmostEqual(full["equity"].iloc[-1] - 100_000.0, pnl, places=6)
-        # sizes follow the stance in quarters, and the exit rule is inert
+        # sizes follow the buffered stance, and the exit rule is inert
         st = backtest(self.df, tpl.with_params(exit_style="time_stop", max_hold_bars=3), fixed_capital=True)
         np.testing.assert_array_equal(full["equity"].to_numpy(), st["equity"].to_numpy())
 
@@ -1192,6 +1192,53 @@ class StanceEntryTests(unittest.TestCase):
         self.assertTrue(all(self.df.index.get_loc(t["entry_date"]) > warm for t in res["trades"]))
         res = backtest(self.df, tpl, first_trade_bar=1300)
         self.assertTrue(all(self.df.index.get_loc(t["entry_date"]) >= 1300 for t in res["trades"]))
+
+    def test_the_level_is_held_under_the_no_trade_band(self):
+        """The held level stays while the stance is within STANCE_BUFFER of it
+        and moves to the near edge of the band otherwise (no quarters), a NaN
+        stance holds it and reports 0, and `sides` zeroes the forbidden side."""
+        tpl = self._tpl()
+        p = hedge_stance(self.df, tpl.atr_n, "learned", tpl.cost_bps, "hedge_slow", "both", 0.0)
+        self.assertTrue(np.isnan(p[:5]).all() and np.isfinite(p[-1]))
+        q = _buffered_level(p, STANCE_BUFFER)
+        self.assertTrue((q[np.isnan(p)] == 0).all())
+        ok = ~np.isnan(p)
+        self.assertTrue((np.abs(p[ok] - q[ok]) <= STANCE_BUFFER + 1e-12).all())
+        prev = 0.0
+        moves = 0
+        for pi, qi in zip(p[ok], q[ok]):
+            if abs(pi - prev) <= STANCE_BUFFER:
+                self.assertEqual(qi, prev)
+            else:
+                self.assertAlmostEqual(qi, pi - np.sign(pi - prev) * STANCE_BUFFER, places=12)
+                moves += 1
+            prev = qi
+        self.assertGreater(moves, 5)
+        self.assertGreater(len(set(np.round(q[ok], 6))), 8)     # not a grid of quarters
+        # a stance wobbling across the old x.125 rounding boundary does not trade
+        w = _buffered_level(np.array([0.0, 0.12, 0.13, 0.12, 0.13]), STANCE_BUFFER)
+        np.testing.assert_allclose(w, [0.0, 0.0, 0.005, 0.005, 0.005], atol=1e-12)
+        # a NaN holds the level but reports 0
+        np.testing.assert_allclose(_buffered_level(np.array([0.5, np.nan, 0.45]), 0.125), [0.375, 0.0, 0.375])
+        # sides zero the forbidden side
+        z = np.array([0.6, -0.6, 0.2, -0.2])
+        np.testing.assert_allclose(_buffered_level(z, 0.125, "long_only"), [0.475, 0.0, 0.075, 0.0])
+        np.testing.assert_allclose(_buffered_level(z, 0.125, "short_only"), [0.0, -0.475, 0.0, -0.075])
+
+    def test_a_warmed_window_reproduces_the_full_history(self):
+        """The held level remembers where it was, so warmup_bars adds
+        STANCE_SETTLE: a window warmed on it returns what a full-history run
+        (first trade at the window start) does."""
+        from walkforward import warmup_bars, window_backtest
+        df = synthetic_ohlc(3000, seed=2)
+        for sides in ("both", "long_only"):
+            tpl = self._tpl(sides=sides)
+            self.assertEqual(warmup_bars(tpl), hedge_warmup(tpl.atr_n, "hedge_slow") + STANCE_SETTLE + 5)
+            for st in (1800, 2100, 2500):
+                full = backtest(df, tpl, first_trade_bar=st)
+                win = window_backtest(df, tpl, st, st + 300)
+                np.testing.assert_allclose(win["returns"].to_numpy(), full["returns"].to_numpy()[st:st + 300],
+                                           rtol=0, atol=1e-12, err_msg=f"{sides} {st}")
 
     def test_switches_it_would_ignore_are_refused(self):
         for kw in (dict(regime_filter="trend_only"), dict(bias_filter="sma"), dict(vol_filter=True),

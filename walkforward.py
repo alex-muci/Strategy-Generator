@@ -38,7 +38,7 @@ from strategy import (
     backtest, annualized_sharpe, max_drawdown, periods_per_year, performance_stats, REGIME_INDICATORS, compound,
     hedge_warmup,
     hedge_ladder_for,
-    HEDGE_CHANNELS, FORECAST_CHANNELS, forecast_warmup, FC_SETTLE,
+    HEDGE_CHANNELS, FORECAST_CHANNELS, forecast_warmup, FC_SETTLE, STANCE_SETTLE,
 )
 
 
@@ -84,6 +84,10 @@ def warmup_bars(tpl) -> int:
         # the forecaster's features, context and ridge window, and the extra
         # bars the buffer's held level needs to forget where it started
         need.append(forecast_warmup(tpl.channel_type, tpl.direction_logic) + FC_SETTLE)
+    if tpl.entry_style == "stance" and tpl.channel_type in HEDGE_CHANNELS:
+        # the hedge stance is held under a no-trade band whose level remembers
+        # where it was: extra bars for it to forget its start
+        need.append(hedge_warmup(tpl.atr_n, hedge_ladder_for(tpl.channel_type)) + STANCE_SETTLE)
     if tpl.exit_style == "channel":
         need.append(tpl.n_exit)
         if tpl.channel_type == "keltner":
