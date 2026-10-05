@@ -10,21 +10,25 @@ follows `docs/hedge_real_data_study.md`. Tools: `extra_utils/online_study/`
 
 ## The short answer
 
-- **Turnover is not excessive anywhere in the online families.** At 5 bps a
-  side no template trades more than ~6.5x its equity a year (the target and
-  time exits); the forecast templates trade 1-1.7x, the cost drag is at most
-  0.4 % a year, and most templates are still positive at 20 bps. The
-  templates whose breakeven is near 5-10 bps on some ETF are the target-stop
-  and time exits and (before this change) the hedge stance.
+- **Turnover is not excessive in the online families.** At 5 bps a side
+  the median template (over the four ETFs) trades at most ~6.5x its equity
+  a year (the target exits; the highest single run is 8.1x, GLD); the
+  forecast templates trade 0.25-1.7x; the cost drag is at most 0.4 % a year
+  by template median (0.53 % in the worst single run, 0.09 % for the
+  forecast templates); at 20 bps 67 % of template medians are still
+  positive. The two-sided templates whose breakeven is 5-11 bps are the
+  target, time and close-confirm trail exits.
 - **One change shipped: the hedge stance is held under a no-trade band**
   instead of being rounded to quarters (`STANCE_BUFFER` = 0.125, one-sided
   templates snap flat on any bar with no stance on their side,
   `STANCE_SETTLE` = 200). Walk-forward on the four ETFs, two-sided
-  `TR-hsp-stance`: OOS Sharpe 0.17 -> 0.34 at 5 bps, 0.05 -> 0.25 at 20 bps,
-  turnover 3.0 -> 1.6x equity a year. Long-only: 0.39 -> 0.40 (noise).
-  Nothing else in either family changed (228 of 288 walk-forward rows are
-  bit-identical; the rest are this template and the forecast's one-sided
-  stance, which moved by 0.01).
+  `TR-hsp-stance`, mean of the four (median in brackets): OOS Sharpe 0.17
+  -> 0.34 (0.14 -> 0.28) at 5 bps, 0.05 -> 0.25 (0.03 -> 0.18) at 20 bps,
+  turnover 3.0 -> 1.6x (3.2 -> 1.5x) equity a year. Long-only: 0.39 -> 0.40
+  (0.42 -> 0.49), which hides TLT 0.05 -> -0.19 and SPY 0.59 -> 0.71: noise.
+  Two-sided behaviour of everything else is bit-identical; 228 of 288
+  walk-forward rows are unchanged, the other 60 are this template and the
+  one-sided forecast stances (section 3: they move by up to 0.1 on an ETF).
 - **Three ideas were tested and NOT shipped**: a cost-aware (Whalley-Wilmott)
   band for the forecaster, an AdaHedge meta-learner over forecasters with
   different priors scored on net-of-cost P&L, and a looser prior on the
@@ -99,8 +103,8 @@ Median OOS Sharpe over SPY / TLT / GLD / USO by cost, before the change:
 | quick | long_only | 0.21 | 0.18 | 0.16 | 0.12 | 0.01 |
 
 Turnover (equity a year, median over the ETFs, 5 bps): forecast templates
-0.5-1.7 (the buffer works: the position changes ~100 times a year but by
-small amounts); `online` channel exits 0.9-1.0, trail 2.5, time 3.9-4.0,
+0.25-1.7 (CT 0.25-0.5, TR and LN 0.7-1.7; the buffer works: the position
+changes ~100 times a year but by small amounts); `online` channel exits 0.9-1.0, trail 2.5, time 3.9-4.0,
 target 6.3-6.5, the stance 3.2. Two-sided breakevens under ~11 bps: the
 target, time and close-confirm trail exits (5-11 bps). 5 bps a side is
 already a conservative cost for these ETFs, so the online families are not
@@ -123,9 +127,10 @@ Evidence (all at 5 bps unless stated):
   the argmax). At 20 bps: 0.11 -> 0.30.
 - Walk-forward (`run_study`), same ETFs: two-sided 0.17 -> 0.34; 20 bps
   0.05 -> 0.25; long-only 0.39 -> 0.40.
-- Synthetic suite, 8 generators x 6-8 fresh seeds: the paired gain is
-  +0.05 to +0.11 Sharpe (+/- 0.02) depending on the seed set; the cost drag
-  per unit of cost falls 38 % at every cost multiple (1x-4x).
+- Synthetic suite, full-history paired gain: +0.05 +/- 0.02 Sharpe (4
+  fresh seeds, the review's rerun) to +0.11 +/- 0.02 (8 seeds, band 0.2,
+  the first sweep); the cost drag per unit of cost fell 38 % at every cost
+  multiple (1x-4x, 6 seeds; a scratch script, not committed).
 - How it gains (the review's measurement): most of the two-sided gain exists
   at ZERO cost (0.28 -> 0.43), so it is mainly a different exposure path, not
   the cost saving; the cost drag itself falls from 0.07 to 0.04 Sharpe and
@@ -147,11 +152,28 @@ one-sided template the level goes flat on any bar whose stance has nothing
 on the template's side, and bands from there. Exact warm-up from 100 settle
 bars in 108 measured cases (ETFs, spreads with per-unit costs and `Roll`,
 tsmom; both / long_only / short_only); `STANCE_SETTLE` = 200, so the shipped
-stance template's warm-up is 986 bars (786 with quarters). The same rule now
-applies to the forecast channels' one-sided stance: their warm-up was
-inexact in 54 of 324 cases at `FC_SETTLE` = 100 and is in 1 (a 1e-5
-difference); their one-sided Sharpes moved by at most 0.03 (full history)
-and 0.01 (walk-forward), with fewer trades.
+stance template's warm-up is 986 bars (786 with quarters). That is an
+EMPIRICAL bound, not a guarantee: the review's out-of-set batch (120 cases:
+regime-switching, random-walk, reversal and trending-spread seeds, whole
+contracts, vol targeting) found 4 cases still off at 200 (at most 4e-4 a
+bar; 3 at 300), all where a two-sided level sat inside the band for 200+
+bars. The hedge learner's own state is not exact either on one trending
+spread (the stance differs by 1e-3 at any settle; pre-existing).
+
+Costs of the one-sided rule, stated plainly:
+- On `hedge_split` the committee is scored on the template's own side, so
+  its stance is never on the forbidden side; the snap fires on the bars it
+  is exactly flat (12-47 % of the ETFs' bars). Against the band without the
+  snap it moves one-sided full-history Sharpe by up to 0.19 either way (TLT
+  long -0.09 -> -0.01, USO short -0.08 -> 0.11, SPY short -0.82 -> -0.71)
+  and ADDS trades and traded notional (+5-13 % long-only, up to +50 %
+  short-only). It buys the short warm-up, not performance.
+- The forecast channels' one-sided stance changes too: TR and LN by at most
+  0.03, the countertrend forecaster by up to 0.16 full-history (USO long
+  0.29 -> 0.20) and 0.10 walk-forward (TLT long -0.41 -> -0.31). Its warm-up
+  was inexact in 54 of 324 cases at `FC_SETTLE` = 100 and is in 1 (1e-5);
+  that one is two-sided, which the rule does not touch: `FC_SETTLE` = 100
+  still ships knowingly inexact, as before.
 
 What this is not: the band-vs-quarters decision was taken on the same four
 ETF histories that give the headline numbers, after ~15 holding rules had
@@ -164,8 +186,8 @@ fresh seeds and the plateau. The long-only gain is one ETF (GLD) and noise.
 a fixed 0.1 whatever the cost. The Whalley-Wilmott / Garleanu-Pedersen band
 h = (3 kappa s^2 / 2 gamma)^(1/3) (kappa the cost in units of the bar's
 volatility, s^2 the per-bar variance of the target, gamma = SR_FULL /
-sqrt(252) from the forecaster's own sizing) gives ~0.17 for SPY at 5 bps and
-~0.5 for a crude calendar spread at one tick. On the ETFs it looked better
+sqrt(252) from the forecaster's own sizing) gives ~0.2 for SPY at 5 bps and
+~0.4 for a crude calendar spread at one tick. On the ETFs it looked better
 (learned SPY 0.44 -> 0.57); on 8 seeds per generator it was neutral on the
 trend series and destroyed the fast-reversion edge on spreads (countertrend
 on a half-life-5 spread 0.45 -> -0.09): the formula assumes a target that
@@ -213,7 +235,19 @@ countertrend forecaster for a mean-reverting spread, or all three for one
 whose level trends. The `online` family is a breakout follower and the
 wrong tool for a stationary spread.
 
-## 6. Reproduce
+## 6. Provenance
+
+The ETF walk-forward numbers come from `run_study` (baseline before the
+change, the same with the new code after; the after run swept 0 / 5 / 20
+bps against 0 / 2 / 5 / 10 / 20, so breakevens differ slightly between the
+two, e.g. 5.25 vs 4.97 bps). The full-history sweeps (band widths, cost
+multiples, the cost-aware band, the prior sweep, the meta-learner) were
+scratch scripts that inject a held level into the stance engine; the
+injection reproduced the engine's own quarters bit for bit, but the scripts
+are not committed. Two adversarial reviews checked the numbers; the ones
+they could not reproduce from stored output are labelled above.
+
+## 7. Reproduce
 
 ```
 PYTHONPATH=. python -m extra_utils.online_study.run_study \

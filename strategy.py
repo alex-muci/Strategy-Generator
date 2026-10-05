@@ -1633,7 +1633,12 @@ def _fc_side_buffer_loop(p, buf, allow_long, allow_short):
     a band run on the target clamped to 0 can hold anything in [0, buf]
     while the target sits at 0, for as long as it sits there, so two runs
     started apart need not agree for hundreds of bars. Snapping to flat
-    makes every forbidden-side bar a common restart."""
+    makes every forbidden-side bar a common restart. On a position-sized
+    hedge ladder (hedge_split) the committee is scored on the template's own
+    side and is never on the other one; there the snap fires on the bars it
+    is exactly flat (12-47 % of the ETFs' bars), which is what makes its
+    one-sided warm-up short, and which moves one-sided Sharpe by up to 0.2
+    either way against a band without it (docs/online_templates_study.md)."""
     T = p.shape[0]
     out = np.zeros(T)
     level = 0.0
@@ -2888,7 +2893,9 @@ STANCE_SETTLE = 200   # extra bars for that band's held level to forget its star
                       # bound: window_backtest vs a full-history backtest, 108 cases (SPY/TLT/GLD/USO + 3 calendar
                       # spreads with per-unit costs and Roll + 2 tsmom, x both/long_only/short_only x 4 window
                       # starts of 125 bars), max |return diff|: settle 0 1.0e-3 (45 inexact), 50 4.2e-4 (2), 100
-                      # and up exact to 2e-16. 200 is twice the first exact settle. (Before the snap, a one-sided
+                      # and up exact to 2e-16. 200 is twice that, NOT a guarantee: out of that set
+                      # a two-sided level that sat inside the band for 200+ bars (regime-switching series) was
+                      # still off by up to 4e-4 a bar at 200 and 300. (Before the snap, a one-sided
                       # band clamped at 0 could hold any sliver in [0, buf] indefinitely and needed 550.)
 
 

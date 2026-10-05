@@ -986,9 +986,10 @@ it.
   style is inert). On a one-sided template the level goes flat on any bar
   whose stance has nothing on the template's side and bands from there, so
   it carries no memory of the other side; `walkforward.warmup_bars` adds
-  `STANCE_SETTLE` (200) bars for the held level to forget its start (an
-  empirical bound: exact from 100 in 108 measured cases, see the
-  constant). The band replaced rounding to quarters,
+  `STANCE_SETTLE` (200) bars for the held level to forget its start. That
+  is an empirical bound, not a guarantee: exact from 100 in the 108 cases it
+  was measured on, but a two-sided level can sit inside the band for longer
+  (a regime-switching series was still off by 4e-4 a bar at 200 and 300). The band replaced rounding to quarters,
   which chatters at the x.125 boundaries (a stance of 0.12 / 0.13 flips
   between 0 and 0.25). Measured (Sharpe from bar 1000, 5 bps a side),
   quarters vs the band: SPY/TLT/GLD/USO two-sided average 0.21 vs 0.39 (bands
@@ -1009,8 +1010,10 @@ it.
   contracts, roll costs, prices through zero), and `live.py` supports it: the
   stance (a hedge committee's, a forecaster's) is published as one
   market-on-open order for the change of holding, the size computed at the
-  last close. There is no stop or target order to publish. The family is
-  `online_stance` (trend and learned, on both slow ladders).
+  last close. There is no stop or target order to publish. The shipped stance template is
+  the `online` family's (`TR-hsp-stance`, on `hedge_split`); on the other
+  ladders it is a switch, e.g. `generate_templates("online",
+  channel_types=["hedge_slow"])`.
 - **`hedge_split`**: trend and mean reversion on their own time scales.
   The hold is decoupled from the lookback (`HedgeExpert.hold`; 0 keeps
   the old rule, hold = lookback). A **follow group** (Donchian and Keltner
