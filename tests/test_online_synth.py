@@ -87,3 +87,10 @@ def test_engine_accepts_spread():
     tpl.validate()
     res = strategy.backtest(df, tpl)
     assert len(res["equity"]) == 600 and np.isfinite(res["equity"].values).all()
+
+
+def test_suites_of_different_seeds_share_no_stream():
+    a, b = synth.make_suite(0, n_bars=300), synth.make_suite(1, n_bars=300)
+    assert not np.allclose(a["random_walk_b"]["Close"].to_numpy(), b["random_walk_a"]["Close"].to_numpy())
+    again = synth.make_suite(1, n_bars=300)
+    np.testing.assert_array_equal(again["tsmom_ic02"]["Close"].to_numpy(), b["tsmom_ic02"]["Close"].to_numpy())

@@ -1623,6 +1623,32 @@ def _fc_buffer_loop(p, buf):
     return out
 
 
+def _fc_side_buffer_loop(p, buf, allow_long, allow_short):
+    """`_fc_buffer_loop` for a one-sided template: a target on the forbidden
+    side (short for long-only, long for short-only) puts the level flat at
+    once, and the band runs from there. That is the side rule the quarters
+    and the zeroed two-sided band had (a short stance is flat on a long-only
+    template), without their memory: a band run on the raw target sat at
+    -0.5 through a short stretch and held the return to +0.2 at 0.075, and
+    a band run on the target clamped to 0 can hold anything in [0, buf]
+    while the target sits at 0, for as long as it sits there, so two runs
+    started apart need not agree for hundreds of bars. Snapping to flat
+    makes every forbidden-side bar a common restart."""
+    T = p.shape[0]
+    out = np.zeros(T)
+    level = 0.0
+    for t in range(T):
+        x = p[t]
+        if np.isnan(x):
+            continue
+        if (x <= 0.0 and not allow_short) or (x >= 0.0 and not allow_long):
+            level = 0.0
+        else:
+            level = min(max(level, x - buf), x + buf)
+        out[t] = level
+    return out
+
+
 try:
     from numba import njit as _njit_f
     _fc_sigma_fast = _njit_f(cache=True, nogil=True)(_fc_sigma_loop)
@@ -1632,6 +1658,7 @@ try:
     _fc_regime_fast = _njit_f(cache=True, nogil=True)(_fc_regime_loop)
     _fc_ridge_fast = _njit_f(cache=True, nogil=True)(_fc_ridge_loop)
     _fc_buffer_fast = _njit_f(cache=True, nogil=True)(_fc_buffer_loop)
+    _fc_side_buffer_fast = _njit_f(cache=True, nogil=True)(_fc_side_buffer_loop)
 except Exception:  # pragma: no cover
     _fc_sigma_fast = _fc_sigma_loop
     _fc_kernel_fast = _fc_kernel_loop
@@ -1639,6 +1666,7 @@ except Exception:  # pragma: no cover
     _fc_regime_fast = _fc_regime_loop
     _fc_ridge_fast = _fc_ridge_loop
     _fc_buffer_fast = _fc_buffer_loop
+    _fc_side_buffer_fast = _fc_side_buffer_loop
 
 
 def mmi(close: pd.Series, n: int = MMI_N) -> pd.Series:
@@ -1782,15 +1810,20 @@ def forecast_diagnostics(df: pd.DataFrame, tpl: "StrategyTemplate") -> dict:
 def _buffered_level(p: np.ndarray, buf: float, sides: str = "both") -> np.ndarray:
     """The level held under a no-trade band of half-width `buf` around the
     target `p` (it stays while |p - level| <= buf, else moves to the near edge
-    of the band), the forbidden side of `sides` zeroed. 0 where the target is
-    not formed (NaN). Shared by the forecast channels and the hedge stance."""
-    q = _fc_buffer_fast(np.ascontiguousarray(p, dtype=np.float64), float(buf))
+    of the band), 0 where the target is not formed (NaN). Shared by the
+    forecast channels and the hedge stance.
+
+    On a one-sided template a target on the forbidden side puts the level
+    flat at once (`_fc_side_buffer_loop`): the band neither follows the
+    target to the short side (where a return to +0.2 was held at 0.075) nor
+    keeps an arbitrary sliver in [0, buf] for as long as the target is on
+    the wrong side, which a walk-forward window warmed on a finite buffer
+    could not reproduce."""
     allow_long, allow_short = _allowed(sides)
-    if not allow_long:
-        q = np.where(q > 0, 0.0, q)
-    if not allow_short:
-        q = np.where(q < 0, 0.0, q)
-    return q
+    p = np.ascontiguousarray(p, dtype=np.float64)
+    if allow_long and allow_short:
+        return _fc_buffer_fast(p, float(buf))
+    return _fc_side_buffer_fast(p, float(buf), allow_long, allow_short)
 
 
 def forecast_stance(p: np.ndarray, sides: str = "both") -> np.ndarray:
@@ -2848,9 +2881,15 @@ def typical_units(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: float
 
 
 STANCE_BUFFER = 0.125  # the 'stance' entry holds its committee's stance under a no-trade band this wide (full sizes)
-STANCE_SETTLE = 750   # extra bars for that band's held level to forget its start (walkforward.warmup_bars): the
-                      # committee's stance is slow and can sit inside both bands for hundreds of bars; measured on
-                      # 4 ETFs + 3 synthetic series, 600 gave exact returns (300: 1e-4, 500: 1e-5), 750 is margin
+STANCE_SETTLE = 200   # extra bars for that band's held level to forget its start (walkforward.warmup_bars). The
+                      # level is a clamp that remembers where it was, so two runs started apart agree again only
+                      # after the target leaves the band of both (an excursion > 2 * STANCE_BUFFER) or, on a
+                      # one-sided template, at the first bar with no stance on its side (the level snaps flat). EMPIRICAL
+                      # bound: window_backtest vs a full-history backtest, 108 cases (SPY/TLT/GLD/USO + 3 calendar
+                      # spreads with per-unit costs and Roll + 2 tsmom, x both/long_only/short_only x 4 window
+                      # starts of 125 bars), max |return diff|: settle 0 1.0e-3 (45 inexact), 50 4.2e-4 (2), 100
+                      # and up exact to 2e-16. 200 is twice the first exact settle. (Before the snap, a one-sided
+                      # band clamped at 0 could hold any sliver in [0, buf] indefinitely and needed 550.)
 
 
 def hedge_stance(df: pd.DataFrame, atr_n: int, mode: str = "learned", cost_bps: float = 0.0,
@@ -2933,13 +2972,22 @@ def _stance_backtest(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: fl
         # quarters (a band of the same 1/8 without memory), which chatters at
         # the x.125 boundaries (a stance of 0.12 / 0.13 flips between 0 and
         # 0.25). Measured on TR-hsp-stance, Sharpe from bar 1000 at 5 bps a
-        # side, quarters vs band 0.1 / 0.15 / 0.2: SPY/TLT/GLD/USO two-sided
-        # 0.21 vs 0.39 / 0.39 / 0.40, long-only 0.45 vs 0.49 / 0.49 / 0.48;
-        # 8 synthetic generators x 8 seeds two-sided -0.03 vs 0.03 / 0.05 /
-        # 0.06, long-only 0.06 vs 0.09 for all three (even the unrounded
-        # stance, 0.31 on the ETFs, beat quarters). Every width from 0.1 to 0.3
-        # beat quarters; 0.125 is the quarter rule's own tolerance, not the
-        # best of the sweep.
+        # side, quarters -> band 0.125: SPY/TLT/GLD/USO two-sided 0.206 ->
+        # 0.394 (bands of 0.1 / 0.15 / 0.2: 0.39 / 0.39 / 0.40); the
+        # long-only gain (0.45 -> 0.49) is one ETF and noise. Most of the
+        # two-sided gain is NOT the cost saving: at ZERO cost the Sharpe goes
+        # 0.276 -> 0.432 (~83 % of the gain), a different exposure path (the
+        # quarters' x.125 flips, the band's level); the cost drag falls only
+        # from 0.07 to 0.04 Sharpe (notional turnover 3.2 -> 1.8x a year). On
+        # 8 synthetic generators x 8 seeds the paired two-sided delta is +0.05
+        # to +0.11 (+/- 0.02) Sharpe. The unrounded stance beat quarters on the
+        # 4 ETFs (0.31 vs 0.21) but not on the synthetic series. The trade
+        # COUNT roughly doubles: the level sits at the band's edge, so a
+        # trending stance re-sizes by a sliver on most bars. Fine under
+        # proportional costs, worse under per-ticket commissions or whole
+        # units (with whole_units the loop below already skips a re-size that
+        # rounds to the same contracts). 0.125 is the quarter rule's own
+        # tolerance, not the best of the sweep.
         q = _buffered_level(p, STANCE_BUFFER, tpl.sides)
     ready = ind["ready"] & ~np.isnan(p)
     atr_v = ind["atr"]; rvol = ind.get("rvol")

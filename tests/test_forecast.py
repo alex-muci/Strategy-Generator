@@ -281,8 +281,15 @@ class BufferTests(unittest.TestCase):
         want = [0.0, 0.0, 0.02, 0.2, 0.2, 0.2, -0.4, -0.4, -0.1]
         np.testing.assert_allclose(q, want, atol=1e-12)
         self.assertEqual(FC_BUFFER, 0.1)
-        np.testing.assert_allclose(forecast_stance(p, "long_only"), np.where(np.array(want) > 0, want, 0.0), atol=1e-12)
-        np.testing.assert_allclose(forecast_stance(p, "short_only"), np.where(np.array(want) < 0, want, 0.0), atol=1e-12)
+        # a one-sided template goes flat on any bar whose target has nothing on
+        # its side (-0.5, -0.45 and 0.0 for long-only) and bands from there: no
+        # memory of the short side, and two runs started apart agree from the
+        # first such bar (the old rule banded the raw target and zeroed the
+        # level afterwards, which encoded the short-side memory)
+        np.testing.assert_allclose(forecast_stance(p, "long_only"),
+                                   [0.0, 0.0, 0.02, 0.2, 0.2, 0.2, 0.0, 0.0, 0.0], atol=1e-12)
+        np.testing.assert_allclose(forecast_stance(p, "short_only"),
+                                   [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -0.4, -0.4, 0.0], atol=1e-12)
 
 
 class ValidateTests(unittest.TestCase):

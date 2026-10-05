@@ -37,6 +37,17 @@ class TestOnlineStudy(unittest.TestCase):
         ratio = row["turnover_direct"] / row["turnover"]
         self.assertTrue(0.5 <= ratio <= 2.0, ratio)
 
+    def test_spread_attrs_instrument_with_tick_runs_the_per_unit_sweep(self):
+        from extra_utils.online_study import synth
+        df = synth.calendar_spread(900, 1)
+        self.assertIn("tick", df.attrs["instrument"])
+        tpl = generator.generate_templates("online_forecast")[:1]
+        rows = evaluate(df, tpl, sides=("both",), jobs=1, dataset="cal", instrument=df.attrs["instrument"],
+                        train=300, test=100)
+        self.assertEqual(int(rows["cost_mult"].notna().sum()), 5)    # the swept multiples (the benchmark row has none)
+        self.assertTrue({"cost_drag_per_mult", "breakeven_mult"} <= set(rows.columns))
+        self.assertGreater(rows.loc[rows["family"] != "benchmark", "turnover_direct"].max(), 0)
+
     def test_breakeven(self):
         self.assertEqual(breakeven([0, 5, 10], [-1, -2, -3]), 0.0)
         self.assertEqual(breakeven([0, 5, 10], [1, 2, 3]), np.inf)

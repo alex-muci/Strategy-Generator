@@ -389,8 +389,10 @@ SYNTH = {"random_walk": random_walk, "tsmom": tsmom, "reversal_trend": reversal_
 
 
 def make_suite(seed=0, n_bars=3000):
-    """Default suite: name -> DataFrame."""
-    s = seed
+    """Default suite: name -> DataFrame. Generator k of suite `seed` is seeded
+    seed * 100 + k, so the suites of different seeds never share a stream
+    (with seed + k, random_walk_b of suite s was random_walk_a of suite s+1)."""
+    s = seed * 100
     return {
         "random_walk_a": random_walk(n_bars, s),
         "random_walk_b": random_walk(n_bars, s + 1),

@@ -978,20 +978,34 @@ came out of it; both leave `hedge` and `hedge_wide` bit for bit as they were.
   under a no-trade band (`STANCE_BUFFER` = 0.125 of a full size: the level
   stays while the stance is within the band, else moves to its near edge,
   the forecast channels' mechanism), with no stop or exit rule (the exit
-  style is inert); `walkforward.warmup_bars` adds `STANCE_SETTLE` bars for
-  the held level to forget its start. The band replaced rounding to quarters,
+  style is inert). On a one-sided template the level goes flat on any bar
+  whose stance has nothing on the template's side and bands from there, so
+  it carries no memory of the other side; `walkforward.warmup_bars` adds
+  `STANCE_SETTLE` (200) bars for the held level to forget its start (an
+  empirical bound: exact from 100 in 108 measured cases, see the
+  constant). The band replaced rounding to quarters,
   which chatters at the x.125 boundaries (a stance of 0.12 / 0.13 flips
-  between 0 and 0.25). Measured (Sharpe from bar 1000, 5 bps a side), quarters
-  vs band 0.1 / 0.15 / 0.2: SPY/TLT/GLD/USO two-sided average 0.21 vs 0.39 /
-  0.39 / 0.40, long-only 0.45 vs 0.49 / 0.49 / 0.48; 8 synthetic generators
-  x 8 seeds (random-walk null and futures spreads with per-tick costs)
-  two-sided -0.03 vs 0.03 / 0.05 / 0.06, long-only 0.06 vs 0.09 for all
-  three. Every width from 0.1 to 0.3 beat quarters; 0.125 is the quarter
-  rule's own tolerance, not the best of the sweep. It recovers the planted edge (2.9-3.0 on the slow
-  ladders). It follows `backtest`'s instrument rules (margin cap, whole
-  contracts, roll costs, prices through zero), and `live.py` refuses it: it
-  is a research entry. The family is `online_stance` (trend and learned, on
-  both slow ladders).
+  between 0 and 0.25). Measured (Sharpe from bar 1000, 5 bps a side),
+  quarters vs the band: SPY/TLT/GLD/USO two-sided average 0.21 vs 0.39 (bands
+  of 0.1 / 0.15 / 0.2: 0.39 / 0.39 / 0.40); 8 synthetic generators x 8
+  seeds (random-walk null and futures spreads with per-tick costs) a paired
+  two-sided gain of +0.05 to +0.11 Sharpe (+/- 0.02). The long-only gain on
+  the ETFs (0.45 vs 0.50) is one ETF (GLD) and noise. Most of the two-sided gain
+  is not the cost saving: at zero cost the Sharpe goes 0.28 -> 0.43 (about
+  83 % of the gain), a different exposure path; the cost drag falls from 0.07
+  to 0.04 Sharpe (notional turnover 3.2 -> 1.8x a year). The trade count
+  roughly doubles (the level sits at the band's edge, so a trending stance
+  re-sizes by a sliver on most bars): fine under proportional costs, worse
+  under per-ticket commissions or whole contracts. The unrounded stance beat
+  quarters on the 4 ETFs only, not on the synthetic series. Every width
+  from 0.1 to 0.3 beat quarters; 0.125 is the quarter rule's own tolerance,
+  not the best of the sweep. It recovers the planted edge (2.9-3.0 on the
+  slow ladders). It follows `backtest`'s instrument rules (margin cap, whole
+  contracts, roll costs, prices through zero), and `live.py` supports it: the
+  stance (a hedge committee's, a forecaster's) is published as one
+  market-on-open order for the change of holding, the size computed at the
+  last close. There is no stop or target order to publish. The family is
+  `online_stance` (trend and learned, on both slow ladders).
 - **`hedge_split`**: trend and mean reversion on their own time scales.
   The hold is decoupled from the lookback (`HedgeExpert.hold`; 0 keeps
   the old rule, hold = lookback). A **follow group** (Donchian and Keltner

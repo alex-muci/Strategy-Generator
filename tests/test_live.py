@@ -758,7 +758,7 @@ class StanceOrderTests(unittest.TestCase):
         tpl = StrategyTemplate("hs", direction_logic="trend", channel_type="hedge", entry_style="stance",
                                cost_bps=0.0, margin_per_unit=1000.0, point_value=10.0, vol_target=0.15,
                                max_leverage=50.0)
-        seen = self._roll(tpl, lookback=1200, step=5)       # the stance's warm-up is 1175 bars (STANCE_SETTLE)
+        seen = self._roll(tpl, lookback=1200, step=5)       # the stance's warm-up is 615 bars (410 + STANCE_SETTLE + 5, see walkforward.warmup_bars)
         self.assertGreater(seen["flat_to_pos"] + seen["pos_changed"], 3)
 
     def test_cash_asset_matches_within_the_open_to_close_ratio(self):

@@ -1220,25 +1220,58 @@ class StanceEntryTests(unittest.TestCase):
         np.testing.assert_allclose(w, [0.0, 0.0, 0.005, 0.005, 0.005], atol=1e-12)
         # a NaN holds the level but reports 0
         np.testing.assert_allclose(_buffered_level(np.array([0.5, np.nan, 0.45]), 0.125), [0.375, 0.0, 0.375])
-        # sides zero the forbidden side
+        # a one-sided band goes flat on a bar with no stance on its side and
+        # bands from there: never below 0 for long-only (the target's -0.6 is
+        # flat, not a level of -0.475 to climb back from)
         z = np.array([0.6, -0.6, 0.2, -0.2])
         np.testing.assert_allclose(_buffered_level(z, 0.125, "long_only"), [0.475, 0.0, 0.075, 0.0])
         np.testing.assert_allclose(_buffered_level(z, 0.125, "short_only"), [0.0, -0.475, 0.0, -0.075])
 
+    def test_a_one_sided_band_has_no_memory_of_the_forbidden_side(self):
+        """A long-only band goes flat on every bar whose stance has nothing on
+        the long side (negative or exactly 0) and bands from there, so what it
+        holds after such a bar does not depend on anything before it: the
+        bars before are a common restart, which is what lets a walk-forward
+        window warmed on a short buffer reproduce the full history (a band
+        clamped at 0 could keep any sliver in [0, buf] for as long as the
+        stance stayed at 0). Short-only is the mirror."""
+        p = np.array([0.3, -0.5, 0.2, -0.5, -0.5, 0.2, 0.5])
+        lo = _buffered_level(p, STANCE_BUFFER, "long_only")
+        np.testing.assert_allclose(lo, [0.175, 0.0, 0.075, 0.0, 0.0, 0.075, 0.375], atol=1e-12)
+        self.assertGreaterEqual(lo.min(), 0.0)
+        # different histories before a flat bar give the same levels after it
+        q = np.array([0.9, 0.0, 0.2, -0.5, -0.5, 0.2, 0.5])
+        np.testing.assert_allclose(_buffered_level(q, STANCE_BUFFER, "long_only")[1:], lo[1:], atol=1e-12)
+        np.testing.assert_allclose(_buffered_level(-p, STANCE_BUFFER, "short_only"), -lo, atol=1e-12)
+        # NaN holds and reports 0, and the caller's target is not touched
+        t = np.array([np.nan, -0.5, 0.2])
+        np.testing.assert_allclose(_buffered_level(t, 0.125, "long_only"), [0.0, 0.0, 0.075], atol=1e-12)
+        np.testing.assert_array_equal(t[1:], [-0.5, 0.2])
+
     def test_a_warmed_window_reproduces_the_full_history(self):
         """The held level remembers where it was, so warmup_bars adds
         STANCE_SETTLE: a window warmed on it returns what a full-history run
-        (first trade at the window start) does."""
+        (first trade at the window start) does. Checked on the slow ladder and
+        the shipped split ladder, on every side, and on a calendar spread
+        (per-unit costs, whole contracts, Roll)."""
         from walkforward import warmup_bars, window_backtest
         df = synthetic_ohlc(3000, seed=2)
-        for sides in ("both", "long_only"):
-            tpl = self._tpl(sides=sides)
-            self.assertEqual(warmup_bars(tpl), hedge_warmup(tpl.atr_n, "hedge_slow") + STANCE_SETTLE + 5)
+        cases = [("hedge_slow", sides, df, {}) for sides in ("both", "long_only")]
+        cases += [("hedge_split", sides, df, {}) for sides in ("both", "long_only", "short_only")]
+        from extra_utils.online_study import synth
+        sp = synth.calendar_spread(3000, 1)
+        inst = {k: v for k, v in sp.attrs["instrument"].items() if k != "tick"}
+        cases += [("hedge_split", sides, sp, dict(inst, cost_bps=0.0, whole_units=True)) for sides in ("both", "short_only")]
+        for ch, sides, d, kw in cases:
+            tpl = self._tpl(channel_type=ch, sides=sides, **kw)
+            self.assertEqual(warmup_bars(tpl),
+                             hedge_warmup(tpl.atr_n, "hedge_slow" if ch == "hedge_slow" else "hedge_split")
+                             + STANCE_SETTLE + 5)
             for st in (1800, 2100, 2500):
-                full = backtest(df, tpl, first_trade_bar=st)
-                win = window_backtest(df, tpl, st, st + 300)
+                full = backtest(d, tpl, first_trade_bar=st)
+                win = window_backtest(d, tpl, st, st + 300)
                 np.testing.assert_allclose(win["returns"].to_numpy(), full["returns"].to_numpy()[st:st + 300],
-                                           rtol=0, atol=1e-12, err_msg=f"{sides} {st}")
+                                           rtol=0, atol=1e-12, err_msg=f"{ch} {sides} {st} {'spread' if kw else ''}")
 
     def test_switches_it_would_ignore_are_refused(self):
         for kw in (dict(regime_filter="trend_only"), dict(bias_filter="sma"), dict(vol_filter=True),
