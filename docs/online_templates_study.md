@@ -175,6 +175,28 @@ Costs of the one-sided rule, stated plainly:
   that one is two-sided, which the rule does not touch: `FC_SETTLE` = 100
   still ships knowingly inexact, as before.
 
+Walk-forward on the synthetic suite (8 generators x 3 seeds, 3,500 bars,
+`TR-hsp-stance` at 5 bps or 1x the spread costs; every other template
+bit-identical two-sided), mean OOS Sharpe before -> after:
+
+| generator | two-sided | long-only |
+|---|---|---|
+| random walk (null) | -0.34 -> -0.30 | -0.27 -> -0.23 |
+| tsmom IC 0.02 | -0.01 -> 0.02 | 0.26 -> 0.28 |
+| tsmom IC 0.04 | 0.45 -> 0.37 | 0.58 -> 0.63 |
+| reversal + trend | -0.04 -> 0.00 | 0.11 -> 0.14 |
+| regime switch | 0.05 -> -0.02 | 0.28 -> 0.19 |
+| spread, half-life 5 | -0.43 -> -0.14 | |
+| spread, half-life 20 | -0.14 -> -0.06 | |
+| trending spread | 0.05 -> 0.11 | |
+| paired mean | +0.05 +/- 0.03 (24 runs) | +0.01 +/- 0.03 (15) |
+
+So out of sample the two-sided gain is real but small (1.5 standard
+errors), and it comes mostly from losing less where the template has no
+edge (the null, the spreads: the cost saving); where the planted trend is
+strongest it is slightly worse. The ETFs' +0.17 is at the top of what the
+synthetic suite supports.
+
 What this is not: the band-vs-quarters decision was taken on the same four
 ETF histories that give the headline numbers, after ~15 holding rules had
 been tried on them; the out-of-sample support is the synthetic suite on
