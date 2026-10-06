@@ -745,8 +745,22 @@ algorithm from the prediction-with-expert-advice literature:
   JMLR 2014), exponential weights whose learning rate is set from the
   accumulated mixability gap. It starts as plain **follow-the-leader**
   and only becomes more conservative when the data forces it to. No
-  learning rate, no threshold. Two additions, both parameter-free:
-  - **Discounting.** Losses and the gap decay with a *lifetime* `H`
+  learning rate, no threshold. Two additions, neither fitted:
+  - **Fixed share** (Herbster & Warmuth 1998; the default,
+    `--hedge-share fixed_share`). After every update a fraction `alpha`
+    of the weight is spread evenly over the experts. Nothing is
+    discounted, but every expert keeps at least `alpha / N`, so **no
+    expert is ever written off**: one that starts winning is in front
+    within a handful of bars (about 7 on the unit test's 0.2 edge),
+    however long it trailed. It is the forgetting built for a best
+    expert that *switches*. The rate is not a parameter: one learner
+    per expected number of switches `m` in the learner's memory
+    (`HEDGE_SHARE_SWITCHES` = 1/4 ... 8, `alpha = m / memory`), mixed
+    by the meta learner below, which weighs each rate by its realised
+    loss.
+  - **Discounting** (`--hedge-share discount`, the former default;
+    runs saved before the option existed replay this way). Losses and
+    the gap decay with a *lifetime* `H`
     (`gamma = 1 - 1/H`) instead of counting in full and then vanishing.
     Plain AdaHedge's learning rate only ever falls; a discounted gap
     lets it climb back after a calm stretch, so it reflects *recent*
@@ -754,7 +768,8 @@ algorithm from the prediction-with-expert-advice literature:
     expert's shortfall per bar, whatever it lost before, so **no
     expert is ever written off for good**: one that starts winning is
     back in front after about `H ln 2` bars.
-  - **A ladder of lifetimes** (`HEDGE_HORIZONS` = 20, 40, 80, 160
+  - **A ladder of rungs**: the switching rates above, or, discounted,
+    the lifetimes (`HEDGE_HORIZONS` = 20, 40, 80, 160
     bars, the lookback ladder doubled), one learner each, mixed on top
     by Vovk's aggregating algorithm with a unit learning rate (Bayesian
     averaging with likelihood `exp(-loss)`, discounted at the longest
@@ -771,13 +786,15 @@ algorithm from the prediction-with-expert-advice literature:
   `HEDGE_MEMORY` (250) bars, which keeps the learner state an exact
   function of a fixed number of past bars, reproducible from the
   walk-forward's warm-up buffer (see `walkforward.window_backtest`).
-  The window's edge now carries `gamma^250` of a bar's weight (e^-1.6
-  at H = 160, e^-3 at H = 80) instead of all of it: a horizon, not a
-  cliff. `strategy.hedge_diagnostics` returns, bar by bar, the expert
-  weights, the losses they were scored on, each lifetime's learning
-  rate, the meta learner's weights over the lifetimes (the short ones
-  gaining is the learner shortening its memory) and the *surprise*
-  (the played mixture's loss minus the best expert's).
+  Discounted, the window's edge carries `gamma^250` of a bar's weight
+  (e^-1.6 at H = 160, e^-3 at H = 80) instead of all of it: a horizon,
+  not a cliff. `strategy.hedge_diagnostics` returns, bar by bar, the
+  expert weights, the losses they were scored on, each rung's learning
+  rate, the meta learner's weights over the rungs (columns in bars: the
+  lifetimes, or `memory / m` between switches) and the *surprise* (the
+  played mixture's loss minus the best expert's). Fixed share against
+  discounting on planted edges and on SPY / TLT / USO / GLD:
+  [docs/hedge_fixed_share_study.md](docs/hedge_fixed_share_study.md).
 - **Channel**: the weight-averaged expert channel, i.e. an adaptive
   channel whose effective period is learned causally bar by bar. The
   exit channel uses the same weights over the ladder scaled by

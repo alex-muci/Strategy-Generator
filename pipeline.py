@@ -36,7 +36,7 @@ from robustness import (
 )
 from strategy import (
     annualized_sharpe, max_drawdown, periods_per_year, set_periods_per_year, compound,
-    periods_per_year_for_interval, SIDES,
+    periods_per_year_for_interval, SIDES, HEDGE_SHARE, HEDGE_SHARES, set_hedge_share,
 )
 from walkforward import matrix_cells, matrix_row, matrix_frame
 
@@ -118,6 +118,9 @@ def add_research_args(p: argparse.ArgumentParser, *, start: str) -> argparse.Arg
     p.add_argument("--cpcv-groups", type=int, default=8)
     p.add_argument("--cpcv-k", type=int, default=2)
     p.add_argument("--n-boot", type=int, default=1000)
+    p.add_argument("--hedge-share", default=HEDGE_SHARE, choices=HEDGE_SHARES,
+                   help="how the hedge learners forget: fixed share (one rung per expected number of "
+                        "switches in the memory, alpha = m / memory) or discounting (one rung per lifetime H)")
     return p
 
 
@@ -195,7 +198,14 @@ def eval_config(args, interval: str) -> dict:
         roll_cost_per_unit=float(getattr(args, "roll_cost_per_unit", 0.0) or 0.0),
         whole_units=bool(getattr(args, "whole_units", False)),
         cpcv_groups=args.cpcv_groups, cpcv_k=args.cpcv_k,
+        hedge_share=getattr(args, "hedge_share", HEDGE_SHARE),
     )
+
+
+def hedge_share_of(c: dict) -> str:
+    """The hedge learners' forgetting of a research config: a config written
+    before the option existed ran discounted."""
+    return c.get("hedge_share", "discount")
 
 
 def instrument_of(c: dict, asset: str | None = None) -> dict:
@@ -281,6 +291,7 @@ def init_worker(data: dict, cfg: dict) -> None:
     # a fresh process re-imports strategy at the daily default; without this every
     # annualized number computed in the pool would be wrong for intraday bars
     set_periods_per_year(cfg["periods_per_year"])
+    set_hedge_share(hedge_share_of(cfg))
 
 
 def _init_worker_from_file(path: str, cfg: dict) -> None:

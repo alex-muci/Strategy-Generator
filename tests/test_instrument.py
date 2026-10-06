@@ -584,7 +584,9 @@ class ParentEngineRegressionTests(unittest.TestCase):
     """Numbers computed once with the engine BEFORE the instrument fields
     existed (commit 766ad97), on synthetic_ohlc(900, seed=13) from bar 100:
     final equity, trade count, sum of the equity curve. The ATR rule with
-    default costs must reproduce them to the last digit."""
+    default costs must reproduce them to the last digit. The hedge case was
+    computed with the discounted learner, the default then, so it runs
+    discounted (strategy.HEDGE_SHARE)."""
 
     CASES = [
         (dict(), 96199.21803455162, 20, 87169986.55665812),
@@ -597,12 +599,27 @@ class ParentEngineRegressionTests(unittest.TestCase):
     ]
 
     def test_cash_engine_is_bit_identical_to_the_parent_commit(self):
+        import strategy
         df = synthetic_ohlc(900, seed=13)
+        share = strategy.HEDGE_SHARE
+        self.addCleanup(strategy.set_hedge_share, share)
+        strategy.set_hedge_share("discount")
         for kw, final, n_trades, total in self.CASES:
             res = backtest(df, StrategyTemplate("t", **kw), first_trade_bar=100)
             self.assertEqual(float(res["equity"].iloc[-1]), final, kw)
             self.assertEqual(len(res["trades"]), n_trades, kw)
             self.assertEqual(float(res["equity"].sum()), total, kw)
+
+    def test_the_fixed_share_learner_is_pinned_too(self):
+        """The same hedge case under the default learner (fixed share),
+        pinned when it became the default, so a numerical change in its
+        share step does not pass unnoticed."""
+        df = synthetic_ohlc(900, seed=13)
+        res = backtest(df, StrategyTemplate("t", channel_type="hedge", direction_logic="learned",
+                                            exit_style="target_stop"), first_trade_bar=100)
+        self.assertEqual(float(res["equity"].iloc[-1]), 97517.19454785736)
+        self.assertEqual(len(res["trades"]), 15)
+        self.assertEqual(float(res["equity"].sum()), 89244596.95579053)
 
 
 class NotionalCapAndBpsCostTests(unittest.TestCase):

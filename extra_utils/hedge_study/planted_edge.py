@@ -7,7 +7,10 @@ on it, the Sharpe of the learner's committee (what it is scored on) and the
 Sharpe of templates that trade it: a channel break (close_confirm entry) with
 the channel or time exit, and the 'stance' entry.
 
-    python extra_utils/hedge_study/planted_edge.py
+    python extra_utils/hedge_study/planted_edge.py [fixed_share]
+
+The published numbers (docs/hedge_real_data_study.md) were computed with the
+discounted learner, so that is what it runs unless told otherwise.
 """
 import itertools
 import os
@@ -50,6 +53,7 @@ def planted(T, n_edge, side, mu, seed, vol=0.01):
 
 
 def main():
+    S.set_hedge_share(sys.argv[1] if len(sys.argv) > 1 else "discount")
     rows, st = [], 1000
     for mu, (n, side), seed in itertools.product([0.05, 0.1, 0.2], [(20, -1), (40, 1)], range(3)):
         df = planted(3000, n, side, mu, seed)

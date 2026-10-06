@@ -61,7 +61,9 @@ import generator
 import pipeline
 from data import load_csv
 from extra_utils.online_study import synth
-from strategy import (annualized_sharpe, compound, max_drawdown, periods_per_year, set_periods_per_year)
+from strategy import (annualized_sharpe, compound, max_drawdown, periods_per_year, set_periods_per_year,
+                      set_hedge_share, HEDGE_SHARES)
+import strategy
 from walkforward import position_units, walk_forward, window_backtest
 
 COST_BPS = (0, 2, 5, 10, 20)
@@ -107,8 +109,9 @@ def replay_turnover(df: pd.DataFrame, res: dict) -> float:
 # one job
 # --------------------------------------------------------------------------
 
-def _init_worker(ppy: int) -> None:
+def _init_worker(ppy: int, share: str = "discount") -> None:
     set_periods_per_year(ppy)
+    set_hedge_share(share)
 
 
 def _instrument_fields(instrument) -> dict:
@@ -129,8 +132,9 @@ def _costed(tpl, sides, cost_bps, mult, instrument):
 
 
 def _job(args) -> dict:
-    df, tpl, family, sides, cost, mult, instrument, train, test, ppy = args
+    df, tpl, family, sides, cost, mult, instrument, train, test, ppy, share = args
     set_periods_per_year(ppy)      # a pool built without _init_worker must still annualise alike
+    set_hedge_share(share)         # ... and run the hedge learners alike
     tpl = _costed(tpl, sides, cost, mult, instrument)
     res = walk_forward(df, tpl, generator.param_grid_for(tpl), train_bars=train, test_bars=test)
     r = res["oos_returns"]
@@ -229,14 +233,15 @@ def evaluate(df, templates, *, cost_bps_list=COST_BPS, sides=("both", "long_only
     fams = templates if isinstance(templates, dict) else {family: list(templates)}
     sweep = [(0.0, m) for m in COST_MULTS] if instrument else [(float(c), np.nan) for c in cost_bps_list]
     ppy = periods_per_year()
-    work = [(df, t, f, sd, c, m, instrument, train, test, ppy)
+    work = [(df, t, f, sd, c, m, instrument, train, test, ppy, strategy.HEDGE_SHARE)
             for f, ts in fams.items() for t in ts for sd in sides for c, m in sweep]
     if pool is not None:
         res = list(pool.map(_job, work, chunksize=1))
     elif jobs <= 1:
         res = [_job(w) for w in work]
     else:
-        with ProcessPoolExecutor(jobs, initializer=_init_worker, initargs=(periods_per_year(),)) as ex:
+        with ProcessPoolExecutor(jobs, initializer=_init_worker,
+                                 initargs=(periods_per_year(), strategy.HEDGE_SHARE)) as ex:
             res = list(ex.map(_job, work, chunksize=1))
     rows = pd.DataFrame(res)
     oos_start = rows.pop("oos_start").dropna().min() if len(rows) and rows["oos_start"].notna().any() else None
@@ -314,7 +319,11 @@ def main(argv=None):
     ap.add_argument("--test", type=int, default=125)
     ap.add_argument("--jobs", type=int, default=4)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--hedge-share", default="discount", choices=HEDGE_SHARES,
+                    help="how the hedge learners forget; 'discount', the setting the published study "
+                         "(docs/online_templates_study.md) ran with, by default")
     a = ap.parse_args(argv)
+    set_hedge_share(a.hedge_share)
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     parts, t0 = [], time.time()

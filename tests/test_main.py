@@ -73,9 +73,39 @@ def _seen_by_worker(asset):
 class _RestoresAnnualization(unittest.TestCase):
     def setUp(self):
         self._ppy = S.periods_per_year()
+        self._share = S.HEDGE_SHARE
 
     def tearDown(self):
         S.set_periods_per_year(self._ppy)
+        S.set_hedge_share(self._share)
+
+
+def _share_seen_by_worker(_):
+    return P._CFG["hedge_share"], S.HEDGE_SHARE
+
+
+class HedgeShareConfigTests(_RestoresAnnualization):
+    """--hedge-share picks how the hedge learners forget; it travels in the
+    run's config to every worker, and a config written before the option
+    existed (no key) is replayed the way it ran: discounted."""
+
+    def test_the_flag_reaches_the_config_and_the_workers(self):
+        self.assertEqual(M.parse_args([]).hedge_share, "fixed_share")
+        self.assertEqual(_cfg()["hedge_share"], "fixed_share")
+        cfg = _cfg(hedge_share="discount")
+        self.assertEqual(cfg["hedge_share"], "discount")
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            M.parse_args(["--hedge-share", "decay"])
+        with P.worker_pool(2, {"a": None}, cfg, context=get_context("spawn")) as pool:
+            self.assertEqual(S.HEDGE_SHARE, "discount")            # this process too
+            seen = set(P.pool_map(pool, _share_seen_by_worker, range(4)))
+        self.assertEqual(seen, {("discount", "discount")})
+
+    def test_an_old_config_runs_discounted(self):
+        self.assertEqual(P.hedge_share_of({"periods_per_year": 252}), "discount")
+        self.assertEqual(P.hedge_share_of(_cfg()), "fixed_share")
+        P.init_worker({}, {"periods_per_year": 252})
+        self.assertEqual(S.HEDGE_SHARE, "discount")
 
 
 class VolTargetRunTests(unittest.TestCase):

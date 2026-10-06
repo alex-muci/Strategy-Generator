@@ -27,8 +27,22 @@ from strategy import (  # noqa: E402
     HEDGE_WIDE_K, hedge_position, hedge_position_sized, hedge_scored_sides, _allowed, _hedge_stances,
     hedge_active, _window_mean, EXIT_STYLES, _hedge_cached,
     sma, atr, hedge_stance, _buffered_level, STANCE_BUFFER, STANCE_SETTLE,
+    hedge_rungs, set_hedge_share, HEDGE_SHARES, HEDGE_SHARE_SWITCHES,
 )
+import strategy as S  # noqa: E402
 from generator import generate_templates, param_grid_for  # noqa: E402
+from contextlib import contextmanager  # noqa: E402
+
+
+@contextmanager
+def hedge_share(share):
+    """Run the block with every hedge learner forgetting by `share`."""
+    old = S.HEDGE_SHARE
+    set_hedge_share(share)
+    try:
+        yield
+    finally:
+        set_hedge_share(old)
 
 # the online family as it was before the redesign (every direction on the plain ladder, six regime
 # filters, an SMA bias or none): the tests below check the plain ladder through it
@@ -444,7 +458,7 @@ class HedgeChannelTests(unittest.TestCase):
         c = 1e-5
         loss = np.array([(0, c), (0, c), (0, c), (0, 10 * c), (0, 300 * c), (0, 3000 * c),   # expert 0 leads ...
                          (1.0, 0.0)])                                                        # ... and is routed
-        W, eta, _, _ = _adahedge_loop(loss, HEDGE_MEMORY)
+        W, eta, _, _ = _adahedge_loop(loss, HEDGE_MEMORY, share="discount")
         self.assertEqual(W[5, 1], 0.0)                       # the precondition: written off completely
         self.assertAlmostEqual(W[5, 0], 1.0, places=12)
         self.assertTrue((eta[5] > 745.0).all())              # and exp(-eta * 1) underflows as well
@@ -454,9 +468,15 @@ class HedgeChannelTests(unittest.TestCase):
         # about that gap: weights near 2/3 and 1/3 (exactly so without the
         # discount), not 1 and 0
         np.testing.assert_allclose(W[6], [1 / 3, 2 / 3], atol=2e-2)
+        # fixed share never writes an expert off (every rung keeps alpha / N on
+        # it), and the same round still ends follow-the-leader
+        W, eta, _, _ = _adahedge_loop(loss, HEDGE_MEMORY, share="fixed_share")
+        self.assertGreater(W[5, 1], 0.0)
+        self.assertTrue(np.isfinite(W).all() and np.isfinite(eta).all())
+        self.assertGreater(W[6, 1], 0.5)
 
     def test_no_expert_is_written_off_for_good(self):
-        """A discounted deficit is bounded by the lifetime times the shortfall
+        """(Discounting.) A discounted deficit is bounded by the lifetime times the shortfall
         per bar, whatever the expert lost before, and the shortest lifetime
         on the ladder bounds it tightest: an expert that starts winning is
         back in front within tens of bars, and the meta learner, scoring
@@ -464,7 +484,7 @@ class HedgeChannelTests(unittest.TestCase):
         loss = np.full((440, 4), 0.6)
         loss[:400, 0] = 0.4                    # 400 rounds of write-off...
         loss[400:, 3] = 0.4                    # ...then the trailer wins by the same edge
-        W, _, V, _ = _adahedge_loop(loss, HEDGE_MEMORY)
+        W, _, V, _ = _adahedge_loop(loss, HEDGE_MEMORY, share="discount")
         self.assertLess(W[399, 3], 1e-6)
         self.assertGreater(W[399 + 30, 3], 0.5)                     # in front within thirty rounds
         self.assertGreater(V[399 + 30, :2].sum(), V[399, :2].sum())  # carried by the short lifetimes
@@ -484,18 +504,20 @@ class HedgeChannelTests(unittest.TestCase):
         np.testing.assert_array_equal(W[500 + HEDGE_MEMORY:], W2[HEDGE_MEMORY:])
 
     def test_eta_recovers_after_a_calm_stretch(self):
-        """Plain AdaHedge's learning rate only ever falls: once burnt, always
-        cautious. Discounting the mixability gap lets it climb back when the
-        experts stop disagreeing, faster at the shorter lifetimes."""
+        """(Discounting.) Plain AdaHedge's learning rate only ever falls: once
+        burnt, always cautious. Discounting the mixability gap lets it climb
+        back when the experts stop disagreeing, faster at the shorter
+        lifetimes. (Under fixed share the gap is not discounted: eta recovers
+        when the burn leaves the memory.)"""
         rng = np.random.default_rng(1)
         loss = np.vstack([rng.uniform(0, 1, (100, 4)), np.full((150, 4), 0.5)])
-        _, eta, _, _ = _adahedge_loop(loss, HEDGE_MEMORY)
+        _, eta, _, _ = _adahedge_loop(loss, HEDGE_MEMORY, share="discount")
         self.assertTrue((eta[249] > 2 * eta[99]).all())
         self.assertGreater(eta[249, 0], 100 * eta[99, 0])
         self.assertTrue((np.diff(eta[249]) < 0).all())       # the shortest lifetime recovered most
 
     def test_meta_learner_shortens_the_memory_on_a_regime_break(self):
-        """The lifetimes are a ladder the learner picks from: when the leader
+        """(Discounting.) The lifetimes are a ladder the learner picks from: when the leader
         changes, the learners with a short memory adapt first and their hedge
         loss wins the meta learner over; once the new leader is established
         the long-memory learner, which concentrates most, takes it back."""
@@ -505,10 +527,89 @@ class HedgeChannelTests(unittest.TestCase):
         loss[:1000, 0] -= 0.2
         loss[1000:, 3] -= 0.2
         loss = np.clip(loss, 0, 1)
-        _, _, V, _ = _adahedge_loop(loss, HEDGE_MEMORY)
+        _, _, V, _ = _adahedge_loop(loss, HEDGE_MEMORY, share="discount")
         short = V[:, :2].sum(axis=1)
         self.assertLess(short[950:1000].mean(), short[1005:1060].mean())      # shorter memory right after the break
         self.assertLess(short[1300:1500].mean(), short[1005:1060].mean())     # and back to a long one after
+
+    def test_fixed_share_is_the_default_and_a_switch(self):
+        """Fixed share is the default way to forget; discounting is the other
+        setting, and the two give different learners on the same losses.
+        hedge_rungs maps a ladder to its rungs: the lifetimes when
+        discounting, the expected switches per memory under fixed share."""
+        self.assertEqual(S.HEDGE_SHARE, "fixed_share")
+        self.assertEqual(set(HEDGE_SHARES), {"fixed_share", "discount"})
+        g, a, gm, r = hedge_rungs(HEDGE_MEMORY, HEDGE_HORIZONS, "fixed_share")
+        np.testing.assert_array_equal(g, 1.0)
+        np.testing.assert_allclose(a, np.array(HEDGE_SHARE_SWITCHES) / HEDGE_MEMORY)
+        np.testing.assert_allclose(r, HEDGE_MEMORY / np.array(HEDGE_SHARE_SWITCHES))
+        g, a, gm2, r = hedge_rungs(HEDGE_MEMORY, HEDGE_HORIZONS, "discount")
+        np.testing.assert_allclose(g, 1.0 - 1.0 / np.array(HEDGE_HORIZONS))
+        np.testing.assert_array_equal(a, 0.0)
+        self.assertEqual(gm, gm2)                                  # the meta learner is discounted alike
+        with self.assertRaises(ValueError):
+            hedge_rungs(HEDGE_MEMORY, HEDGE_HORIZONS, "both")
+        with self.assertRaises(ValueError):          # alpha = m / memory must stay below 1
+            hedge_rungs(6, HEDGE_HORIZONS, "fixed_share")
+        with self.assertRaises(ValueError):
+            set_hedge_share("discounted")
+        self.assertEqual(S.HEDGE_SHARE, "fixed_share")
+        rng = np.random.default_rng(2)
+        loss = rng.uniform(0, 1, (400, 4))
+        np.testing.assert_array_equal(_adahedge_loop(loss)[0], _adahedge_loop(loss, share="fixed_share")[0])
+        self.assertGreater(np.abs(_adahedge_loop(loss, share="discount")[0] - _adahedge_loop(loss)[0]).max(), 0.01)
+        # everything built on the learner follows the setting, cache included
+        df = self.df
+        W = hedge_weights(df, 20, "learned", 5.0)
+        with hedge_share("discount"):
+            Wd = hedge_weights(df, 20, "learned", 5.0)
+            d = hedge_diagnostics(df, 20, "learned", 5.0)
+            self.assertEqual(list(d["eta"].columns), list(HEDGE_HORIZONS))
+        self.assertGreater(np.abs(W - Wd).max(), 0.01)
+        np.testing.assert_array_equal(hedge_weights(df, 20, "learned", 5.0), W)
+        self.assertEqual(list(hedge_diagnostics(df, 20, "learned", 5.0)["eta"].columns),
+                         list(HEDGE_MEMORY / np.array(HEDGE_SHARE_SWITCHES)))
+
+    def test_fixed_share_keeps_every_expert_and_revives_it_at_once(self):
+        """Fixed share spreads alpha of the weight evenly after every update,
+        so no expert's weight falls under (smallest alpha) / N, and a
+        written-off expert that starts winning is in front within a few
+        rounds, however long it trailed: the time to revive depends on
+        log(1/alpha), not on the deficit."""
+        rng = np.random.default_rng(0)
+        loss = rng.uniform(0, 1, (600, 6))
+        loss[:, 2] = np.clip(loss[:, 2] - 0.3, 0, 1)            # a strong leader the others trail
+        W = _adahedge_loop(loss, HEDGE_MEMORY, share="fixed_share")[0]
+        floor = min(HEDGE_SHARE_SWITCHES) / HEDGE_MEMORY / 6
+        self.assertGreaterEqual(W.min(), floor * (1 - 1e-9))
+        np.testing.assert_allclose(W.sum(axis=1), 1.0)
+        lead = []
+        for pre in (100, 240):
+            loss = np.full((pre + 60, 4), 0.6)
+            loss[:pre, 0] = 0.4
+            loss[pre:, 3] = 0.4
+            W = _adahedge_loop(loss, HEDGE_MEMORY, share="fixed_share")[0]
+            Wd = _adahedge_loop(loss, HEDGE_MEMORY, share="discount")[0]
+            self.assertGreater(W[pre - 1, 3], 1e-3)                # never written off ...
+            self.assertLess(Wd[pre - 1, 3], 1e-60)                 # ... where discounting has
+            k = int(np.argmax(W[pre - 1:, 3] > 0.5))
+            lead.append(k)
+            self.assertLess(k, int(np.argmax(Wd[pre - 1:, 3] > 0.5)))   # in front sooner than discounted
+        self.assertLessEqual(max(lead), 10)
+        self.assertLessEqual(abs(lead[0] - lead[1]), 1)            # whatever it lost before
+
+    def test_fixed_share_with_alpha_zero_is_plain_adahedge(self):
+        """A rung with alpha = 0 and no discount is the plain algorithm: eta
+        only falls inside the window, and the weights are exp(-eta d) over
+        the cumulative deficits."""
+        rng = np.random.default_rng(4)
+        loss = rng.uniform(0, 1, (120, 3))
+        W, ETA, _, _, _ = S._hedge_fast(loss, 1000, np.ones(1), np.zeros(1), 1.0)
+        self.assertTrue((np.diff(ETA[1:, 0]) <= 1e-12).all())
+        L = loss.cumsum(axis=0)
+        d = L - L.min(axis=1, keepdims=True)
+        w = np.exp(-ETA[:, :1] * d)
+        np.testing.assert_allclose(W[1:], (w / w.sum(axis=1, keepdims=True))[1:], rtol=1e-9)
 
     def test_costs_move_weight_to_the_slower_experts(self):
         """Each expert pays the sides it trades, in ATRs, as the engine
@@ -537,7 +638,7 @@ class HedgeChannelTests(unittest.TestCase):
         np.testing.assert_array_equal(d["weights"].to_numpy(), W)
         self.assertEqual(list(d["weights"].columns), ["follow_10", "follow_20", "follow_40", "follow_80",
                                                       "fade_10", "fade_20", "fade_40", "fade_80"])
-        self.assertEqual(list(d["eta"].columns), list(HEDGE_HORIZONS))
+        self.assertEqual(list(d["eta"].columns), list(hedge_rungs(HEDGE_MEMORY, HEDGE_HORIZONS)[3]))
         np.testing.assert_allclose(d["horizon_weights"].sum(axis=1), 1.0)
         self.assertTrue((d["surprise"] >= 0).all() and (d["surprise"] <= 1).all())
         self.assertTrue(((d["loss"] >= 0) & (d["loss"] <= 1)).all().all())
@@ -577,7 +678,9 @@ class HedgeChannelTests(unittest.TestCase):
         # on a strong trend the trend learner concentrates on the slowest expert...
         df = trending_series()
         W = hedge_weights(df, 20, "trend")
-        self.assertGreater(W[-500:, 2:].sum(axis=1).mean(), 0.9)   # the two slowest experts
+        self.assertGreater(W[-500:, 2:].sum(axis=1).mean(), 0.8)   # the two slowest experts: 0.84 here; fixed
+                                                                   # share keeps 16 % on the two fast ones
+                                                                   # (discounted: 0.95, 5 %)
         tr = backtest(df, StrategyTemplate("t", channel_type="hedge", cost_bps=0.0))
         ct = backtest(df, StrategyTemplate("t", channel_type="hedge", direction_logic="countertrend", cost_bps=0.0))
         self.assertGreater(tr["stats"]["total_return"], 0.2)
@@ -633,8 +736,15 @@ class HedgeChannelTests(unittest.TestCase):
         learned = backtest(df, StrategyTemplate("t", channel_type="hedge", direction_logic="learned", cost_bps=0.0))
         follow = backtest(df, StrategyTemplate("t", channel_type="hedge", direction_logic="trend", cost_bps=0.0))
         fade = backtest(df, StrategyTemplate("t", channel_type="hedge", direction_logic="countertrend", cost_bps=0.0))
-        self.assertGreater(learned["stats"]["total_return"], follow["stats"]["total_return"])
-        self.assertGreater(learned["stats"]["total_return"], fade["stats"]["total_return"])
+        # by Sharpe: the learned direction is sized by its conviction, which
+        # fixed share keeps lower than discounting, so its total return
+        # measures the size as much as the skill (Sharpe 1.83 against 1.10
+        # and -0.60 here, 1.73 discounted). By total return the learned
+        # direction no longer beats trend-only on this series under fixed
+        # share (0.652 against 0.664; discounted 0.696 against 0.651).
+        sr = lambda r: annualized_sharpe(r["returns"])   # noqa: E731
+        self.assertGreater(sr(learned), sr(follow) + 0.3)
+        self.assertGreater(sr(learned), sr(fade))
         # a trade keeps the exit logic of the side it was opened under
         reasons = {t["reason"] for t in learned["trades"]}
         self.assertTrue({"channel", "midline"} & reasons)
@@ -700,7 +810,10 @@ class WideLadderTests(unittest.TestCase):
             np.testing.assert_array_equal(hedge_weights(df, 20, "learned", 5.0, slow),
                                           _adahedge_loop(loss, HEDGE_SLOW_MEMORY, HEDGE_SLOW_HORIZONS)[0])
         d = hedge_diagnostics(df, 20, "learned", 5.0, "hedge_wide_slow")
-        self.assertEqual(list(d["eta"].columns), list(HEDGE_SLOW_HORIZONS))
+        self.assertEqual(list(d["eta"].columns), list(HEDGE_SLOW_MEMORY / np.array(HEDGE_SHARE_SWITCHES)))
+        with hedge_share("discount"):
+            d = hedge_diagnostics(df, 20, "learned", 5.0, "hedge_wide_slow")
+            self.assertEqual(list(d["eta"].columns), list(HEDGE_SLOW_HORIZONS))
         # a window warmed on hedge_warmup bars matches the full-history run
         warm = hedge_warmup(20, "hedge_slow")
         full = hedge_weights(df, 20, "learned", 5.0, "hedge_slow")
@@ -887,7 +1000,9 @@ class WideLadderTests(unittest.TestCase):
                 self.assertTrue((S <= 0).sum() > 0 and (S < 0).sum() == 0)
             elif sides == "short_only":
                 self.assertTrue((pos[warm:] <= 0).all())
-            self.assertGreater(np.abs(d[warm:]).max(), 0.5); self.assertLess(np.abs(d[warm:]).min(), 0.05)   # graded, not a flag
+            # graded, not a flag; fixed share's floor keeps the smallest conviction
+            # near 6 % on this series (0.3 % discounted)
+            self.assertGreater(np.abs(d[warm:]).max(), 0.5); self.assertLess(np.abs(d[warm:]).min(), 0.1)
         # the plain ladder's direction is untouched
         np.testing.assert_array_equal(hedge_direction(df, 20, 0.0),
                                       np.where(np.arange(len(df)) < hedge_warmup(20), np.nan,
@@ -911,7 +1026,9 @@ class WideLadderTests(unittest.TestCase):
         self.assertLess(np.abs(d[900:]).mean(), 0.3)
         self.assertLess(u[900:].mean(), 0.35)
         plain = hedge_direction(df, 20, 5.0, "hedge", "long_only")
-        self.assertGreater(np.abs(plain[900:]).mean(), np.abs(d[900:]).mean() + 0.2)
+        # the plain ladder keeps twice the size (0.32 against 0.16; discounted
+        # 0.53 against 0.13): a ratio, as fixed share shrinks both
+        self.assertGreater(np.abs(plain[900:]).mean(), 1.5 * np.abs(d[900:]).mean())
         res = backtest(df, StrategyTemplate("t", channel_type="hedge_wide", direction_logic="learned", sides="long_only"))
         ref = backtest(df, StrategyTemplate("t", channel_type="hedge", direction_logic="learned", sides="long_only"))
         leg = lambda r: float(r["equity"].iloc[-1] / r["equity"].iloc[900] - 1)
@@ -1288,8 +1405,11 @@ class StanceEntryTests(unittest.TestCase):
         df[["Open", "High", "Low", "Close"]] -= float(df["Close"].median())   # crosses zero
         df["Roll"] = 0.0
         df.iloc[::63, df.columns.get_loc("Roll")] = 1.0
+        # 2 % risk: whole contracts need a committee position worth at least
+        # one, and fixed share's committee is the less concentrated (at 1 %
+        # it trades once here, discounting 7 times)
         tpl = self._tpl(channel_type="hedge_split", cost_bps=0.0, cost_per_unit=2.5, point_value=100.0,
-                        margin_per_unit=500.0, whole_units=True, roll_cost_per_unit=4.0)
+                        margin_per_unit=500.0, whole_units=True, roll_cost_per_unit=4.0, risk_pct=0.02)
         res = backtest(df, tpl, fixed_capital=True)
         self.assertGreater(len(res["trades"]), 5)
         self.assertTrue(all(t["shares"] == int(t["shares"]) and t["shares"] >= 1 for t in res["trades"]))
@@ -1357,9 +1477,9 @@ class SplitLadderTests(unittest.TestCase):
         self.assertEqual(len(labels), nf + nr)
         self.assertEqual(len(set(labels)), len(labels))
         d = hedge_diagnostics(self.df, 20, "learned", 5.0, "hedge_split")
-        self.assertEqual(list(d["eta"].columns), list(HEDGE_SPLIT_LEARNERS["top"][1]))
+        self.assertEqual(list(d["eta"].columns), list(hedge_rungs(*HEDGE_SPLIT_LEARNERS["top"])[3]))
         d = hedge_diagnostics(self.df, 20, "countertrend", 5.0, "hedge_split")
-        self.assertEqual(list(d["eta"].columns), list(HEDGE_SPLIT_LEARNERS["fade"][1]))
+        self.assertEqual(list(d["eta"].columns), list(hedge_rungs(*HEDGE_SPLIT_LEARNERS["fade"])[3]))
 
     def test_groups_run_their_own_learners(self):
         """The learned weights are the top weight times each group's own

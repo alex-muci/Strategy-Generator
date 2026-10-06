@@ -33,8 +33,10 @@ Switches (define a "template" -- a structurally distinct strategy):
                                    (HEDGE_LADDER) is weighted bar by bar by
                                    AdaHedge, a parameter-free exponential-
                                    weights (Hedge / follow-the-leader)
-                                   learner, discounted over a ladder of
-                                   lifetimes (HEDGE_HORIZONS) it also learns
+                                   learner, with fixed share over a ladder of
+                                   switching rates (or, HEDGE_SHARE =
+                                   'discount', discounted over a ladder of
+                                   lifetimes HEDGE_HORIZONS) it also learns
                                    to pick from, scoring the last
                                    HEDGE_MEMORY bars net of cost_bps; the
                                    channel is the weight-averaged expert
@@ -196,6 +198,16 @@ def set_periods_per_year(n: int) -> None:
     if n < 1:
         raise ValueError(f"periods_per_year must be >= 1, got {n}")
     PERIODS_PER_YEAR = n
+
+
+def set_hedge_share(share: str) -> None:
+    """Set how every hedge learner forgets: 'fixed_share' or 'discount' (see
+    `hedge_rungs`). Like set_periods_per_year, call it before running
+    anything and in every worker process (pipeline.init_worker does it)."""
+    global HEDGE_SHARE
+    if share not in HEDGE_SHARES:
+        raise ValueError(f"unknown hedge share {share!r}, expected one of {HEDGE_SHARES}")
+    HEDGE_SHARE = share
 
 
 INTRADAY_MINUTES = {"1h": 60, "60m": 60, "90m": 90, "30m": 30, "15m": 15, "5m": 5, "1m": 1}
@@ -392,8 +404,25 @@ def channel(df: pd.DataFrame, kind: str, n: int, k: float, atr_n: int,
 #                learning rate eta = ln(N) / (accumulated mixability gap)
 #                starts at infinity, i.e. follow-the-leader, and shrinks
 #                only as much as the data forces it to. Two changes to the
-#                plain algorithm, both parameter-free:
-#                - DISCOUNTING: losses and the gap decay with a lifetime H
+#                plain algorithm, both free of fitted parameters:
+#                - FORGETTING, one of two kinds (HEDGE_SHARE, hedge_rungs):
+#                  FIXED SHARE (Herbster & Warmuth 1998, the default):
+#                  after each update a fraction alpha of the weight is
+#                  spread evenly over the experts. Nothing is discounted:
+#                  the evidence is kept, but every expert keeps at least
+#                  alpha / N of the weight, so a deficit is bounded by
+#                  log(N / alpha) / eta and an expert that starts winning
+#                  takes over in a number of bars that grows with
+#                  log(1/alpha) and its edge, not with how long it trailed.
+#                  It is the forgetting matched to a best expert that
+#                  SWITCHES (its regret is that of the best sequence of
+#                  experts with m switches), where discounting throws
+#                  away evidence even while nothing has changed. The rate
+#                  is not fitted: one learner per expected number of
+#                  switches in the memory (HEDGE_SHARE_SWITCHES, alpha =
+#                  m / memory) and the meta learner below weighs them.
+#                  DISCOUNTING (HEDGE_SHARE = 'discount', the former
+#                  default): losses and the gap decay with a lifetime H
 #                  (gamma = 1 - 1/H). Plain AdaHedge's eta only ever
 #                  falls; a discounted gap lets it rise again after a calm
 #                  stretch, so eta reflects RECENT surprise. A discounted
@@ -401,8 +430,15 @@ def channel(df: pd.DataFrame, kind: str, n: int, k: float, atr_n: int,
 #                  per bar, so no expert is ever written off for good: one
 #                  that starts winning is back in front after about
 #                  H ln 2 bars, whatever it lost before.
-#                - A LADDER OF LIFETIMES HEDGE_HORIZONS instead of one
-#                  memory: one learner per lifetime, and a Bayesian
+#                  On a constant planted edge discounting concentrates a
+#                  little more; on an edge that moves between experts
+#                  fixed share tracks it better; on SPY / TLT / USO / GLD
+#                  the learners are within noise, and the online family's
+#                  nested walk-forward was worse under fixed share
+#                  (docs/hedge_fixed_share_study.md).
+#                - A LADDER OF RUNGS instead of one rate (the lifetimes
+#                  HEDGE_HORIZONS, or the switching rates): one learner
+#                  per rung, and a Bayesian
 #                  mixture on top (Vovk's aggregating algorithm, unit
 #                  rate, see _hedge_window) scores each learner on its
 #                  own hedge loss. When the long-memory learner is surprised
@@ -412,10 +448,13 @@ def channel(df: pd.DataFrame, kind: str, n: int, k: float, atr_n: int,
 #                  in a stable regime the long-memory learner is the more
 #                  concentrated and takes the weight back. The played
 #                  weights stay a convex combination of the experts.
-#                (A fixed-share floor on the weights was tried and
-#                dropped: it bought no revival the ladder does not already
-#                give, and it flipped the learned direction on every
-#                pullback inside a trend.)
+#                (A fixed-share floor ON TOP of the discounted learners
+#                was tried and dropped: it bought no revival the ladder of
+#                lifetimes does not already give, and it flipped the
+#                learned direction on every pullback inside a trend. Fixed
+#                share INSTEAD of discounting, with rates of a few switches
+#                per memory rather than per lifetime, is a different
+#                learner: see the study for its direction flips.)
 #                Everything is still restarted every bar over the last
 #                HEDGE_MEMORY bars and every loss in them is a function
 #                of the last 2 n bars (the stance looks back n bars for a
@@ -425,9 +464,10 @@ def channel(df: pd.DataFrame, kind: str, n: int, k: float, atr_n: int,
 #                forward's warm-up buffer relies on (walkforward.
 #                window_backtest: a window warmed on `warmup_bars` of
 #                history must match a full-history run exactly). The
-#                window's edge now carries gamma^HEDGE_MEMORY of a bar's
-#                weight (e^-1.6 at H = 160, e^-3 at H = 80, e^-6 at H =
-#                40) instead of all of it: a horizon, not a cliff.
+#                window's edge carries, when discounted, gamma^HEDGE_MEMORY
+#                of a bar's weight (e^-1.6 at H = 160, e^-3 at H = 80,
+#                e^-6 at H = 40) instead of all of it: a horizon, not a
+#                cliff; under fixed share the window is the cliff.
 #   * channel  : upper/lower/mid = the weight-averaged expert channels. The
 #                exit channel reuses the weights over the ladder scaled by
 #                HEDGE_EXIT_SCALE (Turtle 20/10, 55/20 style).
@@ -449,6 +489,12 @@ HEDGE_HORIZONS = (20, 40, 80, 160)   # lifetimes H of the discounted learners (g
                                      # flip the learned direction more inside a trend (16 fades 11 % of a
                                      # trend's bars on the regime test series, 20 7 %, 32 7 %, 64 1 %)
 HEDGE_MODES = ("trend", "countertrend", "learned")
+HEDGE_SHARES = ("fixed_share", "discount")
+HEDGE_SHARE = "fixed_share"   # how a learner forgets: fixed share (the default) or discounting, see hedge_rungs
+                              # and docs/hedge_fixed_share_study.md
+HEDGE_SHARE_SWITCHES = (0.25, 0.5, 1.0, 2.0, 4.0, 8.0)   # fixed-share rungs: expected switches of the best
+                              # expert per learner memory (alpha = m / memory), from "about none" to monthly
+                              # on a year of bars; the meta learner weighs them
 
 # The wide ladder ('hedge_wide'). Every number here is a rung, fixed in
 # advance like HEDGE_LADDER, never fitted.
@@ -717,16 +763,33 @@ def hedge_experts(mode: str, ladder: str = "hedge"):
             np.array([float(e.side) for e in experts]))
 
 
-def _hedge_round(l, d, w, z, delta, eta, gamma):
+def _hedge_round(l, d, w, z, delta, eta, gamma, alpha=0.0):
     """One AdaHedge round of one learner over N experts, in place.
 
     `l` are this round's losses (in [0, 1]), `w` the weights the learner
     PLAYS on them (overwritten with the next round's), `d` its deficits
     (discounted cumulative loss behind the leader, so min d = 0), `z` the
     normaliser of `w` (sum_e exp(-eta d[e])), `delta` and `eta` its
-    accumulated mixability gap and learning rate and `gamma` the discount
-    (1 for none). Returns (z, delta, eta, gap, h): the new state, the
-    round's gap and the Hedge loss h = w . l the played weights suffered."""
+    accumulated mixability gap and learning rate, `gamma` the discount
+    (1 for none) and `alpha` the fixed-share rate (0 for none). Returns
+    (z, delta, eta, gap, h): the new state, the round's gap and the Hedge
+    loss h = w . l the played weights suffered.
+
+    Fixed share (Herbster & Warmuth 1998): after the update a fraction
+    alpha of the weight is spread evenly, w <- (1 - alpha) w + alpha / N,
+    and the deficits are re-read from the shared weights at the new rate,
+    d = -log(w) / eta (re-centred), so `w = exp(-eta d) / z` still holds
+    and the mix loss below is computed as before. A deficit is then at
+    most log(N / alpha) / eta. With alpha = 0 this is plain AdaHedge.
+
+    The shared deficits are then treated as history like any other: when
+    eta falls on a later round, every deficit is re-read at the new rate,
+    as AdaHedge always does, so a trailer's floor of alpha / N rises to
+    (alpha / N) ^ (eta_new / eta_old). The effective share rate is above
+    alpha while eta is falling, most in the first rounds of each window
+    (eta drops from inf), which is a choice, not strict Fixed Share: that
+    would mix in weight space and multiply by exp(-eta_t l_t) with each
+    round's own eta, never re-reading the past."""
     N = l.shape[0]
     h = 0.0
     for e in range(N):
@@ -774,6 +837,17 @@ def _hedge_round(l, d, w, z, delta, eta, gamma):
             z += w[e]
         for e in range(N):
             w[e] /= z
+        if alpha > 0.0:
+            m = np.inf
+            for e in range(N):
+                w[e] = (1.0 - alpha) * w[e] + alpha / N
+                d[e] = -np.log(w[e]) / eta
+                if d[e] < m:
+                    m = d[e]
+            z = 0.0
+            for e in range(N):
+                d[e] -= m
+                z += np.exp(-eta * d[e])
     else:
         # only while every round so far scored all experts alike, so the
         # deficits are all 0 and follow-the-leader is a tie
@@ -784,9 +858,11 @@ def _hedge_round(l, d, w, z, delta, eta, gamma):
     return z, delta, eta, gap, h
 
 
-def _hedge_window(loss, t0, t1, gammas, d, w, z, delta, eta, h, dm, v):
-    """The K discounted learners (one per lifetime, gammas[k]) and the meta
-    learner over them, from a cold start over loss[t0:t1]. The work arrays
+def _hedge_window(loss, t0, t1, gammas, alphas, gm, d, w, z, delta, eta, h, dm, v):
+    """The K learners (one per rung: discount gammas[k], fixed-share rate
+    alphas[k]) and the meta learner over them, from a cold start over
+    loss[t0:t1]; the meta learner and the trade weight are discounted at
+    `gm`. The work arrays
     hold the state: d, w (K x N) the deficits and played weights per
     learner, z / delta / eta (K), h (K) the learners' Hedge losses of the
     round, dm / v (K) the meta learner's deficits and weights. Returns
@@ -819,10 +895,7 @@ def _hedge_window(loss, t0, t1, gammas, d, w, z, delta, eta, h, dm, v):
     learner; here they are a choice, not a mixability argument."""
     K = gammas.shape[0]
     N = loss.shape[1]
-    gm = 0.0
     for k in range(K):
-        if gammas[k] > gm:
-            gm = gammas[k]
         z[k] = float(N)
         delta[k] = 0.0
         eta[k] = np.inf
@@ -839,7 +912,8 @@ def _hedge_window(loss, t0, t1, gammas, d, w, z, delta, eta, h, dm, v):
         l = loss[t]
         hm = 0.0
         for k in range(K):
-            z[k], delta[k], eta[k], _, h[k] = _hedge_round(l, d[k], w[k], z[k], delta[k], eta[k], gammas[k])
+            z[k], delta[k], eta[k], _, h[k] = _hedge_round(l, d[k], w[k], z[k], delta[k], eta[k], gammas[k],
+                                                            alphas[k])
             hm += v[k] * h[k]
         m = np.inf
         for k in range(K):
@@ -863,7 +937,7 @@ def _hedge_window(loss, t0, t1, gammas, d, w, z, delta, eta, h, dm, v):
     return hm, best, u
 
 
-def _hedge_core(loss, memory, gammas):
+def _hedge_core(loss, memory, gammas, alphas, gm):
     """Windowed learner over a T x N loss matrix: row t of the returned
     T x N weights is the mixture played after the last `memory` rounds up to
     and including t, from a cold start. Also returns the learners' eta
@@ -885,7 +959,7 @@ def _hedge_core(loss, memory, gammas):
         t0 = t + 1 - memory
         if t0 < 0:
             t0 = 0
-        hm, best, u = _hedge_window(loss, t0, t + 1, gammas, d, w, z, delta, eta, h, dm, v)
+        hm, best, u = _hedge_window(loss, t0, t + 1, gammas, alphas, gm, d, w, z, delta, eta, h, dm, v)
         for e in range(N):
             s = 0.0
             for k in range(K):
@@ -899,15 +973,47 @@ def _hedge_core(loss, memory, gammas):
     return W, ETA, V, SURPRISE, TRADE
 
 
-def _adahedge_loop(loss, memory=HEDGE_MEMORY, horizons=HEDGE_HORIZONS, with_trade=False):
-    """Windowed, discounted AdaHedge over a ladder of lifetimes: W (T x N)
-    the played weights, ETA (T x K) the learners' learning rates, V (T x K)
-    the meta weights over the lifetimes, SURPRISE (T) the played mixture's
-    Hedge loss minus the best expert's, each round, and with `with_trade`
-    also TRADE (T), the weight on trading at all (see `_hedge_window`)."""
+def hedge_rungs(memory, horizons, share=None):
+    """(gammas, alphas, gm, rungs) of a learner: per rung its discount and
+    fixed-share rate, the discount of the meta learner and the trade weight,
+    and the rungs in bars (the column labels of `hedge_diagnostics`).
+
+    'discount': one rung per lifetime H of `horizons`, gamma = 1 - 1/H,
+    alpha = 0. 'fixed_share': no discount (gamma = 1) and one rung per
+    expected number of switches of the best expert in the learner's memory,
+    m in HEDGE_SHARE_SWITCHES: alpha = m / memory, a rung of memory / m bars
+    between switches. The meta learner over the rungs (see _hedge_window) is
+    what picks the rate: it weighs each rung by its own realised loss, so
+    the switching rate is learned online like everything else, from rates
+    fixed in advance. The meta learner and the trade weight are discounted
+    at the longest lifetime of `horizons` either way."""
+    share = HEDGE_SHARE if share is None else share
+    H = np.asarray(horizons, dtype=np.float64)
+    gm = float(1.0 - 1.0 / H.max())
+    if share == "discount":
+        gammas, alphas, rungs = 1.0 - 1.0 / H, np.zeros_like(H), H
+    elif share == "fixed_share":
+        m = np.asarray(HEDGE_SHARE_SWITCHES, dtype=np.float64)
+        alphas = m / float(memory)
+        if (alphas >= 1.0).any():
+            raise ValueError(f"memory {memory} too short for fixed share: alpha = m / memory must be < 1 "
+                             f"for every m in {HEDGE_SHARE_SWITCHES}")
+        gammas, rungs = np.ones_like(alphas), float(memory) / m
+    else:
+        raise ValueError(f"unknown hedge share {share!r}, expected one of {HEDGE_SHARES}")
+    return np.ascontiguousarray(gammas), np.ascontiguousarray(alphas), gm, rungs
+
+
+def _adahedge_loop(loss, memory=HEDGE_MEMORY, horizons=HEDGE_HORIZONS, with_trade=False, share=None):
+    """Windowed AdaHedge over a ladder of rungs (fixed share or discounted,
+    see `hedge_rungs`; `share` None reads HEDGE_SHARE): W (T x N) the played
+    weights, ETA (T x K) the learners' learning rates, V (T x K) the meta
+    weights over the rungs, SURPRISE (T) the played mixture's Hedge loss
+    minus the best expert's, each round, and with `with_trade` also TRADE
+    (T), the weight on trading at all (see `_hedge_window`)."""
     loss = np.ascontiguousarray(loss, dtype=np.float64)
-    gammas = 1.0 - 1.0 / np.asarray(horizons, dtype=np.float64)
-    out = _hedge_fast(loss, int(memory), np.ascontiguousarray(gammas))
+    gammas, alphas, gm, _ = hedge_rungs(memory, horizons, share)
+    out = _hedge_fast(loss, int(memory), gammas, alphas, gm)
     return out if with_trade else out[:4]
 
 
@@ -1118,9 +1224,11 @@ def hedge_diagnostics(df: pd.DataFrame, atr_n: int, mode: str = "trend", cost_bp
     """What the learner did, bar by bar, for notebooks and dashboards:
     `weights` (expert weights, columns follow_10 / fade_20 / ... and, on the
     wide ladder, follow_kel20x2 / fade_kel40x2 ...), `loss` (the expert
-    losses it scored), `eta` (each lifetime's learning rate, columns =
-    HEDGE_HORIZONS), `horizon_weights` (the meta learner's weights over the
-    lifetimes: shorter ones gaining is the learner shortening its memory),
+    losses it scored), `eta` (each rung's learning rate, columns = the
+    rungs in bars, see `hedge_rungs`: the lifetimes under 'discount', the
+    expected bars between switches under 'fixed_share'), `horizon_weights`
+    (the meta learner's weights over the rungs: shorter ones gaining is the
+    learner shortening its memory, or expecting more switches),
     `surprise` (the loss the played mixture suffered minus the best
     expert's, in [0, 1]), `trade_weight` (the weight of the played mixture
     against cash, in [0, 1]) and `position` (the committee's position, see
@@ -1130,14 +1238,15 @@ def hedge_diagnostics(df: pd.DataFrame, atr_n: int, mode: str = "trend", cost_bp
                                                                cost_pts=cost_pts)
     experts = [e.label for e in hedge_ladder(mode, ladder)]
     idx = df.index
-    horizons = hedge_learner(ladder)[1]
+    memory, horizons = hedge_learner(ladder)
     if ladder in HEDGE_SPLIT and mode != "learned":
-        horizons = HEDGE_SPLIT_LEARNERS["follow" if mode == "trend" else "fade"][1]
+        memory, horizons = HEDGE_SPLIT_LEARNERS["follow" if mode == "trend" else "fade"]
+    rungs = [float(r) for r in hedge_rungs(memory, horizons)[3]]
     return {
         "weights": pd.DataFrame(W, index=idx, columns=experts),
         "loss": pd.DataFrame(loss, index=idx, columns=experts),
-        "eta": pd.DataFrame(ETA, index=idx, columns=list(horizons)),
-        "horizon_weights": pd.DataFrame(V, index=idx, columns=list(horizons)),
+        "eta": pd.DataFrame(ETA, index=idx, columns=rungs),
+        "horizon_weights": pd.DataFrame(V, index=idx, columns=rungs),
         "surprise": pd.Series(SURPRISE, index=idx),
         "trade_weight": pd.Series(TRADE, index=idx),
         "position": pd.Series(POSITION, index=idx),
@@ -1982,7 +2091,10 @@ def _df_key(df: pd.DataFrame, close=None) -> tuple:
 
 
 def _cached(df: pd.DataFrame, spec: tuple, fn, dfkey=None):
-    key = (_df_key(df) if dfkey is None else dfkey, spec)
+    # HEDGE_SHARE is in every key: everything built on a hedge learner (its
+    # weights, channels, direction, stance) depends on it, and a process may
+    # switch it (set_hedge_share) between runs on the same bars
+    key = (_df_key(df) if dfkey is None else dfkey, HEDGE_SHARE, spec)
     arr = _IND_CACHE.get(key)
     if arr is None:
         if len(_IND_CACHE) >= _IND_CACHE_MAX:
