@@ -866,11 +866,11 @@ class TypicalUnitsTests(unittest.TestCase):
         df = synthetic_ohlc(600, seed=5)
         tpl = S.StrategyTemplate("t")
         a = float(np.nanmedian(S.atr(df, tpl.atr_n)))
-        self.assertAlmostEqual(S.typical_units(df, tpl), 100_000 * tpl.risk_pct / (tpl.atr_mult_stop * a))
+        self.assertAlmostEqual(S.typical_units(df, tpl, 100_000.0), 100_000 * tpl.risk_pct / (tpl.atr_mult_stop * a))
         # a Brent lot on the same moves: a thousandth of it, and the margin cap binds on top
         lot = tpl.with_params(point_value=1000.0, margin_per_unit=6000.0, max_leverage=0.5)
-        self.assertLess(S.typical_units(df, lot), 1.0)
-        self.assertAlmostEqual(S.typical_units(df, tpl.with_params(max_leverage=0.01)),
+        self.assertLess(S.typical_units(df, lot, 100_000.0), 1.0)
+        self.assertAlmostEqual(S.typical_units(df, tpl.with_params(max_leverage=0.01), 100_000.0),
                                0.01 * 100_000 / float(np.nanmedian(df["Close"])))
 
 

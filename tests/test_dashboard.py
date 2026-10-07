@@ -673,8 +673,9 @@ class SpreadBookTests(unittest.TestCase):
                       "--jobs", "1", "--n-boot", "100", "--min-sharpe", "-5"]
         # the spread alone: at least its best slot is selected, so signals run on it. Sized well
         # above one lot: the walk-forward carries the account's equity from window to window,
-        # and at 5 % a typical entry is ~1.04 lots on 100,000 -- one losing window and it floors
-        # to 0 (whole units do not scale down), which is the account's reality, not this test's.
+        # and at 5 % a typical entry is ~1.04 lots on a 100,000 slot (the signals phase fits on
+        # the slot's own equity; the research sizes on RESEARCH_EQUITY) -- one losing window and
+        # it floors to 0 (whole units do not scale down), the account's reality, not this test's.
         # At 20 % the slot selected is one the signals phase can fit, so it publishes orders
         ED.main(["research", "--synthetic", "--assets", cls.csv, "--instrument-map", "brent_z25z26=1000,15,3000",
                  "--max-leverage", "0.5", "--whole-units", "--risk-pct", "0.2"] + cls.common + ["--state-dir", cls.dir])

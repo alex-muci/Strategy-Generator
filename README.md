@@ -25,7 +25,7 @@ python -m venv env  # assuming 3.12 installed
 ./env/Script/Activate
 pip install -r requirements.txt 
 
-python -m unittest discover -s tests -t . -v # 436 tests (engine, exit ordering, order log, templates, hedge learner and its wide ladder, walk-forward, robustness, selection, data, live signals, replay, both entry points, spreads: shift invariance, point value, per-unit and roll costs, margin cap, ruin, whole units, the ETF trick, a mixed cash + spread book)
+python -m unittest discover -s tests -t . -v # 491 tests (engine, exit ordering, order log, templates, hedge learner and its wide ladder, walk-forward, robustness, selection, data, live signals, replay, both entry points, spreads: shift invariance, point value, per-unit and roll costs, margin cap, ruin, whole units, the ETF trick, a mixed cash + spread book)
 # faster: pip install -r requirements-dev.txt, then, with ./env active,
 python -m pytest -n auto --dist loadscope   # in parallel; loadscope keeps a class (and its one-off setup) on one worker
 python -m pytest -m slow                    # the minutes-long live-order sweeps pytest skips by default
@@ -81,16 +81,18 @@ Two warnings for futures, both learned the hard way:
   0.10 / sqrt(252) x 100,000 = $630 a day, i.e. 0.21 lots, floored to **0**;
   on 100 million it is 210 lots, and the floor costs well under 1 % of the
   size. **The caveat:** the research then shows (almost) fractional sizes,
-  not the lot granularity your own account faces. The currency figures it
-  reports (trade P&L, equity) are on the 100 million scale (returns, Sharpe
-  and drawdowns are not), it assumes 100 million fills at the bar's prices
+  not the lot granularity your own account faces. The window and trade
+  currency figures (trade P&L, each template's OOS equity) are on the 100
+  million scale (returns, Sharpe and drawdowns are not; the portfolio curves
+  and the one-unit benchmark are still scaled to 100,000), it assumes 100 million fills at the bar's prices
   (no market impact), and the live book sizes each slot on its share of
   your real account, where the same gold slot on 100,000 still floors to 0
   lots. Check `typical_units(df, tpl, your_equity)` before trading a
   full-size contract on a small account; trade the micro (MGC, 10 oz:
   about 2 lots at 10 % on 100,000), or raise `--vol-target` / `--risk-pct`.
-  `main.py` still warns when a typical entry sizes below about one unit on
-  the research equity.
+  `main.py` warns only when a typical entry sizes below about one unit even
+  on the research equity, so a small real account is never warned about:
+  check it yourself.
 
 Outputs land in `./outputs/` (or `--out DIR`):
 
