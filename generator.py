@@ -10,27 +10,28 @@ Five families are predefined:
 
   quick           72 templates  (Donchian only, ER regime filter) -- smoke test
   default        768 templates  (two channel types, five regime indicators)
-  online           9 templates  (the follow group of the split hedge ladder
+  online          27 templates  (the follow group of the split hedge ladder
                                   -- 20-80 bar breaks held as long as their
                                   lookback under a slow learner -- by the
                                   stop / close-confirm entries and every exit,
                                   and the committee traded directly (the
                                   'stance' entry, whose exit is the learner:
-                                  one template); no lookback or width in the
-                                  grid, no regime / bias filter, trend
-                                  direction only. On SPY / TLT / GLD / USO
-                                  2016-2026 the trend (follow) direction
-                                  carried all of the hedge families' edge,
-                                  countertrend and the split ladder's fade
-                                  group lost on every series, no regime or
-                                  bias filter beat none, and the slow memory
-                                  beat the fast one (docs/
-                                  hedge_real_data_study.md). 'learned' and
-                                  'countertrend' stay available as switches,
+                                  one template per direction); no lookback or
+                                  width in the grid, no regime / bias filter,
+                                  trend / countertrend / learned. On SPY /
+                                  TLT / GLD / USO 2016-2026 the trend (follow)
+                                  direction carried all of the hedge families'
+                                  edge, countertrend and the split ladder's
+                                  fade group lost on every series, no regime
+                                  or bias filter beat none, and the slow
+                                  memory beat the fast one (docs/
+                                  hedge_real_data_study.md); countertrend and
+                                  learned are kept all the same, for futures
+                                  and data with a short-horizon reversal
+                                  (spreads, intraday). Narrow it with
                                   generate_templates("online",
-                                  direction_logics=[...]), for data with a
-                                  short-horizon reversal (spreads, intraday);
-                                  the other hedge ladders likewise
+                                  direction_logics=["trend"]); the other hedge
+                                  ladders are a switch too
                                   (channel_types=[...]))
   online_forecast  3 templates  (the forecast channel -- slow trend prior plus a
                                   learned fast-scale term, held as a position
@@ -94,11 +95,13 @@ FAMILIES = {
         bias_filters=["none", "sma"],
         sides=["both"],
     ),
-    # the split ladder's follow group (strategy.HEDGE_SPLIT), trend direction only:
-    # see the module docstring for why; the stance entry is canonicalised to a
-    # single template (its exit is the learner)
+    # the split ladder's follow group (strategy.HEDGE_SPLIT), every direction
+    # logic: although countertrend does not seem to work at all on daily SPY /
+    # TLT / GLD / USO (see the module docstring), there is no need to exclude it
+    # for futures. The stance entry is canonicalised to a single template per
+    # direction (its exit is the learner)
     "online": dict(
-        direction_logics=["trend"],
+        direction_logics=DIRECTION_LOGICS,
         channel_types=["hedge_split"],
         entry_styles=["stop", "close_confirm", "stance"],
         exit_styles=EXIT_STYLES,

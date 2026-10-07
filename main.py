@@ -52,7 +52,8 @@ from pipeline import (
 from portfolio import returns_frame
 from replay import save_run, replay_run, TARGETS as REPLAY_TARGETS
 from strategy import (annualized_sharpe, max_drawdown, periods_per_year, BARS_PER_YEAR, validate_instrument,
-                      instrument_warnings, typical_units, set_periods_per_year, set_hedge_share)
+                      instrument_warnings, typical_units, set_periods_per_year, set_hedge_share,
+                      RESEARCH_EQUITY)
 
 
 def parse_args(argv=None):
@@ -156,8 +157,8 @@ def main(argv=None) -> dict:
     if args.whole_units:
         q = typical_units(df, _costed(templates[0], cfg, asset))
         if q < 1.5:
-            print(f"WARNING: --whole-units: a typical entry sizes to {q:.2f} units on the 100,000 the research "
-                  "sizes on, floored to " + ("0: most templates will never trade" if q < 1 else
+            print(f"WARNING: --whole-units: a typical entry sizes to {q:.2f} units on the {RESEARCH_EQUITY:,.0f} "
+                  "the research sizes on, floored to " + ("0: most templates will never trade" if q < 1 else
                                              "1: the size barely varies") +
                   ". Raise --risk-pct / --vol-target (or --max-leverage), or drop --whole-units")
     with worker_pool(args.jobs, {asset: df}, cfg) as pool:

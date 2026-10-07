@@ -31,7 +31,7 @@ import pandas as pd
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from data import synthetic_ohlc  # noqa: E402
-from strategy import StrategyTemplate, backtest, _compute_indicators, atr  # noqa: E402
+from strategy import StrategyTemplate, backtest, _compute_indicators, atr, annualized_sharpe  # noqa: E402
 from generator import generate_templates, param_grid_for  # noqa: E402
 from walkforward import (  # noqa: E402
     walk_forward, walk_forward_matrix, window_backtest, warmup_bars, summarize_walk_forward,
@@ -488,3 +488,24 @@ class OneAccountTests(unittest.TestCase):
             differs += int(not np.allclose(carried["returns"].to_numpy(), fresh["returns"].to_numpy(),
                                            rtol=0, atol=1e-12))
         self.assertGreater(differs, 0, "the fixture never moves a contract count")
+
+
+class WindowFirstReturnTests(unittest.TestCase):
+    def test_the_window_stats_keep_the_return_of_its_first_bar(self):
+        """A trade opened on the window's first bar: that bar's return (a loss
+        from the funded 100,000 to 99,500) is in the Sharpe and the drawdown."""
+        n, k = 60, 30
+        o = np.full(n, 99.9); h = o + 1.0; l = o - 1.0; c = o.copy()
+        h[12], l[12] = 101.0, 98.8                       # a 20-bar channel of 98.8 / 101
+        o[k], h[k], l[k], c[k] = 100.8, 101.6, 100.2, 100.5   # long 1,000 at 101, closes at 100.5
+        for j in range(k + 1, n):
+            o[j], h[j], l[j], c[j] = 102.0, 103.0, 101.5, 102.5
+        df = pd.DataFrame({"Open": o, "High": h, "Low": l, "Close": c}, index=pd.bdate_range("2025-01-01", periods=n))
+        tpl = StrategyTemplate("t", channel_type="donchian", entry_style="stop", exit_style="target_stop", n_entry=20,
+                               atr_n=5, atr_mult_stop=3.0, atr_mult_target=2.0, risk_pct=0.06, max_leverage=10.0,
+                               cost_bps=0.0, sides="long_only")
+        win = window_backtest(df, tpl, k, n, warmup=25, initial_equity=100_000.0)
+        r = win["returns"].to_numpy()
+        self.assertAlmostEqual(r[0], -0.005)
+        self.assertAlmostEqual(win["stats"]["sharpe"], annualized_sharpe(r))
+        self.assertAlmostEqual(win["stats"]["max_drawdown"], -0.005)

@@ -57,7 +57,7 @@ import pipeline
 from data import synthetic_ohlc
 from pipeline import worker_pool, pool_map, hedge_share_of
 from portfolio import close_after_ruin
-from strategy import StrategyTemplate, annualized_sharpe, set_periods_per_year, set_hedge_share
+from strategy import StrategyTemplate, annualized_sharpe, set_periods_per_year, set_hedge_share, RESEARCH_EQUITY
 from walkforward import window_backtest
 
 MANIFEST_VERSION = 1
@@ -141,7 +141,7 @@ def run_manifest(df: pd.DataFrame, results: dict, port: dict, nested: dict, fam:
     static_r = port["portfolio_returns"]
     return dict(
         schema_version=MANIFEST_VERSION, created=pd.Timestamp.now().isoformat(),
-        data=data, config=dict(cfg), initial_equity=100_000.0,
+        data=data, config=dict(cfg), initial_equity=RESEARCH_EQUITY,
         selection=dict(min_sharpe=args.min_sharpe, max_strategies=args.max_strategies,
                        corr_ceiling=args.corr_ceiling, require_pardo=args.require_pardo,
                        select_method=args.select_method, weighting=args.weighting,

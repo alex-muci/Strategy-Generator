@@ -36,7 +36,7 @@ import pandas as pd
 
 from strategy import (
     backtest, annualized_sharpe, max_drawdown, periods_per_year, performance_stats, REGIME_INDICATORS, compound,
-    hedge_warmup,
+    hedge_warmup, RESEARCH_EQUITY,
     hedge_ladder_for,
     HEDGE_CHANNELS, FORECAST_CHANNELS, forecast_warmup, FC_SETTLE, STANCE_SETTLE,
 )
@@ -158,7 +158,7 @@ def _annualized_return(stats: dict) -> float:
 # --------------------------------------------------------------------------
 
 def window_backtest(df: pd.DataFrame, tpl, start: int, end: int, *,
-                    warmup: int | None = None, initial_equity: float = 100_000.0,
+                    warmup: int | None = None, initial_equity: float = RESEARCH_EQUITY,
                     log_orders: bool = False) -> dict:
     """Backtest `tpl` on the bars df.iloc[start:end], with the indicators
     warmed up on the bars before `start` but NO trade opened before it.
@@ -197,7 +197,14 @@ def window_backtest(df: pd.DataFrame, tpl, start: int, end: int, *,
     out["equity"] = res["equity"].iloc[off:]
     out["returns"] = res["returns"].iloc[off:]
     out["entries"] = res["entries"][off:]
-    out["stats"] = performance_stats(eq, res["trades"], initial_equity)
+    # the window's first bar already trades (its equity is not `initial_equity`),
+    # so its return is the window's too: performance_stats skips slot 0 of
+    # `rets`, which is the bar before the window here, and the drawdown runs
+    # from the funded equity. At off == 0 the first bar is the data's, flat.
+    r = res["returns"].to_numpy()
+    rets = np.concatenate([[0.0], r[off:]]) if off > 0 else r
+    out["stats"] = performance_stats(eq, res["trades"], initial_equity, rets)
+    out["stats"]["max_drawdown"] = max_drawdown(np.concatenate([[float(initial_equity)], eq]))
     out["window_start"] = df.index[start]
     out["exposure"] = exposure_totals(out, df["Close"].to_numpy()[start:end], point_value=tpl.point_value,
                                       margin_per_unit=tpl.margin_per_unit)
@@ -255,7 +262,7 @@ def exposure_totals(res: dict, close: np.ndarray, point_value: float = 1.0, marg
 
 def optimize_window(df: pd.DataFrame, tpl, combos: list, idx: np.ndarray, start: int, end: int, *,
                     metric: str = "sharpe", selection: str = "plateau", min_trades: int = 5,
-                    initial_equity: float = 100_000.0) -> dict:
+                    initial_equity: float = RESEARCH_EQUITY) -> dict:
     """The in-sample step: score every parameter set of `combos` on the
     window df.iloc[start:end] (each warmed up on the bars before it) and pick
     one with `selection`. Shared by the walk-forward loop and the live refit
@@ -301,7 +308,7 @@ def walk_forward(
     selection: str = "plateau",
     min_trades: int = 5,
     min_test_bars: int = 20,
-    initial_equity: float = 100_000.0,
+    initial_equity: float = RESEARCH_EQUITY,
 ) -> dict:
     """Walk-forward optimization of `tpl` over `df`.
 

@@ -80,7 +80,7 @@ from portfolio import returns_frame
 from strategy import (
     StrategyTemplate, annualized_sharpe, max_drawdown, set_periods_per_year, periods_per_year,
     periods_per_year_for_interval, SIDES, BARS_PER_YEAR, validate_instrument, instrument_warnings,
-    typical_units, set_hedge_share,
+    typical_units, set_hedge_share, RESEARCH_EQUITY,
 )
 from futures_map import (
     CONTRACTS, LISTINGS, FX_SYMBOLS, HEDGE_RATIO_BARS, QUOTES_STALE_DAYS,
@@ -315,8 +315,8 @@ def research(args) -> dict:
         if tpl.whole_units:
             q = typical_units(data[a], tpl)
             if q < 1.0:
-                print(f"  WARNING {a}: --whole-units: a typical entry sizes to {q:.2f} units on the 100,000 the "
-                      "research sizes on, floored to 0: its templates will rarely trade. Raise --risk-pct / "
+                print(f"  WARNING {a}: --whole-units: a typical entry sizes to {q:.2f} units on the "
+                      f"{RESEARCH_EQUITY:,.0f} the research sizes on, floored to 0: its templates will rarely trade. Raise --risk-pct / "
                       "--vol-target, trade a smaller contract, or drop --whole-units")
     jobs = [(f"{a}|{t.name}", a, t) for a in args.assets for t in templates_for(a)]
     print(f"{len(templates_for(args.assets[0]))} templates x {len(args.assets)} assets = {len(jobs)} slots; "
@@ -803,7 +803,7 @@ def _slot_signal(slot: dict, df: pd.DataFrame, cfg: dict, live: dict, args,
     if mem["fitted_on"] is None or (stale and not args.no_refit):
         # the in-sample fit is sized on the capital the slot actually trades
         # (with whole units the contract counts, and so the fit, depend on it).
-        # Research sized each template on its own account (100,000, carried
+        # Research sized each template on its own account (RESEARCH_EQUITY, carried
         # window to window), not on this slot's share of yours: with whole
         # units the two fits can differ, and the live one is the one you trade
         fit = refit_params(df, base, param_grid_for(base, wide=cfg["wide_grid"]),

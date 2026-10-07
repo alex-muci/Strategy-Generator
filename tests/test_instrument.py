@@ -540,6 +540,27 @@ class RuinTests(unittest.TestCase):
         self.assertGreater(len(after), 0)
         self.assertTrue(all(w.get("ruined") for w in after))
 
+    def test_a_stance_position_is_closed_by_ruin_too(self):
+        """The `stance` entry (no stop: its exit is the learner) held long
+        through the gap: liquidated at the close that left nothing, and the
+        later recovery to 11 does not bring the account back."""
+        from unittest import mock
+        import strategy
+        df = self._gap()
+        df.loc[df.index[60:], ["Open", "High", "Low", "Close"]] = [11.0, 11.2, 10.8, 11.0]
+        tpl = self._tpl(channel_type="forecast", entry_style="stance", risk_pct=1e5)
+        with mock.patch.object(strategy, "forecast_position", lambda *a, **k: np.ones(len(df))):
+            res = backtest(df, tpl, first_trade_bar=41)
+        t = res["trades"][-1]
+        self.assertEqual((t["reason"], t["side"], t["exit_date"]), ("ruin", 1, df.index[42]))
+        self.assertAlmostEqual(t["exit_price"], 0.8)
+        deficit = 100_000.0 + sum(x["pnl"] for x in res["trades"])
+        self.assertLess(deficit, 0.0)
+        np.testing.assert_allclose(res["equity"].to_numpy()[42:], deficit)
+        self.assertTrue((res["returns"].to_numpy()[43:] == 0.0).all())
+        self.assertIsNone(res["open_position"])
+        self.assertFalse(res["stance_next"]["change"])
+
     def test_a_survivable_gap_is_not_ruin(self):
         df = self._gap()
         res = backtest(df, self._tpl(max_leverage=0.05), first_trade_bar=30)   # 1.7 lots: -17k on 100k

@@ -159,3 +159,23 @@ class TargetOnTheWrongSideTests(unittest.TestCase):
         t = backtest(df, tpl, first_trade_bar=B - 3)["trades"][0]
         self.assertEqual((t["side"], t["entry_price"], t["exit_date"]), (1, 95.0, df.index[B]))
         self.assertEqual((t["reason"], t["exit_price"]), ("midline", 95.0))
+
+
+class EntryPrecedenceTests(unittest.TestCase):
+    """A bar that reaches both channel levels (98.8 / 101): the order whose
+    level the OPEN trades through went first; an open inside the channel
+    leaves the order unknowable, and the long side is taken."""
+
+    def _first(self, bar, **kw):
+        t = backtest(_series({K: bar}), _tpl(sides="both", exit_style="time_stop", max_hold_bars=5, **kw),
+                     first_trade_bar=25)["trades"][0]
+        return t["side"], t["entry_price"]
+
+    def test_a_sell_stop_the_open_gapped_through_goes_before_the_buy_stop(self):
+        self.assertEqual(self._first((98.0, 102.0, 97.5, 100.0)), (-1, 98.0))
+
+    def test_a_sell_limit_the_open_gapped_through_goes_before_the_buy_limit(self):
+        self.assertEqual(self._first((102.0, 102.5, 98.0, 100.0), direction_logic="countertrend"), (-1, 102.0))
+
+    def test_an_open_inside_the_channel_takes_the_long_side(self):
+        self.assertEqual(self._first((100.0, 102.0, 97.5, 100.0)), (1, 101.0))
