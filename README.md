@@ -25,7 +25,7 @@ python -m venv env  # assuming 3.12 installed
 ./env/Script/Activate
 pip install -r requirements.txt 
 
-python -m unittest discover -s tests -t . -v # 423 tests (engine, exit ordering, order log, templates, hedge learner and its wide ladder, walk-forward, robustness, selection, data, live signals, replay, both entry points, spreads: shift invariance, point value, per-unit and roll costs, margin cap, ruin, whole units, the ETF trick, a mixed cash + spread book)
+python -m unittest discover -s tests -t . -v # 436 tests (engine, exit ordering, order log, templates, hedge learner and its wide ladder, walk-forward, robustness, selection, data, live signals, replay, both entry points, spreads: shift invariance, point value, per-unit and roll costs, margin cap, ruin, whole units, the ETF trick, a mixed cash + spread book)
 # faster: pip install -r requirements-dev.txt, then, with ./env active,
 python -m pytest -n auto --dist loadscope   # in parallel; loadscope keeps a class (and its one-off setup) on one worker
 python -m pytest -m slow                    # the minutes-long live-order sweeps pytest skips by default
@@ -44,8 +44,8 @@ still runs every test.
 python main.py --help
 python main.py --family quick                       # 72 templates (Donchian, ER filter)
 python main.py --family default                     # 768 templates, all switches sampled
-python main.py --family online                      # 288 templates on the online-learned channel (no lookback to fit)
-python main.py --family online_wide                 # 8 templates: the learned direction on a wider ladder, sized by its own position
+python main.py --family online                      # 9 templates: the split ladder's follow group (trend direction), stop / close-confirm entries by every exit, and the committee's stance traded directly; learned / countertrend remain as overrides
+python main.py --family online_forecast             # 3 templates: the forecast channel (slow trend prior + learned fast-scale term, held as a position under a no-trade buffer) by trend / countertrend / learned
 python main.py --real SPY --start 2005-01-01 --family default --jobs 8
 python main.py --real SPY --start 2005-01-01 --family quick --sides long_only   # one-sided family (an asset with a drift)
 python main.py --real SPY --start 2005-01-01 --family quick --vol-target 0.1  # use vol-target rather than ATR-stop (see Position sizing)
@@ -401,7 +401,7 @@ A **template** is a fixed combination of categorical switches:
 | `channel_type` | `donchian` / `keltner` (EMA +/- k ATR) / `bollinger` (SMA +/- k sd) / `hedge` (online-learned, see below) / `hedge_wide` (the same learner over a wider ladder, sized by its own position, see below) |
 | `entry_style` | `stop` (at the level) / `close_confirm` (close beyond, next open) / `pullback` (after the break, a limit k ATR from the level: back inside the channel when following, deeper beyond it when fading) |
 | `exit_style` | `channel` (Turtle exit; midline target for countertrend) / `atr_trail` / `target_stop` / `time_stop` -- a hard ATR stop is always on |
-| `regime_indicator` | `er` Kaufman Efficiency Ratio / `adx` / `cti` Ehlers Correlation Trend / `chop` Choppiness / `vr` variance ratio (on log returns for a cash asset, on point changes for a future: see Cash assets vs futures and spreads) |
+| `regime_indicator` | `er` Kaufman Efficiency Ratio / `adx` / `cti` Ehlers Correlation Trend / `chop` Choppiness / `mmi` Market Meanness Index (100 - MMI, on differences) / `hurst` Hurst exponent (on differences) / `vr` variance ratio (on log returns for a cash asset, on point changes for a future: see Cash assets vs futures and spreads) |
 | `regime_filter` | `none` / `trend_only` / `range_only` (Ranger's "sideways" mode) |
 | `vol_filter` | skip entries when ATR is in an extreme percentile |
 | `bias_filter` | `sma`: longs only above SMA(200), shorts only below (financial-hacker's market-direction filter) |
@@ -745,8 +745,22 @@ algorithm from the prediction-with-expert-advice literature:
   JMLR 2014), exponential weights whose learning rate is set from the
   accumulated mixability gap. It starts as plain **follow-the-leader**
   and only becomes more conservative when the data forces it to. No
-  learning rate, no threshold. Two additions, both parameter-free:
-  - **Discounting.** Losses and the gap decay with a *lifetime* `H`
+  learning rate, no threshold. Two additions, neither fitted:
+  - **Fixed share** (Herbster & Warmuth 1998; the default,
+    `--hedge-share fixed_share`). After every update a fraction `alpha`
+    of the weight is spread evenly over the experts. Nothing is
+    discounted, but every expert keeps at least `alpha / N`, so **no
+    expert is ever written off**: one that starts winning is in front
+    within a handful of bars (about 7 on the unit test's 0.2 edge),
+    however long it trailed. It is the forgetting built for a best
+    expert that *switches*. The rate is not a parameter: one learner
+    per expected number of switches `m` in the learner's memory
+    (`HEDGE_SHARE_SWITCHES` = 1/4 ... 8, `alpha = m / memory`), mixed
+    by the meta learner below, which weighs each rate by its realised
+    loss.
+  - **Discounting** (`--hedge-share discount`, the former default;
+    runs saved before the option existed replay this way). Losses and
+    the gap decay with a *lifetime* `H`
     (`gamma = 1 - 1/H`) instead of counting in full and then vanishing.
     Plain AdaHedge's learning rate only ever falls; a discounted gap
     lets it climb back after a calm stretch, so it reflects *recent*
@@ -754,7 +768,8 @@ algorithm from the prediction-with-expert-advice literature:
     expert's shortfall per bar, whatever it lost before, so **no
     expert is ever written off for good**: one that starts winning is
     back in front after about `H ln 2` bars.
-  - **A ladder of lifetimes** (`HEDGE_HORIZONS` = 20, 40, 80, 160
+  - **A ladder of rungs**: the switching rates above, or, discounted,
+    the lifetimes (`HEDGE_HORIZONS` = 20, 40, 80, 160
     bars, the lookback ladder doubled), one learner each, mixed on top
     by Vovk's aggregating algorithm with a unit learning rate (Bayesian
     averaging with likelihood `exp(-loss)`, discounted at the longest
@@ -771,13 +786,15 @@ algorithm from the prediction-with-expert-advice literature:
   `HEDGE_MEMORY` (250) bars, which keeps the learner state an exact
   function of a fixed number of past bars, reproducible from the
   walk-forward's warm-up buffer (see `walkforward.window_backtest`).
-  The window's edge now carries `gamma^250` of a bar's weight (e^-1.6
-  at H = 160, e^-3 at H = 80) instead of all of it: a horizon, not a
-  cliff. `strategy.hedge_diagnostics` returns, bar by bar, the expert
-  weights, the losses they were scored on, each lifetime's learning
-  rate, the meta learner's weights over the lifetimes (the short ones
-  gaining is the learner shortening its memory) and the *surprise*
-  (the played mixture's loss minus the best expert's).
+  Discounted, the window's edge carries `gamma^250` of a bar's weight
+  (e^-1.6 at H = 160, e^-3 at H = 80) instead of all of it: a horizon,
+  not a cliff. `strategy.hedge_diagnostics` returns, bar by bar, the
+  expert weights, the losses they were scored on, each rung's learning
+  rate, the meta learner's weights over the rungs (columns in bars: the
+  lifetimes, or `memory / m` between switches) and the *surprise* (the
+  played mixture's loss minus the best expert's). Fixed share against
+  discounting on planted edges and on SPY / TLT / USO / GLD:
+  [docs/hedge_fixed_share_study.md](docs/hedge_fixed_share_study.md).
 - **Channel**: the weight-averaged expert channel, i.e. an adaptive
   channel whose effective period is learned causally bar by bar. The
   exit channel uses the same weights over the ladder scaled by
@@ -954,6 +971,86 @@ decision about the asset and is taken on the command line: on an index
 with a drift run it `--sides long_only`. `hedge_diagnostics(...,
 ladder="hedge_wide")` names the experts `follow_10`, `fade_kel20x2`, and
 so on, and adds `trade_weight` and `position`.
+
+#### Real series: the slow ladders and the `stance` entry
+
+`docs/hedge_real_data_study.md` runs every family on real ETFs (SPY, TLT,
+GLD, USO, 2016-2026, `data_dump/`) and on planted-edge series. Two changes
+came out of it; both leave `hedge` and `hedge_wide` bit for bit as they were.
+`docs/online_templates_study.md` follows it up for the `online` and
+`online_forecast` families with a cost sweep, turnover, and synthetic series
+with a known edge, including futures calendar spreads
+(`extra_utils/online_study/`); the stance's no-trade band below came out of
+it.
+
+- **`hedge_slow` / `hedge_wide_slow`**: the same experts, a learner with a
+  three-year memory (`HEDGE_SLOW_MEMORY` = 750 bars, lifetimes
+  `HEDGE_SLOW_HORIZONS` = 250, 500, 750; `strategy.HEDGE_LEARNERS` maps a
+  ladder to its learner). On real daily bars the rungs' edges are tenths of
+  a Sharpe apart, and the 20-160 bar lifetimes re-weight on noise: on a
+  series with a planted Sharpe-1.4 edge the fast learner's committee earns
+  0.6 of it, the slow one 1.1. The warm-up is 911 bars instead of 410. The
+  families are `online_slow` and `online_wide_slow`.
+- **`entry_style = "stance"`**: the experts are scored on holding a stance
+  for a while after a break, but a channel template trades something else
+  (a break of the averaged channel, then its exit and a hard stop). A
+  planted fade edge the committee earns a Sharpe of 3 on is worth about 1.3
+  through the countertrend exits. The stance entry holds the committee's own
+  signed stance (`strategy.hedge_stance`), ordered at the next open, held
+  under a no-trade band (`STANCE_BUFFER` = 0.125 of a full size: the level
+  stays while the stance is within the band, else moves to its near edge,
+  the forecast channels' mechanism), with no stop or exit rule (the exit
+  style is inert). On a one-sided template the level goes flat on any bar
+  whose stance has nothing on the template's side and bands from there, so
+  it carries no memory of the other side; `walkforward.warmup_bars` adds
+  `STANCE_SETTLE` (200) bars for the held level to forget its start. That
+  is an empirical bound, not a guarantee: exact from 100 in the 108 cases it
+  was measured on, but a two-sided level can sit inside the band for longer
+  (a regime-switching series was still off by 4e-4 a bar at 200 and 300). The band replaced rounding to quarters,
+  which chatters at the x.125 boundaries (a stance of 0.12 / 0.13 flips
+  between 0 and 0.25). Measured (Sharpe from bar 1000, 5 bps a side),
+  quarters vs the band: SPY/TLT/GLD/USO two-sided average 0.21 vs 0.39 (bands
+  of 0.1 / 0.15 / 0.2: 0.39 / 0.39 / 0.40); 8 synthetic generators x 8
+  seeds (random-walk null and futures spreads with per-tick costs) a paired
+  two-sided gain of +0.05 to +0.11 Sharpe (+/- 0.02). The long-only gain on
+  the ETFs (0.45 vs 0.50) is one ETF (GLD) and noise. Most of the two-sided gain
+  is not the cost saving: at zero cost the Sharpe goes 0.28 -> 0.43 (about
+  83 % of the gain), a different exposure path; the cost drag falls from 0.07
+  to 0.04 Sharpe (notional turnover 3.2 -> 1.8x a year). The trade count
+  roughly doubles (the level sits at the band's edge, so a trending stance
+  re-sizes by a sliver on most bars): fine under proportional costs, worse
+  under per-ticket commissions or whole contracts. The unrounded stance beat
+  quarters on the 4 ETFs only, not on the synthetic series. Every width
+  from 0.1 to 0.3 beat quarters; 0.125 is the quarter rule's own tolerance,
+  not the best of the sweep. It recovers the planted edge (2.9-3.0 on the
+  slow ladders). It follows `backtest`'s instrument rules (margin cap, whole
+  contracts, roll costs, prices through zero), and `live.py` supports it: the
+  stance (a hedge committee's, a forecaster's) is published as one
+  market-on-open order for the change of holding, the size computed at the
+  last close. There is no stop or target order to publish. The shipped stance template is
+  the `online` family's (`TR-hsp-stance`, on `hedge_split`); on the other
+  ladders it is a switch, e.g. `generate_templates("online",
+  channel_types=["hedge_slow"])`.
+- **`hedge_split`**: trend and mean reversion on their own time scales.
+  The hold is decoupled from the lookback (`HedgeExpert.hold`; 0 keeps
+  the old rule, hold = lookback). A **follow group** (Donchian and Keltner
+  breaks at 20, 40, 80 bars, held as long as the lookback) runs under a
+  slow learner (memory 500, lifetimes 125-500); a **fade group** (the same
+  breaks at 5, 10, 20 bars, faded for 1 or 3 bars only) runs under a fast
+  one (memory 250, lifetimes 10-80); a **top learner** (memory 120,
+  lifetimes 10-40, `HEDGE_SPLIT_LEARNERS`) scores each group's committee
+  on the loss its played weights suffered and splits the weight between
+  them (`strategy.hedge_group_weights`). `trend` runs the follow group
+  alone, `countertrend` the fade group alone, `learned` all three. On a
+  trend / mean-reversion / trend regime series the fade share goes from
+  under 0.3 to about 0.9 within a few weeks of the switch and back. The
+  family is `online_split` (27: every direction, stop / close-confirm with
+  the four exits, and the stance entry, which is the faithful way to trade
+  a 1-3 bar hold). Warm-up 781 bars.
+
+Neither makes the hedge win on the real ETFs: there the follow side is the
+only edge the experts have, and follow-or-fade is not learnable from ten
+years of one asset (see the study).
 
 **A caveat on conviction, for both ladders.** The learner's weights are
 follow-the-leader until the losses prove that flipping costs something,

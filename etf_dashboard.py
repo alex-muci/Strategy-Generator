@@ -74,13 +74,13 @@ from pipeline import (
     resolve_interval, load_real, eval_config, worker_pool, evaluate_slots,
     family_diagnostics, build_portfolios, finalist_stats, sizing_text,
     benchmark_returns, benchmark_curve, instrument_of, _costed, BENCH_ONE_UNIT,
-    add_research_args, parse_instrument_map, costs_text,
+    add_research_args, parse_instrument_map, costs_text, hedge_share_of,
 )
 from portfolio import returns_frame
 from strategy import (
     StrategyTemplate, annualized_sharpe, max_drawdown, set_periods_per_year, periods_per_year,
     periods_per_year_for_interval, SIDES, BARS_PER_YEAR, validate_instrument, instrument_warnings,
-    typical_units,
+    typical_units, set_hedge_share,
 )
 from futures_map import (
     CONTRACTS, LISTINGS, FX_SYMBOLS, HEDGE_RATIO_BARS, QUOTES_STALE_DAYS,
@@ -634,6 +634,7 @@ def signals(args) -> dict:
 
     cfg = spec["config"]
     set_periods_per_year(cfg["periods_per_year"])
+    set_hedge_share(hedge_share_of(cfg))
     interval = args.interval if args.interval != "1d" or cfg["interval"] == "1d" else cfg["interval"]
     if interval != cfg["interval"]:
         raise SystemExit(f"--interval {interval} but the research was done on "

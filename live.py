@@ -256,10 +256,42 @@ def strategy_state(
         unrealized=0.0 if pos is None else pos["unrealized"],
         n_trades_in_window=len(res["trades"]),
     )
+    if tpl.entry_style == "stance":
+        # the stance entry (a hedge committee's stance, a forecaster's buffered
+        # position) holds a target, not a channel: it has no stop, target or
+        # resting entry, only the change of holding at the next open
+        sn = res["stance_next"]
+        state["exit_orders"] = []
+        state["entry_orders"] = _stance_orders(tpl, sn)
+        state["blocked_by"] = _filter_block(tail, tpl, ind)
+        if not state["blocked_by"] and not sn["formed"]:
+            state["blocked_by"] = ["indicators not fully formed on the last bar"]
+        return state
     state["exit_orders"] = _exit_orders(tail, tpl, ind, pos, last_atr=res["last_atr"]) if pos else []
     state["entry_orders"] = [] if pos else _entry_orders(tail, tpl, ind, res["pending_order"], equity)
     state["blocked_by"] = _filter_block(tail, tpl, ind)
     return state
+
+
+def _stance_orders(tpl: StrategyTemplate, sn: dict) -> list:
+    """The one order that takes the holding to the stance engine's target at
+    the next open: a market-on-open order for |target units - held units| (the
+    engine closes and reopens a stretch of constant size, so the net trade is
+    the difference). `sn` is the `stance_next` record of
+    `strategy._stance_backtest`'s result: the target level read at the last close by the engine's own rule
+    (the hedge stance and the forecaster's target, each under its no-trade band), and the
+    units it sizes it to. Nothing while the target is not formed or equals the
+    level already held (the buffer holds)."""
+    if not sn["formed"] or not sn["change"]:
+        return []
+    delta = sn["target_units"] - sn["held_units"]
+    if delta == 0.0:
+        return []
+    price_sized = not (tpl.vol_target > 0 and tpl.margin_per_unit > 0)
+    note = (f"stance {sn['want']:+.3f} of a full size (held level {sn['level']:+.3f})"
+            + ("; the next open is unknown, so the size is computed at the last close "
+               f"{sn['price_proxy']:.2f}" if price_sized else ""))
+    return [dict(kind="market_on_open", side=1 if delta > 0 else -1, level=None, shares=float(abs(delta)), note=note)]
 
 
 def _last_ready(tpl: StrategyTemplate, ind: dict, n: int) -> bool:

@@ -29,3 +29,14 @@ def pytest_collection_modifyitems(config, items):
     for item in items:
         if "slow" in item.keywords:
             item.add_marker(skip)
+
+
+@pytest.fixture(autouse=True)
+def _restore_hedge_share():
+    """A research config read by pipeline.init_worker (in this process too)
+    sets strategy.HEDGE_SHARE, and one written before the option existed
+    sets 'discount': put the default back so no test leaks it into the next."""
+    import strategy
+    share = strategy.HEDGE_SHARE
+    yield
+    strategy.set_hedge_share(share)

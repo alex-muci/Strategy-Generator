@@ -55,9 +55,9 @@ import pandas as pd
 
 import pipeline
 from data import synthetic_ohlc
-from pipeline import worker_pool, pool_map
+from pipeline import worker_pool, pool_map, hedge_share_of
 from portfolio import close_after_ruin
-from strategy import StrategyTemplate, annualized_sharpe, set_periods_per_year
+from strategy import StrategyTemplate, annualized_sharpe, set_periods_per_year, set_hedge_share
 from walkforward import window_backtest
 
 MANIFEST_VERSION = 1
@@ -182,10 +182,43 @@ def save_run(out_dir: str, df: pd.DataFrame, results: dict, port: dict, nested: 
     return manifest
 
 
-def _read_series_frame(path: str) -> pd.DataFrame:
+def _tz_aware(manifest: dict) -> bool:
+    """Whether the run's bars were stamped tz-aware: its manifest's first
+    bar carries a UTC offset. A synthetic run's (and every run main.py makes
+    from data.py's bars, see `data._naive_index`) are naive."""
+    first = manifest.get("data", {}).get("first")
+    return first is not None and pd.Timestamp(first).tz is not None
+
+
+def _stamp(x, aware: bool) -> pd.Timestamp:
+    """A saved stamp back to a Timestamp: in UTC for a tz-aware run (an
+    offset string, or a naive one, is the same instant in UTC), as it was
+    for a naive run."""
+    t = pd.Timestamp(x)
+    if not aware:
+        return t
+    return t.tz_localize("UTC") if t.tz is None else t.tz_convert("UTC")
+
+
+def _parse_index(index: pd.Index, aware: bool) -> pd.Index:
+    """A CSV's first column back to stamps. Aware stamps can carry mixed
+    offsets (a DST change), which parse to objects unless read as UTC; naive
+    ones are left naive."""
+    if len(index) == 0:
+        return pd.DatetimeIndex([], tz="UTC" if aware else None, name=index.name)
+    return pd.DatetimeIndex(pd.to_datetime(index, utc=aware), name=index.name)
+
+
+def _read_stamped_csv(path: str, aware: bool) -> pd.DataFrame:
+    df = pd.read_csv(path, index_col=0, float_precision="round_trip")
+    df.index = _parse_index(df.index, aware)
+    return df
+
+
+def _read_series_frame(path: str, aware: bool = False) -> pd.DataFrame:
     if not os.path.exists(path):
         return pd.DataFrame()
-    return pd.read_csv(path, index_col=0, parse_dates=True, float_precision="round_trip")
+    return _read_stamped_csv(path, aware)
 
 
 def load_run(out_dir: str) -> dict:
@@ -199,9 +232,10 @@ def load_run(out_dir: str) -> dict:
         m = json.load(f)
     if m.get("schema_version") != MANIFEST_VERSION:
         raise ValueError(f"{path}: schema version {m.get('schema_version')}, this code reads {MANIFEST_VERSION}")
+    aware = _tz_aware(m)
     data_path = os.path.join(out_dir, m["data"].get("file", DATA_FILE))
     if os.path.exists(data_path):
-        df = pd.read_csv(data_path, index_col=0, parse_dates=True, float_precision="round_trip")
+        df = _read_stamped_csv(data_path, aware)
     elif m["data"]["source"] == "synthetic":
         d = m["data"]
         df = synthetic_ohlc(n_bars=d["bars"], seed=d["seed"], trend_prob=d["trend_prob"], trend_drift=d["trend_drift"])
@@ -211,15 +245,15 @@ def load_run(out_dir: str) -> dict:
     for spec in m["templates"].values():
         for w in spec["windows"]:
             for k in ("train_start", "train_end", "test_start", "test_end"):
-                w[k] = pd.Timestamp(w[k])
+                w[k] = _stamp(w[k], aware)
     for s in m["nested"]["selections"]:
-        s["period_start"] = pd.Timestamp(s["period_start"])
-    m["boundaries"] = [pd.Timestamp(b) for b in m["boundaries"]]
+        s["period_start"] = _stamp(s["period_start"], aware)
+    m["boundaries"] = [_stamp(b, aware) for b in m["boundaries"]]
     templates = {name: template_from_dict(spec["template"]) for name, spec in m["templates"].items()}
     return dict(
         out_dir=out_dir, manifest=m, df=df, templates=templates,
-        portfolio_returns=_read_series_frame(os.path.join(out_dir, PORTFOLIO_RETURNS)),
-        selected_returns=_read_series_frame(os.path.join(out_dir, SELECTED_RETURNS)),
+        portfolio_returns=_read_series_frame(os.path.join(out_dir, PORTFOLIO_RETURNS), aware),
+        selected_returns=_read_series_frame(os.path.join(out_dir, SELECTED_RETURNS), aware),
     )
 
 
@@ -366,6 +400,7 @@ def replay_target(run: dict, which: str, pool=None, *, template: str | None = No
     # every Sharpe and vol-target size below reads the run's annualization
     # (worker_pool sets it for the pool; this covers a direct call too)
     set_periods_per_year(m["config"]["periods_per_year"])
+    set_hedge_share(hedge_share_of(m["config"]))
     if which == "best":
         name = template or m["best_template"]
         if name not in m["templates"]:

@@ -52,7 +52,7 @@ from pipeline import (
 from portfolio import returns_frame
 from replay import save_run, replay_run, TARGETS as REPLAY_TARGETS
 from strategy import (annualized_sharpe, max_drawdown, periods_per_year, BARS_PER_YEAR, validate_instrument,
-                      instrument_warnings, typical_units, set_periods_per_year)
+                      instrument_warnings, typical_units, set_periods_per_year, set_hedge_share)
 
 
 def parse_args(argv=None):
@@ -124,6 +124,7 @@ def main(argv=None) -> dict:
     except ValueError as e:
         raise SystemExit(f"--bars-per-day: {e}")
     set_periods_per_year(cfg["periods_per_year"])   # before anything here annualizes (the pool re-sets it)
+    set_hedge_share(cfg["hedge_share"])
 
     if args.real:
         print(f"Loading {args.real} ({interval} bars) from yfinance...")
