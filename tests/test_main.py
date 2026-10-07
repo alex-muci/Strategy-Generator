@@ -30,6 +30,7 @@ import time
 import unittest
 from multiprocessing import get_context
 from unittest import mock
+from dataclasses import asdict
 
 import numpy as np
 import pandas as pd
@@ -748,7 +749,10 @@ class SpreadRunTests(unittest.TestCase):
             other = _main(argv)
             for name, res in self.out["results"].items():
                 pd.testing.assert_series_equal(other["results"][name]["oos_returns"], res["oos_returns"])
-                self.assertEqual(other["results"][name]["template"], res["template"])
+                # field by field, NaN equal to NaN: an unset regime_threshold is NaN, and two NaN
+                # objects are never equal, so the dataclass == fails on identical templates
+                a, b = (pd.Series(asdict(r["template"]), dtype=object) for r in (other["results"][name], res))
+                self.assertTrue(a.equals(b), pd.concat([a, b], axis=1)[a.ne(b) & a.notna()])
         finally:
             shutil.rmtree(d, ignore_errors=True)
 
