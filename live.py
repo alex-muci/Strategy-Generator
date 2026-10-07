@@ -33,7 +33,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from strategy import StrategyTemplate, backtest, periods_per_year
+from strategy import StrategyTemplate, backtest, periods_per_year, RESEARCH_EQUITY
 from walkforward import grid_combos, optimize_window, warmup_bars
 
 
@@ -124,7 +124,7 @@ def refit_params(
     selection: str = "plateau",
     min_trades: int = 5,
     anchored: bool = False,
-    initial_equity: float = 100_000.0,
+    initial_equity: float = RESEARCH_EQUITY,
 ) -> dict:
     """Re-optimize `tpl`'s numeric params on the most recent training window.
 

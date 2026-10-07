@@ -468,7 +468,7 @@ class HedgeWarmupTests(unittest.TestCase):
                 for sides in ("both", "long_only"):
                     tpl = StrategyTemplate("t", channel_type=ladder, direction_logic=dl, exit_style="atr_trail", sides=sides)
                     ref = backtest(df, tpl, first_trade_bar=k)
-                    win = window_backtest(df, tpl, k, len(df))
+                    win = window_backtest(df, tpl, k, len(df), initial_equity=100_000.0)
                     np.testing.assert_allclose(win["equity"].to_numpy(), ref["equity"].to_numpy()[k:], rtol=1e-12,
                                                err_msg=f"{ladder} {dl} {sides}")
                     self.assertEqual([(t["entry_date"], t["entry_price"]) for t in win["trades"]],

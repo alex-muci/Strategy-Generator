@@ -491,7 +491,7 @@ class CpcvSelectionRuleTests(unittest.TestCase):
         tpl = StrategyTemplate("wu", exit_style="target_stop", point_value=50.0, margin_per_unit=5000.0,
                                cost_bps=0.0, cost_per_unit=2.5, whole_units=True, risk_pct=0.02, max_leverage=0.5)
         emb = cpcv_embargo(tpl, [{}])
-        R0, E0, P0, X0 = trial_returns(df, tpl, [{}], with_trades=True)
+        R0, E0, P0, X0 = trial_returns(df, tpl, [{}], initial_equity=100_000.0, with_trades=True)
         np.testing.assert_array_equal(R0[:, 0], backtest(df, tpl, fixed_capital=True)["returns"].to_numpy())
         rng = np.random.default_rng(1)
         compounding_leaks = checked = 0
@@ -501,7 +501,7 @@ class CpcvSelectionRuleTests(unittest.TestCase):
             f = np.exp(np.cumsum(rng.normal(0, 0.01, len(rows))))
             for c in ("Open", "High", "Low", "Close"):
                 d1.iloc[rows, d1.columns.get_loc(c)] *= f
-            R1, E1, P1, X1 = trial_returns(d1, tpl, [{}], with_trades=True)
+            R1, E1, P1, X1 = trial_returns(d1, tpl, [{}], initial_equity=100_000.0, with_trades=True)
             # training rows in both runs, past the embargo and any carried trade,
             # whose trade (if any) was entered on the same bar in both
             m = (robustness.train_masks(T, bounds, groups, emb, 0, E0, X0)[:, 0]

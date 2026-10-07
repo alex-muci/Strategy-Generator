@@ -22,7 +22,7 @@ import pandas as pd
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from data import synthetic_ohlc  # noqa: E402
-from strategy import StrategyTemplate, backtest  # noqa: E402
+from strategy import StrategyTemplate, backtest, HEDGE_CHANNELS  # noqa: E402
 from generator import generate_templates, param_grid_for  # noqa: E402
 from walkforward import window_backtest  # noqa: E402
 from live import (  # noqa: E402
@@ -31,7 +31,18 @@ from live import (  # noqa: E402
 )
 
 LOOKBACK = 450
-SWEEP_STRIDE = 137      # prime, so it does not alias with the generator's switch cycles
+SWEEP_SAMPLE = 240      # base templates swept, whatever the size of the universe
+BAR_STEP = 17           # bars between two checked states
+HEDGE_BAR_STEP = 119    # ... on a hedge channel (see the test)
+
+
+def _prime_at_least(n: int) -> int:
+    """The smallest prime >= n: a prime stride does not alias with the
+    generator's switch cycles, so every switch value is still sampled."""
+    n = max(2, n)
+    while any(n % d == 0 for d in range(2, int(n ** 0.5) + 1)):
+        n += 1
+    return n
 
 
 def _fill_price_for(order, open_, level):
@@ -58,12 +69,12 @@ class LiveOrderTests(unittest.TestCase):
 
     def test_predicted_orders_match_what_the_engine_does(self):
         checked_entries = checked_exits = checked_blocks = 0
-        # The sweep costs ~55 cold indicator builds per template, so the sample
-        # is sized by COUNT, not by a fixed stride: the universe grew 6x with the
-        # hedge channel and a stride of 23 turned this test into an hour's run.
+        # The sample is sized by COUNT, not by a fixed stride: the universe grew
+        # 6x with the hedge channel and a fixed stride of 23 turned this test
+        # into an hour's run; a stride derived from the universe's size keeps
+        # the sweep the same size however many switches are added.
         full = generate_templates("full")
-        base = full[::SWEEP_STRIDE]
-        self.assertLess(len(base), 200, "the template universe grew: raise SWEEP_STRIDE")
+        base = full[::_prime_at_least(len(full) // SWEEP_SAMPLE)]
         # every fourth one again, sized to a vol target: exercises the
         # realized-vol readiness gate and the sizing branch live.py restates.
         # It runs right after its twin so the indicator cache is still warm.
@@ -73,7 +84,15 @@ class LiveOrderTests(unittest.TestCase):
             if k % 4 == 0:
                 sample.append(tpl.with_params(vol_target=0.15))
         for tpl in sample:
-            for t in range(LOOKBACK + 20, len(self.df), 17):
+            # A hedge channel rebuilds its online learners on every window
+            # (~0.2 s per learner, two windows per state, and the wide ladder
+            # has one learner per direction and `sides`), which was 85% of the
+            # run time. live.py restates none of the learner -- it reads the
+            # direction the engine computed -- so a hedge template needs a few
+            # states, not dense coverage: stepping them 7x coarser keeps every
+            # learner spec in the sweep at a seventh of the cost.
+            step = HEDGE_BAR_STEP if tpl.channel_type in HEDGE_CHANNELS else BAR_STEP
+            for t in range(LOOKBACK + 20, len(self.df), step):
                 w0 = t - LOOKBACK
                 tail, tail1 = self.df.iloc[w0:t], self.df.iloc[w0:t + 1]
                 st = strategy_state(self.df.iloc[:t], tpl, equity=100_000.0,

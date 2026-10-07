@@ -113,10 +113,10 @@ class ForecastFamilyTests(unittest.TestCase):
 
     def test_online_is_the_split_follow_group(self):
         fam = generate_templates("online")
-        self.assertEqual(len(fam), 9)
-        self.assertEqual({t.direction_logic for t in fam}, {"trend"})
+        self.assertEqual(len(fam), 27)
+        self.assertEqual({t.direction_logic for t in fam}, {"trend", "countertrend", "learned"})
         self.assertEqual({t.channel_type for t in fam}, {"hedge_split"})
-        self.assertEqual(sum(t.entry_style == "stance" for t in fam), 1)
+        self.assertEqual(sum(t.entry_style == "stance" for t in fam), 3)
 
     def test_full_family_leaves_the_forecast_channels_out(self):
         self.assertFalse({t.channel_type for t in generate_templates("full")} & set(FORECAST_CHANNELS))

@@ -137,7 +137,9 @@ Execution model (no look-ahead):
     ATR stop is unchanged
   * stops/limits are filled intrabar at the level, or at the open if the
     open gapped through the level; a time exit is an order at the open, so
-    it goes before any intrabar stop on its bar
+    it goes before any intrabar stop on its bar. A bar that reaches both
+    entry levels fills the one its open already traded through; when the
+    open is inside the channel, the long side
   * every stop the exit rules run (hard ATR stop, chandelier, opposite
     channel) is already working on the entry bar: a bar that trades through
     it after the fill is a same-bar exit at its level
@@ -169,6 +171,14 @@ import pandas as pd
 # at import time and set_periods_per_year() can then no longer be honoured.
 # Read it through periods_per_year() instead.
 PERIODS_PER_YEAR = 252
+
+# The capital the research (walk-forward, CPCV's trial returns, the live refit)
+# sizes on. Returns are scale-free with fractional units; it is this large so
+# that --whole-units floors a full-size contract to a count that is not 0 (on
+# 100,000 a 10 % vol target on gold wanted 0.21 lots: every template sat
+# flat). The flip side: the research then no longer shows the granularity a
+# small account would face; the live book sizes on the real account.
+RESEARCH_EQUITY = 100_000_000.0
 
 # Regular-session bars per year for the intervals yfinance serves. US equity
 # ETFs trade 6.5h a day, which Yahoo cuts into seven '1h' bars (the last one is
@@ -2671,17 +2681,24 @@ def _bar_loop(open_, high, low, close, ready, upper, lower, atr_v,
                         m = _olog(o_i, o_f, m, i, _O_ENTRY_WORKING, -1, otype,
                                   level_down if is_trend else level_up, 0.0, 0.0)
 
+            # a bar that reaches both channel levels: the order whose level the
+            # OPEN already trades through went first (the open is the bar's
+            # first price); otherwise the order inside the bar is unknowable
+            # and the long side is taken. A close_confirm break is
+            # one-sided (both cannot hold), so it has no precedence to settle.
+            up_first = entry_style != 1 and open_[i] >= level_up and open_[i] > level_down
+            down_first = entry_style != 1 and open_[i] <= level_down and open_[i] < level_up
             side = 0
             level = 0.0
             if is_trend:
-                if broke_up and long_ok:
+                if broke_up and long_ok and not (down_first and broke_down and short_ok):
                     side = 1
                     level = level_up
                 elif broke_down and short_ok:
                     side = -1
                     level = level_down
             else:
-                if broke_down and long_ok:
+                if broke_down and long_ok and not (up_first and broke_up and short_ok):
                     side = 1
                     level = level_down
                 elif broke_up and short_ok:
@@ -2975,7 +2992,7 @@ def instrument_warnings(tpl: StrategyTemplate) -> list:
     return out
 
 
-def typical_units(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: float = 100_000.0) -> float:
+def typical_units(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: float = RESEARCH_EQUITY) -> float:
     """The size, in units, the engine's rule gives an entry of `tpl` on a
     median bar of `df` (median ATR or realized vol, median |close|), before
     the learner's conviction and `whole_units`: what a flat run with
@@ -3054,7 +3071,10 @@ def _stance_backtest(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: fl
       a new one opened, the cost charged on the units actually traded), so
       the trade list holds one row per stretch of constant size;
     * there is no stop, target or exit channel: the exit IS the learner
-      changing its mind, so exit_style and its parameters are inert.
+      changing its mind, so exit_style and its parameters are inert;
+    * ruin is `backtest`'s: a close that leaves the equity at or below zero
+      liquidates the position at that close (reason "ruin") and closes the
+      account at what is left, a deficit included (off with fixed_capital).
 
     Costs, point value, fixed capital, the returns and the instrument rules
     follow `backtest`: on a future or spread (`margin_per_unit`) the leverage
@@ -3119,13 +3139,13 @@ def _stance_backtest(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: fl
     cash = float(initial_equity)
     pos = 0; shares = 0.0; e_bar = -1; e_px = 0.0; e_cost = 0.0; trades = []
 
-    def close_trade(i, px, charge=True):
+    def close_trade(i, px, charge=True, reason="stance"):
         nonlocal cash, pos, shares
         xc = (cost_rate * shares * pv * abs(px) + tpl.cost_per_unit * shares) if charge else 0.0
         cash -= xc
         pnl = pos * shares * pv * (px - e_px) - e_cost - xc
         trades.append(dict(entry_date=df.index[e_bar], side=int(pos), entry_price=float(e_px), shares=float(shares),
-                           cost=float(e_cost + xc), exit_date=df.index[i], exit_price=float(px), reason="stance",
+                           cost=float(e_cost + xc), exit_date=df.index[i], exit_price=float(px), reason=reason,
                            pnl=float(pnl), bars_held=int(i - e_bar)))
         pos = 0; shares = 0.0
 
@@ -3150,7 +3170,22 @@ def _stance_backtest(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: fl
         return float(qty)
 
     level = 0.0                      # the quantised stance the position was sized for
+    ruined = False
     for i in range(1, n):
+        # ---- ruin, as in `_bar_loop`: the previous close left nothing ----
+        if ruined:
+            equity[i] = cash
+            continue
+        if not fixed_capital and equity[i - 1] <= 0.0:
+            # liquidated at that close (the cash is already marked there); a
+            # loss beyond the cash is a deficit the account owes, and it stays
+            if pos != 0:
+                close_trade(i - 1, close[i - 1], reason="ruin")
+            equity[i - 1] = cash
+            equity[i] = cash
+            level = 0.0
+            ruined = True
+            continue
         # the open of bar i: the position marked from the last close, then the order
         if pos != 0:
             cash += pos * shares * pv * (open_[i] - close[i - 1])
@@ -3189,11 +3224,18 @@ def _stance_backtest(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: fl
                 cash -= rc
                 e_cost += rc
         equity[i] = cash
+    # ---- ruin on the last bar: the loop above would have closed it on the next ----
+    if n > 1 and equity[n - 1] <= 0.0 and not ruined and not fixed_capital:
+        if pos != 0:
+            close_trade(n - 1, close[n - 1], reason="ruin")
+        equity[n - 1] = cash
+        level = 0.0
+        ruined = True
     # what the NEXT open (bar n) would do, for `live`: the target read at the
     # close of bar n-1 by the rule above, sized on the last close as the proxy
-    # for the open that does not exist yet
+    # for the open that does not exist yet (nothing, on a closed account)
     formed = bool(n > 0 and ready[n - 1])
-    want_next = 0.0 if n < first_trade_bar else (float(q[n - 1]) if formed else level)
+    want_next = 0.0 if n < first_trade_bar or ruined else (float(q[n - 1]) if formed else level)
     qty_next = target_units(want_next, n - 1, close[n - 1], cash) if want_next != level and want_next != 0.0 else 0.0
     stance_next = dict(formed=formed, want=float(want_next), level=float(level), change=bool(want_next != level),
                        target_units=float(np.sign(want_next) * qty_next), held_units=float(pos * shares),
@@ -3367,10 +3409,15 @@ def compound(returns) -> np.ndarray:
     return eq
 
 
-def max_drawdown(equity) -> float:
+def max_drawdown(equity, start: float | None = None) -> float:
     """Deepest peak-to-trough fall of an equity path, as a (negative) fraction
-    of the running peak; 0.0 for an empty path."""
+    of the running peak; 0.0 for an empty path. `start` is the equity the
+    path was funded with, before its first bar: a path compounded from
+    returns begins at 1 + r[0], so without it a loss on the first bar is
+    never a drawdown (pass 1.0 for such a curve)."""
     eq = np.asarray(equity, dtype=float)
+    if start is not None:
+        eq = np.concatenate([[float(start)], eq])
     if len(eq) == 0:
         return 0.0
     return float((eq / np.maximum.accumulate(eq) - 1).min())

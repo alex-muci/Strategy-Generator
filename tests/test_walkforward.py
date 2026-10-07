@@ -31,7 +31,9 @@ import pandas as pd
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from data import synthetic_ohlc  # noqa: E402
-from strategy import StrategyTemplate, backtest, _compute_indicators, atr  # noqa: E402
+from strategy import (  # noqa: E402
+    StrategyTemplate, backtest, _compute_indicators, atr, annualized_sharpe, RESEARCH_EQUITY,
+)
 from generator import generate_templates, param_grid_for  # noqa: E402
 from walkforward import (  # noqa: E402
     walk_forward, walk_forward_matrix, window_backtest, warmup_bars, summarize_walk_forward,
@@ -58,13 +60,13 @@ class WarmupGateTests(unittest.TestCase):
         self.assertGreater(warmup_bars(tpl), 300)
         self.assertGreater(warmup_bars(tpl), warmup_bars(off))
         n, start = len(self.df), 700
-        win = window_backtest(self.df, tpl, start, n)
+        win = window_backtest(self.df, tpl, start, n, initial_equity=100_000.0)
         full = backtest(self.df, tpl, first_trade_bar=start)
         np.testing.assert_allclose(win["equity"].to_numpy(), full["equity"].to_numpy()[start:], rtol=1e-9)
         self.assertEqual(len(win["trades"]), len(full["trades"]))
         self.assertGreater(len(win["trades"]), 0)
         # teeth: the ATR rule's warm-up is not enough for this template
-        short = window_backtest(self.df, tpl, start, n, warmup=warmup_bars(off))
+        short = window_backtest(self.df, tpl, start, n, warmup=warmup_bars(off), initial_equity=100_000.0)
         self.assertFalse(np.allclose(short["equity"].to_numpy(), win["equity"].to_numpy()))
 
     def test_first_trade_bar_gates_entries_and_equity(self):
@@ -88,7 +90,7 @@ class WarmupGateTests(unittest.TestCase):
             for params in ({}, {"n_entry": 60, "n_exit": 20, "regime_n": 30}):
                 t = tpl.with_params(**params)
                 full = backtest(self.df, t, first_trade_bar=k)
-                win = window_backtest(self.df, t, k, n)
+                win = window_backtest(self.df, t, k, n, initial_equity=100_000.0)
                 self.assertLess(warmup_bars(t), k, t.name)
                 # an EMA never forgets its seed completely: the buffer leaves
                 # ~1e-4 of it, about a dollar on 100k here, and no trade differs
@@ -446,9 +448,9 @@ class OneAccountTests(unittest.TestCase):
         cls.tpl = generate_templates("quick")[0]
         cls.grid = param_grid_for(cls.tpl)
 
-    def _check_chain(self, res):
+    def _check_chain(self, res, funded=RESEARCH_EQUITY):
         eq = res["oos_equity"]
-        prev_end = 100_000.0
+        prev_end = funded
         for w in res["windows"]:
             self.assertAlmostEqual(w["initial_equity"], prev_end, delta=1e-6 * prev_end)
             prev_end = float(eq.loc[w["test_end"]])
@@ -462,7 +464,7 @@ class OneAccountTests(unittest.TestCase):
         res = walk_forward(self.df, self.tpl, self.grid, train_bars=400, test_bars=100)
         live = [w for w in res["windows"] if not w["skipped"]]
         self.assertGreater(len(live), 3)
-        self.assertNotAlmostEqual(live[-1]["initial_equity"], 100_000.0, places=0)
+        self.assertNotAlmostEqual(live[-1]["initial_equity"], RESEARCH_EQUITY, places=0)
         for w in live:
             i0, i1 = self.df.index.get_loc(w["test_start"]), self.df.index.get_loc(w["test_end"]) + 1
             fresh = window_backtest(self.df, self.tpl.with_params(**w["params"]), i0, i1)["returns"]
@@ -475,16 +477,53 @@ class OneAccountTests(unittest.TestCase):
         equity buys, not those of a fresh 100,000."""
         tpl = self.tpl.with_params(point_value=50.0, margin_per_unit=5000.0, cost_bps=0.0, cost_per_unit=2.5,
                                    whole_units=True, risk_pct=0.02, max_leverage=0.5)
-        res = walk_forward(self.df, tpl, param_grid_for(tpl), train_bars=400, test_bars=100)
-        self._check_chain(res)
+        res = walk_forward(self.df, tpl, param_grid_for(tpl), train_bars=400, test_bars=100,
+                           initial_equity=100_000.0)   # a small account, where the floor binds
+        self._check_chain(res, 100_000.0)
         differs = 0
         for w in [w for w in res["windows"] if not w["skipped"]]:
             i0, i1 = self.df.index.get_loc(w["test_start"]), self.df.index.get_loc(w["test_end"]) + 1
             chosen = tpl.with_params(**w["params"])
             carried = window_backtest(self.df, chosen, i0, i1, initial_equity=w["initial_equity"])
-            fresh = window_backtest(self.df, chosen, i0, i1)
+            fresh = window_backtest(self.df, chosen, i0, i1, initial_equity=100_000.0)
             np.testing.assert_allclose(res["oos_returns"].loc[carried["returns"].index].to_numpy(),
                                        carried["returns"].to_numpy(), rtol=0, atol=0)
             differs += int(not np.allclose(carried["returns"].to_numpy(), fresh["returns"].to_numpy(),
                                            rtol=0, atol=1e-12))
         self.assertGreater(differs, 0, "the fixture never moves a contract count")
+
+
+class WindowFirstReturnTests(unittest.TestCase):
+    def test_the_window_stats_keep_the_return_of_its_first_bar(self):
+        """A trade opened on the window's first bar: that bar's return (a loss
+        from the funded 100,000 to 99,500) is in the Sharpe and the drawdown."""
+        n, k = 60, 30
+        o = np.full(n, 99.9); h = o + 1.0; l = o - 1.0; c = o.copy()
+        h[12], l[12] = 101.0, 98.8                       # a 20-bar channel of 98.8 / 101
+        o[k], h[k], l[k], c[k] = 100.8, 101.6, 100.2, 100.5   # long 1,000 at 101, closes at 100.5
+        for j in range(k + 1, n):
+            o[j], h[j], l[j], c[j] = 102.0, 103.0, 101.5, 102.5
+        df = pd.DataFrame({"Open": o, "High": h, "Low": l, "Close": c}, index=pd.bdate_range("2025-01-01", periods=n))
+        tpl = StrategyTemplate("t", channel_type="donchian", entry_style="stop", exit_style="target_stop", n_entry=20,
+                               atr_n=5, atr_mult_stop=3.0, atr_mult_target=2.0, risk_pct=0.06, max_leverage=10.0,
+                               cost_bps=0.0, sides="long_only")
+        win = window_backtest(df, tpl, k, n, warmup=25, initial_equity=100_000.0)
+        r = win["returns"].to_numpy()
+        self.assertAlmostEqual(r[0], -0.005)
+        self.assertAlmostEqual(win["stats"]["sharpe"], annualized_sharpe(r))
+        self.assertAlmostEqual(win["stats"]["max_drawdown"], -0.005)
+
+
+class PooledDrawdownTests(unittest.TestCase):
+    def test_a_first_bar_loss_is_in_the_pooled_drawdown(self):
+        """The stitched OOS series starts at a funded 1.0: a loss on its first
+        bar is a drawdown (compounding from 1 + r[0] alone hides it)."""
+        import pipeline as P
+        from strategy import max_drawdown
+        idx = pd.bdate_range("2025-01-01", periods=4)
+        r = pd.Series([-0.10, 0.02, 0.01, 0.01], index=idx)            # the deepest fall is the first bar
+        self.assertAlmostEqual(max_drawdown(1 + r.cumsum(), start=1.0), -0.10)
+        windows = [dict(skipped=False, is_stats=dict(sharpe=1.0, total_return=0.1, n_bars=100),
+                        oos_stats=dict(total_return=0.04, n_trades=3, n_bars=4), params_changed=False)]
+        self.assertAlmostEqual(summarize_walk_forward(windows, r)["oos_max_drawdown"], -0.10)
+        self.assertAlmostEqual(P.curve_stats(r)["max_dd"], -0.10)

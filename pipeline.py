@@ -494,7 +494,7 @@ def curve_stats(r: pd.Series, additive: bool = False) -> dict:
         max_dd = float((v - np.maximum.accumulate(v)).min())
     else:
         cagr = float(eq.iloc[-1] ** (periods_per_year() / n) - 1) if eq.iloc[-1] > 0 else -1.0
-        max_dd = max_drawdown(eq)
+        max_dd = max_drawdown(eq, start=1.0)      # funded at 1 before the first bar
     return dict(sharpe=annualized_sharpe(r), cagr=cagr, max_dd=max_dd, n_bars=n)
 
 

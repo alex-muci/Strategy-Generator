@@ -25,7 +25,7 @@ python -m venv env  # assuming 3.12 installed
 ./env/Script/Activate
 pip install -r requirements.txt 
 
-python -m unittest discover -s tests -t . -v # 436 tests (engine, exit ordering, order log, templates, hedge learner and its wide ladder, walk-forward, robustness, selection, data, live signals, replay, both entry points, spreads: shift invariance, point value, per-unit and roll costs, margin cap, ruin, whole units, the ETF trick, a mixed cash + spread book)
+python -m unittest discover -s tests -t . -v # 491 tests (engine, exit ordering, order log, templates, hedge learner and its wide ladder, walk-forward, robustness, selection, data, live signals, replay, both entry points, spreads: shift invariance, point value, per-unit and roll costs, margin cap, ruin, whole units, the ETF trick, a mixed cash + spread book)
 # faster: pip install -r requirements-dev.txt, then, with ./env active,
 python -m pytest -n auto --dist loadscope   # in parallel; loadscope keeps a class (and its one-off setup) on one worker
 python -m pytest -m slow                    # the minutes-long live-order sweeps pytest skips by default
@@ -44,7 +44,7 @@ still runs every test.
 python main.py --help
 python main.py --family quick                       # 72 templates (Donchian, ER filter)
 python main.py --family default                     # 768 templates, all switches sampled
-python main.py --family online                      # 9 templates: the split ladder's follow group (trend direction), stop / close-confirm entries by every exit, and the committee's stance traded directly; learned / countertrend remain as overrides
+python main.py --family online                      # 27 templates: the split ladder's follow group by trend / countertrend / learned, stop / close-confirm entries by every exit, and the committee's stance traded directly (countertrend lost on daily SPY / TLT / GLD / USO, but is kept for futures)
 python main.py --family online_forecast             # 3 templates: the forecast channel (slow trend prior + learned fast-scale term, held as a position under a no-trade buffer) by trend / countertrend / learned
 python main.py --real SPY --start 2005-01-01 --family default --jobs 8
 python main.py --real SPY --start 2005-01-01 --family quick --sides long_only   # one-sided family (an asset with a drift)
@@ -70,16 +70,29 @@ Two warnings for futures, both learned the hard way:
   `--roll-cost-per-unit` and a `Roll` column, never inside the prices (see
   Futures and spreads). The `=F` series are fine for what `futures_map.py`
   uses them for: today's price of a contract.
-- **`--whole-units` can leave every template flat.** It floors every entry to
-  whole contracts, and on the 100,000 the research sizes on a full-size
-  contract is often less than one. Full-size gold (GC, 100 oz) moving about
-  $30 a day is $3,000 a day per lot; a 10 % vol target on 100,000 wants
-  0.10 / sqrt(252) x 100,000 = $630 a day, i.e. 0.21 lots, floored to **0**,
-  and the 1 % ATR rule (3 ATR stop) wants about 0.1. Brent at a 15 % target is
-  about 0.6 lots. `main.py` prints a warning with the typical size before the
-  run. Trade the micro contract (MGC, 10 oz: about 2 lots at 10 %), raise
-  `--vol-target` / `--risk-pct`, or research in fractional lots (drop
-  `--whole-units`; the live book then rounds what the research did not).
+- **The research sizes on 100,000,000, not on your account.** The
+  walk-forward, CPCV's trial returns and the live refit fund every template
+  with `strategy.RESEARCH_EQUITY` = 100 million. With fractional units the
+  scale changes no return (every size, cap and cost is linear in it); it is
+  that large for `--whole-units`, which floors every entry to whole
+  contracts: on 100,000 a full-size contract was often less than one and
+  every template sat flat. Full-size gold (GC, 100 oz) moving about $30 a day
+  is $3,000 a day per lot; a 10 % vol target on 100,000 wants
+  0.10 / sqrt(252) x 100,000 = $630 a day, i.e. 0.21 lots, floored to **0**;
+  on 100 million it is 210 lots, and the floor costs well under 1 % of the
+  size. **The caveat:** the research then shows (almost) fractional sizes,
+  not the lot granularity your own account faces. The window and trade
+  currency figures (trade P&L, each template's OOS equity) are on the 100
+  million scale (returns, Sharpe and drawdowns are not; the portfolio curves
+  and the one-unit benchmark are still scaled to 100,000), it assumes 100 million fills at the bar's prices
+  (no market impact), and the live book sizes each slot on its share of
+  your real account, where the same gold slot on 100,000 still floors to 0
+  lots. Check `typical_units(df, tpl, your_equity)` before trading a
+  full-size contract on a small account; trade the micro (MGC, 10 oz:
+  about 2 lots at 10 % on 100,000), or raise `--vol-target` / `--risk-pct`.
+  With `--whole-units` both entry points print the typical entry size on the
+  research equity and per 100,000 of account, and say when a 100,000 account
+  would floor it to 0 and sit flat where the research trades.
 
 Outputs land in `./outputs/` (or `--out DIR`):
 
@@ -471,9 +484,10 @@ asset (a 15 % target on a 5 % vol asset asks for 3x).
 
 The walk-forward is **one account traded forward**. Each window, its
 in-sample fit and its out-of-sample run, is sized on the equity the previous
-out-of-sample window ended with, not on a fresh 100,000
-(`walkforward.walk_forward`; each window's `initial_equity` is recorded in
-`run.json` and the replay uses it).
+out-of-sample window ended with, not on a fresh `initial_equity` (100
+million by default, `strategy.RESEARCH_EQUITY`: see the caveat under Running
+it) (`walkforward.walk_forward`; each window's `initial_equity` is recorded
+in `run.json` and the replay uses it).
 
 - **Why.** The report compounds the windows' returns into one equity curve,
   but every window used to be funded with 100,000 whatever that curve said:
@@ -488,7 +502,10 @@ out-of-sample window ended with, not on a fresh 100,000
   floors to 0, on 100,000 to 1. One lot is also a larger share of a smaller
   account, so the risk per trade drifts up as equity falls until the floor
   sends it to zero. That is what a small futures account is, and the
-  research now shows it instead of hiding it behind a fresh 100,000.
+  research shows it instead of hiding it behind a fresh 100,000, when it is
+  run on such an account (`walk_forward(..., initial_equity=100_000)`). On
+  the default 100 million the counts are in the hundreds and the floor
+  barely moves them, which is why it is the default.
 - **Ruin ends it.** An account at or below zero (a deficit included, see
   Ruin) is closed: every later window is flat and marked `ruined`.
 
@@ -568,9 +585,10 @@ the account in notional terms, which is why the cap should sit at 0.5 or
 below: a $12 gap against 8 lots ($96,000) nearly wipes the account (see
 **Ruin**). A sizing rule usually binds well before the cap. At 1 % risk on a
 3-ATR stop with a $2 ATR, the rule wants $1,000 / (3 x 2 x 1,000) = 0.17
-lots, which `--whole-units` floors to **0**: `main.py` warns about this
-before the run. Raise `--risk-pct`, use `--vol-target`, or trade a
-smaller contract.
+lots, which `--whole-units` floors to **0** on this account. The research,
+sized on 100 million, trades about 170 lots and never sees it: the live book,
+sized on your account, does (see the caveat under Running it). Raise
+`--risk-pct`, use `--vol-target`, or trade a smaller contract.
 
 **Example: a Brent calendar spread (Dec25-Dec26).** It is quoted front
 minus back, say +$1.50, and can go negative. Its "notional" (1.50 x 1,000 =
@@ -626,9 +644,9 @@ Research trades fractional units unless `--whole-units` is set; the live
 trade list always rounds to whole units, so a futures research run without
 the flag can book P&L on 0.3 contracts that the live book never holds.
 With the flag, `main.py` warns before the run when a typical entry sizes
-below one unit on the 100,000 the research sizes on (every template would
+below one unit on the 100 million the research sizes on (every template would
 sit flat); the live book sizes each slot on its share of the account, so a
-small slot can floor to 0 where the research traded one lot.
+small slot can floor to 0 where the research traded hundreds of lots.
 
 **Ruin.** A close that leaves the equity at or below zero (a gap through the
 stop beyond the margin) liquidates the position at that close (trade reason
@@ -682,10 +700,11 @@ contract's return): for a series that touches zero, or any run with
 equity, an additive curve (summed, never compounded) on an arbitrary scale.
 Its Sharpe, the correlation to it and the information ratio are scale-free
 and read as before. The **beta is not**: the benchmark's return is point
-value x price change / initial equity, so the beta scales with 1 / point
-value (and with the initial equity). Read it as the number of units the
-portfolio behaves like it holds on that equity (a beta of 2 is two lots'
-exposure on average, not twice the market's). Its CAGR column is the simple
+value x price change / 100,000, so the beta scales with 1 / point value.
+Read it as the number of units the portfolio behaves like it holds per
+100,000 of equity (a beta of 2 is two lots' exposure per 100,000 on
+average, not twice the market's); the strategies' returns are scale-free,
+so the research equity does not enter it. Its CAGR column is the simple
 annual P&L and its drawdown the deepest fall from a peak, both as fractions
 of the initial equity. A
 calendar spread that stays positive over the whole sample and is run
@@ -1027,8 +1046,8 @@ it.
   contracts, roll costs, prices through zero), and `live.py` supports it: the
   stance (a hedge committee's, a forecaster's) is published as one
   market-on-open order for the change of holding, the size computed at the
-  last close. There is no stop or target order to publish. The shipped stance template is
-  the `online` family's (`TR-hsp-stance`, on `hedge_split`); on the other
+  last close. There is no stop or target order to publish. The shipped stance templates are
+  the `online` family's (`TR-` / `CT-` / `LN-hsp-stance`, on `hedge_split`); on the other
   ladders it is a switch, e.g. `generate_templates("online",
   channel_types=["hedge_slow"])`.
 - **`hedge_split`**: trend and mean reversion on their own time scales.
@@ -1231,7 +1250,7 @@ They are listed with the number that would justify reopening each one.
   set. The default stays at 0. CSCV cannot be purged by construction;
   its blocks (T/16 bars) are long next to a trade and PBO is a rank
   statistic with every trial treated alike. The trials matrix is run on
-  **fixed capital** (`trial_returns`: every entry sized on the same 100,000,
+  **fixed capital** (`trial_returns`: every entry sized on the same 100 million,
   every return P&L over it, ruin off). On a compounding account a test
   block's P&L changes every later size, and with `--whole-units` every later
   contract count, indefinitely: changing one price inside a test block moved

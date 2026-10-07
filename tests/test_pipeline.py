@@ -1386,7 +1386,7 @@ class StanceEntryTests(unittest.TestCase):
                              + STANCE_SETTLE + 5)
             for st in (1800, 2100, 2500):
                 full = backtest(d, tpl, first_trade_bar=st)
-                win = window_backtest(d, tpl, st, st + 300)
+                win = window_backtest(d, tpl, st, st + 300, initial_equity=100_000.0)
                 np.testing.assert_allclose(win["returns"].to_numpy(), full["returns"].to_numpy()[st:st + 300],
                                            rtol=0, atol=1e-12, err_msg=f"{ch} {sides} {st} {'spread' if kw else ''}")
 

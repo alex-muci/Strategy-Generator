@@ -34,7 +34,7 @@ from scipy.stats import norm, skew as _skew, kurtosis as _kurtosis
 from scipy.cluster.hierarchy import linkage, leaves_list
 from scipy.spatial.distance import squareform
 
-from strategy import backtest, periods_per_year, compound
+from strategy import backtest, periods_per_year, compound, RESEARCH_EQUITY
 from walkforward import smooth_scores, walk_forward, grid_combos, score_stats, warmup_bars
 
 EULER_GAMMA = 0.5772156649015329
@@ -44,7 +44,7 @@ EULER_GAMMA = 0.5772156649015329
 # trials matrix
 # --------------------------------------------------------------------------
 
-def trial_returns(df: pd.DataFrame, tpl, combos: list, initial_equity: float = 100_000.0,
+def trial_returns(df: pd.DataFrame, tpl, combos: list, initial_equity: float = RESEARCH_EQUITY,
                   with_trades: bool = False):
     """Backtest every param combo over the FULL history, on FIXED capital.
     Returns (R, E): float array T x N of per-bar returns and int8 array

@@ -78,9 +78,9 @@ from pipeline import (
 )
 from portfolio import returns_frame
 from strategy import (
-    StrategyTemplate, annualized_sharpe, max_drawdown, set_periods_per_year, periods_per_year,
+    StrategyTemplate, annualized_sharpe, max_drawdown, compound, set_periods_per_year, periods_per_year,
     periods_per_year_for_interval, SIDES, BARS_PER_YEAR, validate_instrument, instrument_warnings,
-    typical_units, set_hedge_share,
+    typical_units, set_hedge_share, RESEARCH_EQUITY,
 )
 from futures_map import (
     CONTRACTS, LISTINGS, FX_SYMBOLS, HEDGE_RATIO_BARS, QUOTES_STALE_DAYS,
@@ -315,9 +315,14 @@ def research(args) -> dict:
         if tpl.whole_units:
             q = typical_units(data[a], tpl)
             if q < 1.0:
-                print(f"  WARNING {a}: --whole-units: a typical entry sizes to {q:.2f} units on the 100,000 the "
-                      "research sizes on, floored to 0: its templates will rarely trade. Raise --risk-pct / "
+                print(f"  WARNING {a}: --whole-units: a typical entry sizes to {q:.2f} units on the "
+                      f"{RESEARCH_EQUITY:,.0f} the research sizes on, floored to 0: its templates will rarely trade. Raise --risk-pct / "
                       "--vol-target, trade a smaller contract, or drop --whole-units")
+            # the research equity rarely floors anything; the slot that trades it does
+            q_acct = typical_units(data[a], tpl, 100_000.0)
+            print(f"  NOTE {a}: --whole-units: a typical entry is {q:,.1f} units on the research equity, "
+                  f"{q_acct:.2f} per 100,000 of account"
+                  + (" -- a 100,000 slot floors it to 0 and sits flat where the research trades" if q_acct < 1 else ""))
     jobs = [(f"{a}|{t.name}", a, t) for a in args.assets for t in templates_for(a)]
     print(f"{len(templates_for(args.assets[0]))} templates x {len(args.assets)} assets = {len(jobs)} slots; "
           f"walk-forward train={args.train} test={args.test} "
@@ -468,7 +473,7 @@ def _diagnostics(results, rets, nested, port, args) -> dict:
         years_available=float(fam["years_available"]),
         static_sharpe=float(annualized_sharpe(pr)) if len(pr) > 2 else 0.0,
         nested_sharpe=float(nested["sharpe"]),
-        nested_max_drawdown=max_drawdown(ne),
+        nested_max_drawdown=max_drawdown(compound(nested["portfolio_returns"].to_numpy()), start=1.0),
         n_reselections=len(nested["selections"]),
     )
     print(f"  PBO over {n_trials} parameter trials: {out['pbo_trials']:.2f}"
@@ -556,7 +561,11 @@ def _curves(data, rets, nested, port, cfg=None) -> dict:
         kind, r = benchmark_returns(data[a], point_value=ins["point_value"], margin_per_unit=ins["margin_per_unit"])
         parts[a] = benchmark_curve(r.reindex(ne.index).fillna(0.0), additive=kind == BENCH_ONE_UNIT)
     bh = pd.concat(parts, axis=1).mean(axis=1)
-    strat = ne / ne.iloc[0]
+    # growth of the funded book (1 before its first bar, so a first-bar loss
+    # shows); a record without the returns is normalised by its first equity
+    pr = nested.get("portfolio_returns")
+    strat = (pd.Series(compound(pr.to_numpy()), index=ne.index) if pr is not None and len(pr) == len(ne)
+             else ne / ne.iloc[0])
     step = max(1, len(strat) // 400)
     s, b = strat.iloc[::step], bh.iloc[::step]
     return dict(
@@ -803,7 +812,7 @@ def _slot_signal(slot: dict, df: pd.DataFrame, cfg: dict, live: dict, args,
     if mem["fitted_on"] is None or (stale and not args.no_refit):
         # the in-sample fit is sized on the capital the slot actually trades
         # (with whole units the contract counts, and so the fit, depend on it).
-        # Research sized each template on its own account (100,000, carried
+        # Research sized each template on its own account (RESEARCH_EQUITY, carried
         # window to window), not on this slot's share of yours: with whole
         # units the two fits can differ, and the live one is the one you trade
         fit = refit_params(df, base, param_grid_for(base, wide=cfg["wide_grid"]),
