@@ -155,12 +155,18 @@ def main(argv=None) -> dict:
     for w in instrument_warnings(_costed(templates[0], cfg, asset)):
         print(f"WARNING: {w}")
     if args.whole_units:
-        q = typical_units(df, _costed(templates[0], cfg, asset))
+        tpl0 = _costed(templates[0], cfg, asset)
+        q = typical_units(df, tpl0)
         if q < 1.5:
             print(f"WARNING: --whole-units: a typical entry sizes to {q:.2f} units on the {RESEARCH_EQUITY:,.0f} "
                   "the research sizes on, floored to " + ("0: most templates will never trade" if q < 1 else
                                              "1: the size barely varies") +
                   ". Raise --risk-pct / --vol-target (or --max-leverage), or drop --whole-units")
+        # the research equity rarely floors anything; the account that trades it does
+        q_acct = typical_units(df, tpl0, 100_000.0)
+        print(f"NOTE: --whole-units: a typical entry is {q:,.1f} units on the {RESEARCH_EQUITY:,.0f} the research "
+              f"sizes on, {q_acct:.2f} per 100,000 of account"
+              + (" -- a 100,000 account floors it to 0 and sits flat where the research trades" if q_acct < 1 else ""))
     with worker_pool(args.jobs, {asset: df}, cfg) as pool:
         out = _run(df, asset, templates, pool, args, cfg)
     print(f"\nTotal runtime {time.time() - t0:.1f}s. Outputs in {os.path.join(args.out, '')}")

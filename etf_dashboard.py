@@ -318,6 +318,11 @@ def research(args) -> dict:
                 print(f"  WARNING {a}: --whole-units: a typical entry sizes to {q:.2f} units on the "
                       f"{RESEARCH_EQUITY:,.0f} the research sizes on, floored to 0: its templates will rarely trade. Raise --risk-pct / "
                       "--vol-target, trade a smaller contract, or drop --whole-units")
+            # the research equity rarely floors anything; the slot that trades it does
+            q_acct = typical_units(data[a], tpl, 100_000.0)
+            print(f"  NOTE {a}: --whole-units: a typical entry is {q:,.1f} units on the research equity, "
+                  f"{q_acct:.2f} per 100,000 of account"
+                  + (" -- a 100,000 slot floors it to 0 and sits flat where the research trades" if q_acct < 1 else ""))
     jobs = [(f"{a}|{t.name}", a, t) for a in args.assets for t in templates_for(a)]
     print(f"{len(templates_for(args.assets[0]))} templates x {len(args.assets)} assets = {len(jobs)} slots; "
           f"walk-forward train={args.train} test={args.test} "

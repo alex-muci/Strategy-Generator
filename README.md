@@ -90,9 +90,9 @@ Two warnings for futures, both learned the hard way:
   lots. Check `typical_units(df, tpl, your_equity)` before trading a
   full-size contract on a small account; trade the micro (MGC, 10 oz:
   about 2 lots at 10 % on 100,000), or raise `--vol-target` / `--risk-pct`.
-  `main.py` warns only when a typical entry sizes below about one unit even
-  on the research equity, so a small real account is never warned about:
-  check it yourself.
+  With `--whole-units` both entry points print the typical entry size on the
+  research equity and per 100,000 of account, and say when a 100,000 account
+  would floor it to 0 and sit flat where the research trades.
 
 Outputs land in `./outputs/` (or `--out DIR`):
 
@@ -700,10 +700,11 @@ contract's return): for a series that touches zero, or any run with
 equity, an additive curve (summed, never compounded) on an arbitrary scale.
 Its Sharpe, the correlation to it and the information ratio are scale-free
 and read as before. The **beta is not**: the benchmark's return is point
-value x price change / initial equity, so the beta scales with 1 / point
-value (and with the initial equity). Read it as the number of units the
-portfolio behaves like it holds on that equity (a beta of 2 is two lots'
-exposure on average, not twice the market's). Its CAGR column is the simple
+value x price change / 100,000, so the beta scales with 1 / point value.
+Read it as the number of units the portfolio behaves like it holds per
+100,000 of equity (a beta of 2 is two lots' exposure per 100,000 on
+average, not twice the market's); the strategies' returns are scale-free,
+so the research equity does not enter it. Its CAGR column is the simple
 annual P&L and its drawdown the deepest fall from a peak, both as fractions
 of the initial equity. A
 calendar spread that stays positive over the whole sample and is run
