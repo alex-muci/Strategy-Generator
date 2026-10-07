@@ -204,7 +204,7 @@ def window_backtest(df: pd.DataFrame, tpl, start: int, end: int, *,
     r = res["returns"].to_numpy()
     rets = np.concatenate([[0.0], r[off:]]) if off > 0 else r
     out["stats"] = performance_stats(eq, res["trades"], initial_equity, rets)
-    out["stats"]["max_drawdown"] = max_drawdown(np.concatenate([[float(initial_equity)], eq]))
+    out["stats"]["max_drawdown"] = max_drawdown(eq, start=initial_equity)
     out["window_start"] = df.index[start]
     out["exposure"] = exposure_totals(out, df["Close"].to_numpy()[start:end], point_value=tpl.point_value,
                                       margin_per_unit=tpl.margin_per_unit)
@@ -452,7 +452,7 @@ def summarize_walk_forward(windows: list, oos_returns: pd.Series) -> dict:
     total = float(eq.iloc[-1] - 1)
     n_bars = len(oos_returns)
     cagr = float(eq.iloc[-1] ** (periods_per_year() / n_bars) - 1) if eq.iloc[-1] > 0 else -1.0
-    max_dd = max_drawdown(eq)
+    max_dd = max_drawdown(eq, start=1.0)       # funded at 1 before the first OOS bar
     oos_sharpe = annualized_sharpe(oos_returns)
 
     is_sharpes = np.array([w["is_stats"]["sharpe"] for w in live])

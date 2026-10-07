@@ -512,3 +512,18 @@ class WindowFirstReturnTests(unittest.TestCase):
         self.assertAlmostEqual(r[0], -0.005)
         self.assertAlmostEqual(win["stats"]["sharpe"], annualized_sharpe(r))
         self.assertAlmostEqual(win["stats"]["max_drawdown"], -0.005)
+
+
+class PooledDrawdownTests(unittest.TestCase):
+    def test_a_first_bar_loss_is_in_the_pooled_drawdown(self):
+        """The stitched OOS series starts at a funded 1.0: a loss on its first
+        bar is a drawdown (compounding from 1 + r[0] alone hides it)."""
+        import pipeline as P
+        from strategy import max_drawdown
+        idx = pd.bdate_range("2025-01-01", periods=4)
+        r = pd.Series([-0.10, 0.02, 0.01, 0.01], index=idx)            # the deepest fall is the first bar
+        self.assertAlmostEqual(max_drawdown(1 + r.cumsum(), start=1.0), -0.10)
+        windows = [dict(skipped=False, is_stats=dict(sharpe=1.0, total_return=0.1, n_bars=100),
+                        oos_stats=dict(total_return=0.04, n_trades=3, n_bars=4), params_changed=False)]
+        self.assertAlmostEqual(summarize_walk_forward(windows, r)["oos_max_drawdown"], -0.10)
+        self.assertAlmostEqual(P.curve_stats(r)["max_dd"], -0.10)

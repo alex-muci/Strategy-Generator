@@ -51,7 +51,7 @@ from pipeline import (
 )
 from portfolio import returns_frame
 from replay import save_run, replay_run, TARGETS as REPLAY_TARGETS
-from strategy import (annualized_sharpe, max_drawdown, periods_per_year, BARS_PER_YEAR, validate_instrument,
+from strategy import (annualized_sharpe, max_drawdown, periods_per_year, compound, BARS_PER_YEAR, validate_instrument,
                       instrument_warnings, typical_units, set_periods_per_year, set_hedge_share,
                       RESEARCH_EQUITY)
 
@@ -333,16 +333,18 @@ def _report(df, results, port, nested, fam, finalists, bench, args, asset: str |
         eq = res["oos_equity"]
         if len(eq) < 3:
             continue
-        norm = eq / eq.iloc[0]
+        # growth of the funded account (1 before the first bar), not of the
+        # equity the first bar left: a first-bar loss must show
+        norm = pd.Series(compound(res["oos_returns"].to_numpy()), index=eq.index)
         if name in selected:
             ax.plot(norm.index, norm.values, linewidth=1.6, label=name, alpha=0.9)
         else:
             ax.plot(norm.index, norm.values, linewidth=0.5, color="grey", alpha=0.2)
     if len(port["portfolio_equity"]) > 1:
-        peq = port["portfolio_equity"] / port["portfolio_equity"].iloc[0]
+        peq = pd.Series(compound(port["portfolio_returns"].to_numpy()), index=port["portfolio_equity"].index)
         ax.plot(peq.index, peq.values, linewidth=3.0, color="black", label="PORTFOLIO (static selection, in-sample w.r.t. selection)")
     if len(nested["portfolio_equity"]) > 1:
-        neq = nested["portfolio_equity"] / nested["portfolio_equity"].iloc[0]
+        neq = pd.Series(compound(nested["portfolio_returns"].to_numpy()), index=nested["portfolio_equity"].index)
         ax.plot(neq.index, neq.values, linewidth=3.0, color="red", linestyle="--", label="PORTFOLIO (nested walk-forward selection)")
     ax.set_title(f"Out-of-sample walk-forward equity: all templates (grey), selected, portfolios, {bench_kind}")
     ax.grid(alpha=0.3)
@@ -510,12 +512,12 @@ def _report(df, results, port, nested, fam, finalists, bench, args, asset: str |
     pr = port["portfolio_returns"]; pe = port["portfolio_equity"]
     L.append(f"\n## Portfolio ({args.weighting} weights)\n\n")
     if len(pe):
-        L.append(f"- Static selection: Sharpe {annualized_sharpe(pr):.2f}, max drawdown {max_drawdown(pe):.1%}, "
+        L.append(f"- Static selection: Sharpe {annualized_sharpe(pr):.2f}, max drawdown {max_drawdown(compound(pr.to_numpy()), start=1.0):.1%}, "
                  f"final equity ${pe.iloc[-1]:,.0f} -- **biased upward**: the selection saw this whole history.\n")
     if len(nested["portfolio_equity"]):
         ne = nested["portfolio_equity"]
         L.append(f"- Nested walk-forward selection: Sharpe **{nested['sharpe']:.2f}**, max drawdown "
-                 f"{max_drawdown(ne):.1%}, final equity ${ne.iloc[-1]:,.0f} "
+                 f"{max_drawdown(compound(nested['portfolio_returns'].to_numpy()), start=1.0):.1%}, final equity ${ne.iloc[-1]:,.0f} "
                  f"({len(nested['selections'])} re-selections). This is the honest number.\n")
         L.append("\nRe-selection log (period start -> templates):\n\n")
         for s in nested["selections"]:

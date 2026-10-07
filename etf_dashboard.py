@@ -78,7 +78,7 @@ from pipeline import (
 )
 from portfolio import returns_frame
 from strategy import (
-    StrategyTemplate, annualized_sharpe, max_drawdown, set_periods_per_year, periods_per_year,
+    StrategyTemplate, annualized_sharpe, max_drawdown, compound, set_periods_per_year, periods_per_year,
     periods_per_year_for_interval, SIDES, BARS_PER_YEAR, validate_instrument, instrument_warnings,
     typical_units, set_hedge_share, RESEARCH_EQUITY,
 )
@@ -473,7 +473,7 @@ def _diagnostics(results, rets, nested, port, args) -> dict:
         years_available=float(fam["years_available"]),
         static_sharpe=float(annualized_sharpe(pr)) if len(pr) > 2 else 0.0,
         nested_sharpe=float(nested["sharpe"]),
-        nested_max_drawdown=max_drawdown(ne),
+        nested_max_drawdown=max_drawdown(compound(nested["portfolio_returns"].to_numpy()), start=1.0),
         n_reselections=len(nested["selections"]),
     )
     print(f"  PBO over {n_trials} parameter trials: {out['pbo_trials']:.2f}"
@@ -561,7 +561,11 @@ def _curves(data, rets, nested, port, cfg=None) -> dict:
         kind, r = benchmark_returns(data[a], point_value=ins["point_value"], margin_per_unit=ins["margin_per_unit"])
         parts[a] = benchmark_curve(r.reindex(ne.index).fillna(0.0), additive=kind == BENCH_ONE_UNIT)
     bh = pd.concat(parts, axis=1).mean(axis=1)
-    strat = ne / ne.iloc[0]
+    # growth of the funded book (1 before its first bar, so a first-bar loss
+    # shows); a record without the returns is normalised by its first equity
+    pr = nested.get("portfolio_returns")
+    strat = (pd.Series(compound(pr.to_numpy()), index=ne.index) if pr is not None and len(pr) == len(ne)
+             else ne / ne.iloc[0])
     step = max(1, len(strat) // 400)
     s, b = strat.iloc[::step], bh.iloc[::step]
     return dict(

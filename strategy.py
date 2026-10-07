@@ -3409,10 +3409,15 @@ def compound(returns) -> np.ndarray:
     return eq
 
 
-def max_drawdown(equity) -> float:
+def max_drawdown(equity, start: float | None = None) -> float:
     """Deepest peak-to-trough fall of an equity path, as a (negative) fraction
-    of the running peak; 0.0 for an empty path."""
+    of the running peak; 0.0 for an empty path. `start` is the equity the
+    path was funded with, before its first bar: a path compounded from
+    returns begins at 1 + r[0], so without it a loss on the first bar is
+    never a drawdown (pass 1.0 for such a curve)."""
     eq = np.asarray(equity, dtype=float)
+    if start is not None:
+        eq = np.concatenate([[float(start)], eq])
     if len(eq) == 0:
         return 0.0
     return float((eq / np.maximum.accumulate(eq) - 1).min())
