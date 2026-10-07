@@ -149,9 +149,9 @@ class TemplateParamTests(unittest.TestCase):
             t.with_params(n_enrty=55)
 
     def test_grid_only_varies_what_the_switches_use(self):
-        for wide in (False, True):
+        for wide, slow in ((False, False), (True, False), (False, True), (True, True)):
             for t in generate_templates("full"):
-                grid = param_grid_for(t, wide=wide)
+                grid = param_grid_for(t, wide=wide, slow=slow)
                 if t.channel_type not in HEDGE_CHANNELS:
                     self.assertIn("n_entry", grid, t.name)
                 for k, values in grid.items():
@@ -168,14 +168,38 @@ class TemplateParamTests(unittest.TestCase):
                     self.assertEqual(grid["regime_threshold"],
                                      REGIME_INDICATORS[t.regime_indicator]["thresholds"])
 
+    def test_slow_grid_is_another_horizon_band_of_the_same_size(self):
+        """The slow grid moves the horizons, not the trial count: as many
+        combinations per template as the default grid, every lookback at or
+        beyond the default grid's longest, and one wider hard stop on every
+        template that has a stop (the stance entry has none)."""
+        from generator import SLOW_HARD_STOP
+        tpls = generate_templates("full") + generate_templates("online_long") + generate_templates("online")
+        for t in tpls:
+            for wide in (False, True):
+                fast, slow = param_grid_for(t, wide=wide), param_grid_for(t, wide=wide, slow=True)
+                self.assertEqual(len(grid_combos(fast)[0]), len(grid_combos(slow)[0]), t.name)
+                for k in ("n_entry", "n_exit", "max_hold_bars"):
+                    if k in fast:
+                        self.assertGreaterEqual(min(slow[k]), max(param_grid_for(t)[k]) if k == "n_entry" and not wide
+                                                else min(fast[k]), f"{t.name}: {k}")
+                if t.entry_style == "stance":
+                    self.assertNotIn("atr_mult_stop", slow, t.name)
+                elif t.exit_style != "target_stop":
+                    self.assertEqual(slow["atr_mult_stop"], [SLOW_HARD_STOP], t.name)
+                if "atr_mult_trail" in slow:
+                    self.assertLessEqual(max(slow["atr_mult_trail"]), SLOW_HARD_STOP if not wide else 8.0)
+        t = StrategyTemplate("t")
+        self.assertEqual(param_grid_for(t, slow=True)["n_entry"], [60, 120, 250])
+
     def test_sizing_settings_are_never_searched(self):
         """risk_pct, max_leverage, cost_bps and the vol target are run
         settings: every template is generated with them off/default and no
         grid ever varies them."""
         for t in generate_templates("full"):
             self.assertEqual((t.vol_target, t.vol_target_n), (0.0, 60), t.name)
-            for wide in (False, True):
-                grid = param_grid_for(t, wide=wide)
+            for wide, slow in ((False, False), (True, False), (False, True), (True, True)):
+                grid = param_grid_for(t, wide=wide, slow=slow)
                 for k in ("vol_target", "vol_target_n", "risk_pct", "max_leverage", "cost_bps"):
                     self.assertNotIn(k, grid, f"{t.name}: {k} is a run setting, not a searched parameter")
 

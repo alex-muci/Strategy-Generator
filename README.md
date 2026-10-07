@@ -25,7 +25,7 @@ python -m venv env  # assuming 3.12 installed
 ./env/Script/Activate
 pip install -r requirements.txt 
 
-python -m unittest discover -s tests -t . -v # 491 tests (engine, exit ordering, order log, templates, hedge learner and its wide ladder, walk-forward, robustness, selection, data, live signals, replay, both entry points, spreads: shift invariance, point value, per-unit and roll costs, margin cap, ruin, whole units, the ETF trick, a mixed cash + spread book)
+python -m unittest discover -s tests -t . -v # 500 tests (engine, exit ordering, order log, templates, hedge learner and its wide and long ladders, the slow grid, walk-forward, robustness, selection, data, live signals, replay, both entry points, spreads: shift invariance, point value, per-unit and roll costs, margin cap, ruin, whole units, the ETF trick, a mixed cash + spread book)
 # faster: pip install -r requirements-dev.txt, then, with ./env active,
 python -m pytest -n auto --dist loadscope   # in parallel; loadscope keeps a class (and its one-off setup) on one worker
 python -m pytest -m slow                    # the minutes-long live-order sweeps pytest skips by default
@@ -46,6 +46,8 @@ python main.py --family quick                       # 72 templates (Donchian, ER
 python main.py --family default                     # 768 templates, all switches sampled
 python main.py --family online                      # 27 templates: the split ladder's follow group by trend / countertrend / learned, stop / close-confirm entries by every exit, and the committee's stance traded directly (countertrend lost on daily SPY / TLT / GLD / USO, but is kept for futures)
 python main.py --family online_forecast             # 3 templates: the forecast channel (slow trend prior + learned fast-scale term, held as a position under a no-trade buffer) by trend / countertrend / learned
+python main.py --family online_long                 # 27 templates: the online switches on the long ladder (Donchian 20-160 under the slow learner), the 2-8 month horizons on daily bars
+python main.py --real SPY --family quick --slow-grid  # the slow horizon band: n_entry 60/120/250, exits and hard stop widened to match; same number of trials
 python main.py --real SPY --start 2005-01-01 --family default --jobs 8
 python main.py --real SPY --start 2005-01-01 --family quick --sides long_only   # one-sided family (an asset with a drift)
 python main.py --real SPY --start 2005-01-01 --family quick --vol-target 0.1  # use vol-target rather than ATR-stop (see Position sizing)

@@ -616,6 +616,16 @@ HEDGE_SLOW_MEMORY = 750
 HEDGE_SLOW_HORIZONS = (250, 500, 750)
 HEDGE_LADDERS["hedge_slow"] = HEDGE_LADDERS["hedge"]
 HEDGE_LADDERS["hedge_wide_slow"] = HEDGE_LADDERS["hedge_wide"]
+# The long ladder ('hedge_long'): the plain ladder's Donchian experts shifted
+# one rung slower, 20-160 bars instead of 10-80, under the slow learner. On
+# daily bars that reaches the 2-8 month horizons where trend following's
+# documented edge sits, which no other ladder (nor the fitted grid's n_entry
+# of 20-60) trades; on the four dev ETFs the two-sided trend template on these
+# rungs was the one lead of docs/hedge_real_data_study.md (picked out of a
+# dozen variants: a lead to test on other data, not a result). Not position-
+# sized, like 'hedge_slow'. Warm-up: the slow memory plus 2 x 160 bars.
+HEDGE_LONG_LADDER = (20, 40, 80, 160)
+HEDGE_LADDERS["hedge_long"] = tuple(HedgeExpert("donchian", n) for n in HEDGE_LONG_LADDER)
 HEDGE_CHANNELS = tuple(HEDGE_LADDERS)   # the channel types the learner builds
 
 # ladder -> (memory, lifetimes) of its learner
@@ -624,6 +634,7 @@ HEDGE_LEARNERS = {
     "hedge_wide": (HEDGE_MEMORY, HEDGE_HORIZONS),
     "hedge_slow": (HEDGE_SLOW_MEMORY, HEDGE_SLOW_HORIZONS),
     "hedge_wide_slow": (HEDGE_SLOW_MEMORY, HEDGE_SLOW_HORIZONS),
+    "hedge_long": (HEDGE_SLOW_MEMORY, HEDGE_SLOW_HORIZONS),
 }
 
 
@@ -1981,7 +1992,7 @@ REGIME_INDICATORS = {
 
 DIRECTION_LOGICS = ["trend", "countertrend", "learned"]
 CHANNEL_TYPES = ["donchian", "keltner", "bollinger", "hedge", "hedge_wide", "hedge_slow", "hedge_wide_slow",
-                 "hedge_split", "forecast", "forecast_ctx"]
+                 "hedge_long", "hedge_split", "forecast", "forecast_ctx"]
 ENTRY_STYLES = ["stop", "close_confirm", "pullback", "stance"]
 EXIT_STYLES = ["channel", "atr_trail", "target_stop", "time_stop"]
 REGIME_INDICATOR_NAMES = list(REGIME_INDICATORS)
