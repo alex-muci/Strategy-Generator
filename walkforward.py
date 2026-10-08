@@ -111,6 +111,13 @@ def warmup_bars(tpl) -> int:
     return int(max(need)) + 5
 
 
+# Ceiling of the ratio metrics. A training window with almost no drawdown
+# (return_over_dd divides by max(|dd|, 1e-6)) or no losing trade
+# (profit_factor) would otherwise score in the thousands, and one such point
+# swamps the plateau average of every neighbour it has.
+SCORE_CAP = 10.0
+
+
 def score_stats(stats: dict, metric: str, min_trades: int) -> float:
     if stats["n_trades"] < min_trades:
         return -np.inf  # not enough trades to trust this window
@@ -118,9 +125,9 @@ def score_stats(stats: dict, metric: str, min_trades: int) -> float:
         return stats["sharpe"]
     if metric == "return_over_dd":
         dd = abs(stats["max_drawdown"]) or 1e-6
-        return stats["total_return"] / dd
+        return min(stats["total_return"] / dd, SCORE_CAP)
     if metric == "profit_factor":
-        return min(stats["profit_factor"], 10.0)
+        return min(stats["profit_factor"], SCORE_CAP)
     raise ValueError(f"unknown metric {metric}")
 
 

@@ -239,7 +239,7 @@ def generate_templates(
 # (on daily bars 6-12 month breakouts, the 3-12 month horizons of classic
 # trend following) with the exits that fit it.
 GRIDS = {
-    "n_entry":           ([20, 40, 60], [10, 20, 30, 40, 55, 70, 90], [120, 160, 250]),
+    "n_entry":           ([20, 40, 60], [10, 20, 30, 40, 70, 90], [120, 160, 250]),   # no 55 next to 60
     "n_exit":            ([10, 20], [5, 10, 15, 20, 30], [50, 80, 120]),
     "atr_mult_trail":    ([2.5, 3.5], [1.5, 2.0, 2.5, 3.0, 3.5, 4.5], [6.0, 7.5, 9.0]),
     "atr_mult_stop":     ([2.0, 3.0], [1.5, 2.0, 2.5, 3.0, 4.0], [5.0, 6.0, 8.0]),      # target_stop's stop
