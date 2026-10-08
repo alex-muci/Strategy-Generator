@@ -168,33 +168,37 @@ class TemplateParamTests(unittest.TestCase):
                     self.assertEqual(grid["regime_threshold"],
                                      REGIME_INDICATORS[t.regime_indicator]["thresholds"])
 
-    def test_wide_grid_spans_every_horizon_band(self):
-        """The wide lattice reaches from below the default grid's shortest
-        lookback to a year of daily bars, stretches the exits with it, and
-        searches the hard stop at its default and at the slow band's width
-        on every fitted channel (an online template keeps nothing to fit,
-        and the stance entry has no stop). The default grid is what it was."""
-        from generator import WIDE_HARD_STOPS
-        self.assertIn(StrategyTemplate("t").atr_mult_stop, WIDE_HARD_STOPS)
+    def test_wide_grid_is_the_usual_values_plus_three_longer(self):
+        """The wide grid holds every value of the default grid, the wide
+        lattice's, and exactly three values longer than all of those on
+        every horizon and exit-width parameter; the hard stop is searched at
+        the template default and three larger values on every fitted channel
+        (an online template keeps nothing to fit, the stance entry has no
+        stop). The default grid is what it was."""
+        from generator import GRIDS, HARD_STOPS
+        stretched = ("n_entry", "n_exit", "atr_mult_trail", "atr_mult_stop", "atr_mult_target", "max_hold_bars")
+        for name in stretched:
+            default, finer, longer = GRIDS[name]
+            self.assertEqual(len(longer), 3, name)
+            self.assertGreater(min(longer), max(default + finer), name)
+        self.assertEqual(HARD_STOPS[0], [StrategyTemplate("t").atr_mult_stop])
+        self.assertEqual(len(HARD_STOPS[2]), 3)
+        self.assertGreater(min(HARD_STOPS[2]), HARD_STOPS[0][0])
         for t in generate_templates("full") + generate_templates("online") + generate_templates("online_long"):
             base, wide = param_grid_for(t), param_grid_for(t, wide=True)
             for k in base:
-                self.assertIn(k, wide, f"{t.name}: {k}")
-                self.assertLessEqual(min(wide[k]), min(base[k]), f"{t.name}: {k}")
-                self.assertGreaterEqual(max(wide[k]), max(base[k]), f"{t.name}: {k}")
+                self.assertTrue(set(base[k]) <= set(wide[k]), f"{t.name}: {k} drops a default value")
+                if k in stretched:
+                    self.assertEqual(sorted(wide[k])[-3:], GRIDS[k][2], f"{t.name}: {k}")
             if "n_entry" in wide:
                 self.assertEqual((min(wide["n_entry"]), max(wide["n_entry"])), (10, 250))
-            if "n_exit" in wide:
-                self.assertGreaterEqual(max(wide["n_exit"]), 80)
             if t.channel_type in HEDGE_CHANNELS and t.exit_style != "target_stop":
                 self.assertNotIn("atr_mult_stop", wide, t.name)
-            elif t.exit_style == "target_stop":
-                self.assertEqual(max(wide["atr_mult_stop"]), max(WIDE_HARD_STOPS), t.name)
-            else:
-                self.assertEqual(wide["atr_mult_stop"], WIDE_HARD_STOPS, t.name)
+            elif t.exit_style != "target_stop":
+                self.assertEqual(wide["atr_mult_stop"], HARD_STOPS[0] + HARD_STOPS[2], t.name)
                 self.assertNotIn("atr_mult_stop", base, t.name)
-            if "atr_mult_trail" in wide:
-                self.assertLessEqual(max(wide["atr_mult_trail"]), max(WIDE_HARD_STOPS), t.name)
+                if "atr_mult_trail" in wide:
+                    self.assertLessEqual(max(wide["atr_mult_trail"]), max(wide["atr_mult_stop"]), t.name)
         t = StrategyTemplate("t")
         self.assertEqual(param_grid_for(t), {"n_entry": [20, 40, 60], "n_exit": [10, 20]})
 
