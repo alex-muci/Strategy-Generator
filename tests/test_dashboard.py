@@ -761,3 +761,22 @@ class SpreadBookTests(unittest.TestCase):
                      "brent_z25z26=1000,15", "--family", "quick", "--max-templates", "1", "--bars", "1100",
                      "--train", "300", "--test", "100", "--jobs", "1", "--state-dir", tempfile.mkdtemp()])
         self.assertIn("margin_per_unit", str(cm.exception))
+
+
+class HistoryNeededTests(unittest.TestCase):
+    def test_the_signals_history_covers_the_slots_warm_up(self):
+        """A refit window shorter than its grid's warm-up is skipped, so the
+        signals phase must load a training window plus the longest warm-up
+        of any slot's grid, not a fixed 400 bars."""
+        from strategy import StrategyTemplate
+        from generator import param_grid_for
+        from walkforward import grid_combos, warmup_bars
+        from dataclasses import asdict
+        kel = StrategyTemplate("k", channel_type="keltner", exit_style="channel")
+        spec = dict(config=dict(train_bars=500, wide_grid=True), slots=[dict(template=asdict(kel))])
+        warm = max(warmup_bars(kel.with_params(**p)) for p in grid_combos(param_grid_for(kel, wide=True))[0])
+        self.assertGreater(warm, 1000)
+        self.assertGreaterEqual(ED._history_bars_needed(spec), 500 + warm)
+        spec["config"]["wide_grid"] = False
+        self.assertEqual(ED._history_bars_needed(spec), int(500 * 1.25) + 400)
+        self.assertEqual(ED._history_bars_needed(dict(config=dict(train_bars=500), slots=[])), int(500 * 1.25) + 400)

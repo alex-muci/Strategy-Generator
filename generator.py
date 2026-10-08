@@ -118,7 +118,13 @@ FAMILIES = {
     ),
     # the 'online' switches on the long ladder (strategy.HEDGE_LONG_LADDER,
     # Donchian 20-160 under the slow learner): the slow-horizon counterpart of
-    # `online`, for the trend horizons beyond its 20-80 bar follow group
+    # `online`, for the trend horizons beyond its 20-80 bar follow group. It
+    # needs history: the learner warms up for 1070 bars (1270 on the stance
+    # entry) before the first window can trade, and a 160-bar breakout comes
+    # a few times a year, so a 500-bar window rarely holds the 5 trades a fit
+    # needs. On USO's 2700 daily bars, 11 of 18 windows (train 500) or 3 of 7
+    # (train 1000) of the stop template were flat: give it --train 1000 and 15+
+    # years of daily bars, or run it on 4h / 1h bars
     "online_long": dict(
         direction_logics=DIRECTION_LOGICS,
         channel_types=["hedge_long"],

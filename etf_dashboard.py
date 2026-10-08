@@ -77,6 +77,7 @@ from pipeline import (
     add_research_args, parse_instrument_map, costs_text, hedge_share_of,
 )
 from portfolio import returns_frame
+from walkforward import grid_combos, warmup_bars
 from strategy import (
     StrategyTemplate, annualized_sharpe, max_drawdown, compound, set_periods_per_year, periods_per_year,
     periods_per_year_for_interval, SIDES, BARS_PER_YEAR, validate_instrument, instrument_warnings,
@@ -242,8 +243,15 @@ def fx_rate(currency: str, *, interval: str = "1d", now=None) -> float:
 
 def _history_bars_needed(spec: dict) -> int:
     """Bars of history the signals phase needs: one training window, plus the
-    longest warm-up any template could ask for, plus slack."""
-    return int(spec["config"]["train_bars"] * 1.25) + 400
+    longest warm-up any slot's grid asks for (a refit window shorter than
+    that is skipped, see walkforward.optimize_window), plus slack."""
+    cfg = spec["config"]
+    warm = 0
+    for slot in spec.get("slots", []):
+        tpl = StrategyTemplate(**slot["template"])
+        combos, _ = grid_combos(param_grid_for(tpl, wide=cfg.get("wide_grid", False)))
+        warm = max(warm, max(warmup_bars(tpl.with_params(**p)) for p in combos))
+    return int(cfg["train_bars"] * 1.25) + max(400, warm + 50)
 
 
 def _start_for_bars(n_bars: int, interval: str) -> str:

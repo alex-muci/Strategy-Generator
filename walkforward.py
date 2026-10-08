@@ -138,13 +138,25 @@ def smooth_scores(scores: np.ndarray, idx: np.ndarray) -> np.ndarray:
     return out
 
 
+def plateau_pick(scores: np.ndarray, idx: np.ndarray) -> int:
+    """The grid point with the best smoothed score (see `smooth_scores`),
+    ties broken by its own score. Along a dimension of two values both
+    points have the same neighbourhood, so their smoothed scores are
+    bit-identical: a bare argmax would always return the first value and
+    the second could never be chosen (a 6-ATR hard stop next to a 3-ATR
+    one, n_exit 20 next to 10). The tie-break lets their own scores decide."""
+    sm = smooth_scores(scores, idx)
+    top = np.flatnonzero(sm == sm.max())
+    return int(top[np.argmax(scores[top])])
+
+
 def select_params(scores: np.ndarray, idx: np.ndarray, method: str = "plateau") -> int | None:
     if not np.isfinite(scores).any():
         return None
     if method == "best":
         return int(np.argmax(scores))
     if method == "plateau":
-        return int(np.argmax(smooth_scores(scores, idx)))
+        return plateau_pick(scores, idx)
     raise ValueError(f"unknown selection method {method}")
 
 
@@ -270,7 +282,11 @@ def optimize_window(df: pd.DataFrame, tpl, combos: list, idx: np.ndarray, start:
 
     A window that starts before the grid's longest warm-up (the first rolling
     window, every anchored one) has no earlier bars to warm up on, so it is
-    scored from bar `warm` on. Left at `start`, its dead bars would dilute
+    scored from bar `warm` on; a window that ENDS before it is skipped (best
+    None), since no bar of it has every grid point's indicators formed. A
+    rolling indicator would have nothing to trade on there anyway, but an
+    EMA (a Keltner channel) trades from a cold start, on a channel a trader
+    with the full history would not see. Left at `start`, its dead bars would dilute
     the IS return and Sharpe against an OOS window that has none (inflating
     Pardo's WFE), and a short-lookback grid point would trade, and be scored,
     on more bars than a long-lookback one.
@@ -278,8 +294,11 @@ def optimize_window(df: pd.DataFrame, tpl, combos: list, idx: np.ndarray, start:
     Returns dict(best=index into combos or None, scores, stats, warmup,
     start=the first bar actually scored)."""
     warm = max(warmup_bars(tpl.with_params(**p)) for p in combos)
-    if warm < end - 1:  # otherwise nothing can trade and the window is skipped anyway
-        start = max(int(start), warm)
+    if warm >= end - 1:
+        # no bar of the window is warm for every grid point: skip it
+        return dict(best=None, scores=np.full(len(combos), -np.inf), stats=[None] * len(combos),
+                    warmup=warm, start=int(start))
+    start = max(int(start), warm)
     scores = np.empty(len(combos))
     stats_list = []
     for j, params in enumerate(combos):

@@ -38,6 +38,7 @@ from generator import generate_templates, param_grid_for  # noqa: E402
 from walkforward import (  # noqa: E402
     walk_forward, walk_forward_matrix, window_backtest, warmup_bars, summarize_walk_forward,
     grid_combos, optimize_window, _ema_settle_bars, position_notional, exposure_totals,
+    select_params, smooth_scores,
 )
 from live import refit_params  # noqa: E402
 
@@ -178,6 +179,22 @@ class WalkForwardWindowTests(unittest.TestCase):
         tiny = optimize_window(df, tpl, combos, idx, 0, warm)
         self.assertEqual(tiny["start"], 0)
         self.assertIsNone(tiny["best"])
+
+    def test_a_window_ending_before_the_warm_up_is_skipped_not_scored_cold(self):
+        """A Keltner channel's EMA trades from a cold start: a window that
+        ends before the grid's longest warm-up would be scored on channels
+        a trader with the full history would not see. It is skipped."""
+        df = self.df
+        tpl = StrategyTemplate("t", channel_type="keltner", exit_style="channel")
+        combos, idx = grid_combos({"n_entry": [20, 250]})
+        warm = max(warmup_bars(tpl.with_params(**p)) for p in combos)
+        self.assertGreater(warm, 1000)
+        # the short channel alone would trade in the window
+        self.assertGreater(window_backtest(df, tpl.with_params(n_entry=20), 0, 500, warmup=warm)["stats"]["n_trades"], 5)
+        opt = optimize_window(df, tpl, combos, idx, 0, 500)
+        self.assertIsNone(opt["best"])
+        self.assertEqual(opt["start"], 0)
+        self.assertTrue(np.all(np.isneginf(opt["scores"])))
 
     def test_anchored_windows_report_the_bars_they_scored(self):
         tpl = StrategyTemplate("t", exit_style="channel")
@@ -527,3 +544,21 @@ class PooledDrawdownTests(unittest.TestCase):
                         oos_stats=dict(total_return=0.04, n_trades=3, n_bars=4), params_changed=False)]
         self.assertAlmostEqual(summarize_walk_forward(windows, r)["oos_max_drawdown"], -0.10)
         self.assertAlmostEqual(P.curve_stats(r)["max_dd"], -0.10)
+
+
+class PlateauSelectionTests(unittest.TestCase):
+    def test_the_second_value_of_a_two_value_dimension_can_be_chosen(self):
+        """Both points of a two-value dimension have the same neighbourhood,
+        so the same smoothed score; the tie is broken by their own score,
+        not by their position (a bare argmax always took the first)."""
+        combos, idx = grid_combos({"n_entry": [20, 40, 60], "atr_mult_stop": [3.0, 6.0]})
+        scores = np.array([0.1 if c["atr_mult_stop"] == 3.0 else 0.5 for c in combos])
+        sm = smooth_scores(scores, idx)
+        self.assertEqual(sm[0], sm[1])          # the tie a bare argmax resolved to the first value
+        best = select_params(scores, idx, "plateau")
+        self.assertEqual(combos[best]["atr_mult_stop"], 6.0)
+        # the plateau still decides along a longer dimension: an isolated spike loses to a ridge
+        combos, idx = grid_combos({"n_entry": [10, 20, 30, 40, 55, 70, 90]})
+        scores = np.array([0.9, -0.5, 0.4, 0.5, 0.45, -0.2, -0.3])
+        self.assertEqual(combos[select_params(scores, idx, "plateau")]["n_entry"], 40)
+        self.assertEqual(combos[select_params(scores, idx, "best")]["n_entry"], 10)

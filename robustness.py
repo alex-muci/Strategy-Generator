@@ -35,7 +35,7 @@ from scipy.cluster.hierarchy import linkage, leaves_list
 from scipy.spatial.distance import squareform
 
 from strategy import backtest, periods_per_year, compound, RESEARCH_EQUITY
-from walkforward import smooth_scores, walk_forward, grid_combos, score_stats, warmup_bars
+from walkforward import plateau_pick, walk_forward, grid_combos, score_stats, warmup_bars
 
 EULER_GAMMA = 0.5772156649015329
 
@@ -349,7 +349,7 @@ def cpcv(
                 path_returns[groups[g], assign[(c, g)]] = 0.0
             continue
         if selection == "plateau" and idx is not None:
-            best = int(np.argmax(smooth_scores(scores, idx)))
+            best = plateau_pick(scores, idx)
         else:
             best = int(np.argmax(scores))
         chosen[c] = best
