@@ -629,3 +629,27 @@ class PlateauSelectionTests(unittest.TestCase):
             for i in range(0, len(s), 2):          # (n, 3.0) and (n, 6.0) are adjacent rows
                 if np.isfinite(s[i]) and np.isfinite(s[i + 1]):
                     self.assertEqual(sm[i], sm[i + 1])
+
+
+class ScoreCapTests(unittest.TestCase):
+    def test_ratio_metrics_are_bounded_but_keep_their_order(self):
+        """Above SCORE_CAP a ratio is compressed, not clipped: two strong
+        windows keep their order (a hard cap tied them at 10 and grid order
+        chose), and nothing, not even no drawdown or no losing trade, can
+        score high enough to swamp a plateau average."""
+        from walkforward import score_stats, SCORE_CAP
+        st = lambda r, dd, pf=1.0: dict(n_trades=9, sharpe=1.0, total_return=r, max_drawdown=dd, profit_factor=pf)  # noqa: E731
+        self.assertAlmostEqual(score_stats(st(0.3, -0.1), "return_over_dd", 5), 3.0)  # below the cap: unchanged
+        a = score_stats(st(0.0584, -0.0025), "return_over_dd", 5)                    # 23.4
+        b = score_stats(st(0.0730, -0.0025), "return_over_dd", 5)                    # 29.2
+        self.assertTrue(SCORE_CAP < a < b < 15.0)
+        self.assertLess(score_stats(st(0.1, 0.0), "return_over_dd", 5), 25.0)       # the 1e-6 floor
+        self.assertLess(score_stats(st(0.1, -0.1, np.inf), "profit_factor", 5), 25.0)
+        self.assertLess(score_stats(st(0.1, -0.1, 12.0), "profit_factor", 5),
+                        score_stats(st(0.1, -0.1, 30.0), "profit_factor", 5))
+        self.assertEqual(score_stats(st(0.1, -0.1, 7.0), "profit_factor", 5), 7.0)
+        self.assertTrue(np.isfinite(score_stats(st(0.1, -0.1, np.inf), "profit_factor", 5)))
+        # the plateau picks the higher of two strong points that tie on their neighbourhood
+        combos, idx = grid_combos({"n": [20, 40, 60], "target": [3.0, 4.0]})
+        scores = np.array([1.0, 1.0, 1.0, 1.0, a, b])
+        self.assertEqual(combos[select_params(scores, idx, "plateau")], {"n": 60, "target": 4.0})

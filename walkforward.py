@@ -111,11 +111,21 @@ def warmup_bars(tpl) -> int:
     return int(max(need)) + 5
 
 
-# Ceiling of the ratio metrics. A training window with almost no drawdown
-# (return_over_dd divides by max(|dd|, 1e-6)) or no losing trade
+# Soft ceiling of the ratio metrics. A training window with almost no
+# drawdown (return_over_dd divides by max(|dd|, 1e-6)) or no losing trade
 # (profit_factor) would otherwise score in the thousands, and one such point
-# swamps the plateau average of every neighbour it has.
+# swamps the plateau average of every neighbour it has. Above SCORE_CAP a
+# score grows only logarithmically (_soft_cap): 29 -> 13, 1e5 -> 21.5, an
+# infinite profit factor -> 23.8. Not a hard min(): that made every strong
+# point exactly 10, so plateau_pick's tie-break by own score, and the 'best'
+# argmax, fell back to grid order between them.
 SCORE_CAP = 10.0
+
+
+def _soft_cap(x: float) -> float:
+    if not x > SCORE_CAP:          # NaN passes through, as before
+        return x
+    return SCORE_CAP + float(np.log1p(min(x, 1e6) - SCORE_CAP))
 
 
 def score_stats(stats: dict, metric: str, min_trades: int) -> float:
@@ -125,9 +135,9 @@ def score_stats(stats: dict, metric: str, min_trades: int) -> float:
         return stats["sharpe"]
     if metric == "return_over_dd":
         dd = abs(stats["max_drawdown"]) or 1e-6
-        return min(stats["total_return"] / dd, SCORE_CAP)
+        return _soft_cap(stats["total_return"] / dd)
     if metric == "profit_factor":
-        return min(stats["profit_factor"], SCORE_CAP)
+        return _soft_cap(stats["profit_factor"])
     raise ValueError(f"unknown metric {metric}")
 
 
@@ -146,7 +156,7 @@ def _box3(a: np.ndarray, axis: int) -> np.ndarray:
 # Weight of a missing neighbour in the plateau average (see smooth_scores):
 # 0 averages only the neighbours that exist, 1 counts every missing one at the
 # window median. 0.5 is where iid noise picks every grid value about equally
-# often (calibrated on the wide 11 x 8 x 4 lattice: the shortest and the
+# often (calibrated on an 11 x 8 x 4 lattice, the wide grid's shape then: the shortest and the
 # longest n_entry 8 % each against 9 % uniform, the four hard stops 24-26 %
 # against 25 %); 0 piled noise onto the edges (21-24 %, the stops 45 / 5 / 5 /
 # 45 %) and 1 pushed it one step in (3 % at the ends, 11-12 % next to them).

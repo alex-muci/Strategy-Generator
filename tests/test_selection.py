@@ -123,7 +123,11 @@ class ObjectiveTests(unittest.TestCase):
         no_dd = dict(self.STATS, max_drawdown=0.0)
         self.assertTrue(np.isfinite(score_stats(no_dd, "return_over_dd", 5)))
         never_lost = dict(self.STATS, profit_factor=np.inf)
-        self.assertEqual(score_stats(never_lost, "profit_factor", 5), 10.0, "capped, or it always wins")
+        # bounded, or one never-losing window swamps every plateau average it is in; it still
+        # ranks above a finite profit factor (a hard cap tied them and grid order chose)
+        top = score_stats(never_lost, "profit_factor", 5)
+        self.assertTrue(np.isfinite(top) and top < 25.0)
+        self.assertGreater(top, score_stats(dict(self.STATS, profit_factor=50.0), "profit_factor", 5))
         with self.assertRaises(ValueError):
             score_stats(self.STATS, "sortino", 5)
 
