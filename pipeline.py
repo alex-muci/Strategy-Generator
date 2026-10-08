@@ -74,7 +74,10 @@ def add_research_args(p: argparse.ArgumentParser, *, start: str) -> argparse.Arg
     p.add_argument("--anchored", action="store_true", help="expanding instead of rolling training window")
     p.add_argument("--selection", default="plateau", choices=["plateau", "best"])
     p.add_argument("--metric", default="sharpe", choices=["sharpe", "return_over_dd", "profit_factor"])
-    p.add_argument("--wide-grid", action="store_true")
+    p.add_argument("--wide-grid", action="store_true",
+                   help="search every horizon band in one lattice: n_entry 10-250 bars (two weeks to a year on daily "
+                        "bars), exits and the hard stop stretched to match (generator.param_grid_for). Many times the "
+                        "trials of the default grid, and every window warms up to its longest lookback")
     p.add_argument("--cost-bps", type=float, default=5.0,
                    help="commission+slippage per side, bps of notional. A cash asset's cost: an instrument with a "
                         "margin is costed per unit only (--cost-per-unit), its bps cost is 0")

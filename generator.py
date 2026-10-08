@@ -6,7 +6,7 @@ family of structurally distinct ones by combining switches, and let
 evaluation (walk-forward analysis + robustness tests + portfolio
 selection) decide which ones earn a place in the final portfolio.
 
-Five families are predefined:
+Six families are predefined:
 
   quick           72 templates  (Donchian only, ER regime filter) -- smoke test
   default        768 templates  (two channel types, five regime indicators)
@@ -33,6 +33,12 @@ Five families are predefined:
                                   direction_logics=["trend"]); the other hedge
                                   ladders are a switch too
                                   (channel_types=[...]))
+  online_long     27 templates  (the 'online' family on the long ladder: the
+                                  plain Donchian experts one rung slower,
+                                  20-160 bars, under the slow learner -- the
+                                  2-8 month horizons on daily bars that no
+                                  other family trades; nothing in the grid
+                                  but the exits)
   online_forecast  3 templates  (the forecast channel -- slow trend prior plus a
                                   learned fast-scale term, held as a position
                                   under a no-trade buffer -- by trend /
@@ -110,6 +116,25 @@ FAMILIES = {
         bias_filters=["none"],
         sides=["both"],
     ),
+    # the 'online' switches on the long ladder (strategy.HEDGE_LONG_LADDER,
+    # Donchian 20-160 under the slow learner): the slow-horizon counterpart of
+    # `online`, for the trend horizons beyond its 20-80 bar follow group. It
+    # needs history: the learner warms up for 1070 bars (1270 on the stance
+    # entry) before the first window can trade, and a 160-bar breakout comes
+    # a few times a year, so a 500-bar window rarely holds the 5 trades a fit
+    # needs. On USO's 2700 daily bars, 11 of 18 windows (train 500) or 3 of 7
+    # (train 1000) of the stop template were flat: give it --train 1000 and 15+
+    # years of daily bars, or run it on 4h / 1h bars
+    "online_long": dict(
+        direction_logics=DIRECTION_LOGICS,
+        channel_types=["hedge_long"],
+        entry_styles=["stop", "close_confirm", "stance"],
+        exit_styles=EXIT_STYLES,
+        regimes=[("er", "none")],
+        vol_filters=[False],
+        bias_filters=["none"],
+        sides=["both"],
+    ),
     # the forecast channel (strategy.FORECAST_CHANNELS): a slow trend prior and
     # a freely learned fast-scale term, traded as a position under a no-trade
     # buffer; trend (the prior alone), countertrend (the fast learner alone)
@@ -132,8 +157,8 @@ FAMILIES = {
         direction_logics=DIRECTION_LOGICS,
         # the slow ladders are the fast ones' experts with a longer memory, so
         # they have their own families rather than doubling the hedge part of
-        # this one; the split ladder needs more warm-up than a short test series has
-        channel_types=[c for c in CHANNEL_TYPES if not c.endswith("_slow") and c != "hedge_split"
+        # this one; the split and long ladders need more warm-up than a short test series has
+        channel_types=[c for c in CHANNEL_TYPES if not c.endswith("_slow") and c not in ("hedge_split", "hedge_long")
                        and c not in FORECAST_CHANNELS],
         entry_styles=[e for e in ENTRY_STYLES if e != "stance"],
         exit_styles=EXIT_STYLES,
@@ -151,7 +176,7 @@ FAMILIES = {
 _SHORT = {
     "trend": "TR", "countertrend": "CT", "learned": "LN",
     "donchian": "don", "keltner": "kel", "bollinger": "bol", "hedge": "hdg", "hedge_wide": "hdw",
-    "hedge_slow": "hds", "hedge_wide_slow": "hws", "hedge_split": "hsp",
+    "hedge_slow": "hds", "hedge_wide_slow": "hws", "hedge_split": "hsp", "hedge_long": "hlg",
     "forecast": "fc", "forecast_ctx": "fcx",
     "stop": "stop", "close_confirm": "cls", "pullback": "pb", "stance": "stance",
     "channel": "chan", "atr_trail": "trail", "target_stop": "tgt", "time_stop": "time",
@@ -207,6 +232,35 @@ def generate_templates(
     return templates
 
 
+# The numeric grids: param -> (default, wide, longer). The default grid is the
+# first list. The wide grid is the union of all three, so it always holds the
+# default grid's values ("the usual"), the finer and shorter ones of the wide
+# lattice, and exactly three values LONGER than all of those: the slow band
+# (on daily bars 6-12 month breakouts, the 3-12 month horizons of classic
+# trend following) with the exits that fit it.
+GRIDS = {
+    "n_entry":           ([20, 40, 60], [10, 20, 30, 40, 70, 90], [120, 160, 250]),   # no 55 next to 60
+    "n_exit":            ([10, 20], [5, 10, 15, 20, 30], [50, 80, 120]),
+    "atr_mult_trail":    ([2.5, 3.5], [1.5, 2.0, 2.5, 3.0, 3.5, 4.5], [6.0, 7.5, 9.0]),
+    "atr_mult_stop":     ([2.0, 3.0], [1.5, 2.0, 2.5, 3.0, 4.0], [5.0, 6.0, 8.0]),      # target_stop's stop
+    "atr_mult_target":   ([3.0, 4.0], [2.0, 3.0, 4.0, 5.0, 6.0], [8.0, 10.0, 12.0]),
+    "max_hold_bars":     ([10, 20], [5, 10, 15, 20, 30, 40], [60, 80, 120]),
+    "channel_k":         ([1.5, 2.5], [1.0, 1.5, 2.0, 2.5, 3.0], []),
+    "pullback_atr_mult": ([0.4, 0.7], [0.25, 0.5, 0.75, 1.0], []),
+}
+# The hard stop works whatever the exit; the default grid leaves it at the
+# template default (3 ATR), and the wide grid searches it on the fitted
+# channels at that value and three larger ones, up to the widest trail: at
+# 3 ATR(20) a 160- or 250-bar breakout is stopped out by noise long before
+# its channel or trail exit is reached.
+HARD_STOPS = ([3.0], [], [4.5, 6.0, 9.0])
+
+
+def _values(spec, wide: bool) -> list:
+    default, finer, longer = spec
+    return sorted(set(default) | set(finer) | set(longer)) if wide else list(default)
+
+
 def param_grid_for(tpl: StrategyTemplate, wide: bool = False) -> dict:
     """Return the numeric-parameter search grid to walk-forward optimize
     for this template. Only the params relevant to this template's
@@ -215,30 +269,46 @@ def param_grid_for(tpl: StrategyTemplate, wide: bool = False) -> dict:
     The grid is a LATTICE (each param a sorted list) so that the
     walk-forward 'plateau' selection can look at parameter neighbours.
     Kept deliberately small so a full sweep across hundreds of templates
-    finishes in minutes; `wide=True` roughly triples it.
-    """
+    finishes in minutes.
+
+    `wide=True` searches every horizon band in one lattice (GRIDS: the
+    default values, the wide lattice's and three longer ones): n_entry from
+    10 to 250 bars, two weeks to a year on daily bars, with the exit
+    lookbacks, the time stop and the ATR exits stretched to match, and the
+    hard stop searched at HARD_STOPS on the fitted channels (target_stop
+    searches its own; an online template keeps nothing to fit, stance has no
+    stop at all). It is many times the default grid's trials, which PBO, the
+    DSR and the Reality Check charge for. And one long lookback in a lattice
+    delays every combination: a window is warmed up to the grid's LONGEST
+    warm-up (walkforward.optimize_window), so the short lookbacks lose the
+    first windows too, a Keltner template most (its EMA(250) settles in
+    ~1150 bars). Load the history for it."""
     grid = {}
     if tpl.channel_type in FORECAST_CHANNELS:
         return grid      # the forecaster learns online and the stance has no exit: nothing to fit
     online = tpl.channel_type in HEDGE_CHANNELS   # lookbacks (and widths) are learned online, not fitted
+    v = lambda name: _values(GRIDS[name], wide)  # noqa: E731
     if not online:
-        grid["n_entry"] = [20, 40, 60] if not wide else [10, 20, 30, 40, 55, 70, 90]
+        grid["n_entry"] = v("n_entry")
 
     if tpl.channel_type in ("keltner", "bollinger"):
-        grid["channel_k"] = [1.5, 2.5] if not wide else [1.0, 1.5, 2.0, 2.5, 3.0]
+        grid["channel_k"] = v("channel_k")
 
     if tpl.exit_style == "channel" and not online:
-        grid["n_exit"] = [10, 20] if not wide else [5, 10, 15, 20, 30]
+        grid["n_exit"] = v("n_exit")
     elif tpl.exit_style == "atr_trail":
-        grid["atr_mult_trail"] = [2.5, 3.5] if not wide else [1.5, 2.0, 2.5, 3.0, 3.5, 4.5]
+        grid["atr_mult_trail"] = v("atr_mult_trail")
     elif tpl.exit_style == "target_stop":
-        grid["atr_mult_stop"] = [2.0, 3.0] if not wide else [1.5, 2.0, 2.5, 3.0, 4.0]
-        grid["atr_mult_target"] = [3.0, 4.0] if not wide else [2.0, 3.0, 4.0, 5.0, 6.0]
+        grid["atr_mult_stop"] = v("atr_mult_stop")
+        grid["atr_mult_target"] = v("atr_mult_target")
     elif tpl.exit_style == "time_stop":
-        grid["max_hold_bars"] = [10, 20] if not wide else [5, 10, 15, 20, 30, 40]
+        grid["max_hold_bars"] = v("max_hold_bars")
+
+    if wide and not online and "atr_mult_stop" not in grid:
+        grid["atr_mult_stop"] = _values(HARD_STOPS, True)   # an online template keeps nothing to fit
 
     if tpl.entry_style == "pullback":
-        grid["pullback_atr_mult"] = [0.4, 0.7] if not wide else [0.25, 0.5, 0.75, 1.0]
+        grid["pullback_atr_mult"] = v("pullback_atr_mult")
 
     if tpl.regime_filter != "none":
         grid["regime_threshold"] = list(REGIME_INDICATORS[tpl.regime_indicator]["thresholds"])

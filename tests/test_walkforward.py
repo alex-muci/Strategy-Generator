@@ -38,6 +38,7 @@ from generator import generate_templates, param_grid_for  # noqa: E402
 from walkforward import (  # noqa: E402
     walk_forward, walk_forward_matrix, window_backtest, warmup_bars, summarize_walk_forward,
     grid_combos, optimize_window, _ema_settle_bars, position_notional, exposure_totals,
+    select_params, smooth_scores,
 )
 from live import refit_params  # noqa: E402
 
@@ -178,6 +179,22 @@ class WalkForwardWindowTests(unittest.TestCase):
         tiny = optimize_window(df, tpl, combos, idx, 0, warm)
         self.assertEqual(tiny["start"], 0)
         self.assertIsNone(tiny["best"])
+
+    def test_a_window_ending_before_the_warm_up_is_skipped_not_scored_cold(self):
+        """A Keltner channel's EMA trades from a cold start: a window that
+        ends before the grid's longest warm-up would be scored on channels
+        a trader with the full history would not see. It is skipped."""
+        df = self.df
+        tpl = StrategyTemplate("t", channel_type="keltner", exit_style="channel")
+        combos, idx = grid_combos({"n_entry": [20, 250]})
+        warm = max(warmup_bars(tpl.with_params(**p)) for p in combos)
+        self.assertGreater(warm, 1000)
+        # the short channel alone would trade in the window
+        self.assertGreater(window_backtest(df, tpl.with_params(n_entry=20), 0, 500, warmup=warm)["stats"]["n_trades"], 5)
+        opt = optimize_window(df, tpl, combos, idx, 0, 500)
+        self.assertIsNone(opt["best"])
+        self.assertEqual(opt["start"], 0)
+        self.assertTrue(np.all(np.isneginf(opt["scores"])))
 
     def test_anchored_windows_report_the_bars_they_scored(self):
         tpl = StrategyTemplate("t", exit_style="channel")
@@ -527,3 +544,112 @@ class PooledDrawdownTests(unittest.TestCase):
                         oos_stats=dict(total_return=0.04, n_trades=3, n_bars=4), params_changed=False)]
         self.assertAlmostEqual(summarize_walk_forward(windows, r)["oos_max_drawdown"], -0.10)
         self.assertAlmostEqual(P.curve_stats(r)["max_dd"], -0.10)
+
+
+class PlateauSelectionTests(unittest.TestCase):
+    def test_the_second_value_of_a_two_value_dimension_can_be_chosen(self):
+        """Both points of a two-value dimension have the same neighbourhood,
+        so the same smoothed score; the tie is broken by their own score,
+        not by their position (a bare argmax always took the first)."""
+        combos, idx = grid_combos({"n_entry": [20, 40, 60], "atr_mult_stop": [3.0, 6.0]})
+        scores = np.array([0.1 if c["atr_mult_stop"] == 3.0 else 0.5 for c in combos])
+        sm = smooth_scores(scores, idx)
+        self.assertEqual(sm[0], sm[1])          # the tie a bare argmax resolved to the first value
+        best = select_params(scores, idx, "plateau")
+        self.assertEqual(combos[best]["atr_mult_stop"], 6.0)
+        # the plateau still decides along a longer dimension: an isolated spike loses to a ridge
+        combos, idx = grid_combos({"n_entry": [10, 20, 30, 40, 55, 70, 90]})
+        scores = np.array([0.9, -0.5, 0.4, 0.5, 0.45, -0.2, -0.3])
+        self.assertEqual(combos[select_params(scores, idx, "plateau")]["n_entry"], 40)
+        self.assertEqual(combos[select_params(scores, idx, "best")]["n_entry"], 10)
+
+    def test_smoothing_averages_a_fixed_neighbourhood(self):
+        """Every point averages prod(min(3, values)) cells; a cell beyond the
+        grid or a -inf neighbour counts at the median of the finite scores,
+        with weight PLATEAU_FILL_WEIGHT. Checked against a direct per-point
+        sum on random lattices, with the rows of idx in any order."""
+        from walkforward import PLATEAU_FILL_WEIGHT as w
+        rng = np.random.default_rng(3)
+        for grid in ({"a": [1, 2, 3, 4, 5], "b": [1, 2], "c": [1, 2, 3]}, {"a": [1]}, {"a": [1, 2]},
+                     {"a": list(range(11)), "b": list(range(8)), "c": [1, 2, 3, 4]}):
+            combos, idx = grid_combos(grid)
+            full = np.prod(np.minimum(3, idx.max(axis=0) + 1))
+            for _ in range(10):
+                s = rng.standard_normal(len(combos))
+                s[rng.random(len(combos)) < 0.3] = -np.inf
+                if not np.isfinite(s).any():
+                    continue
+                f = np.isfinite(s)
+                m = np.median(s[f])
+                ref = np.full(len(s), -np.inf)
+                for i in np.flatnonzero(f):
+                    nb = np.all(np.abs(idx - idx[i]) <= 1, axis=1) & f
+                    miss = w * (full - nb.sum())
+                    ref[i] = (s[nb].sum() + miss * m) / (nb.sum() + miss)
+                np.testing.assert_allclose(smooth_scores(s, idx), ref, rtol=1e-12)
+                perm = rng.permutation(len(s))
+                np.testing.assert_allclose(smooth_scores(s[perm], idx[perm]), ref[perm], rtol=1e-12)
+                # shift and scale move every smoothed score along
+                sm = smooth_scores(s, idx)
+                np.testing.assert_allclose(smooth_scores(3.0 * s - 2.0, idx)[f], 3.0 * sm[f] - 2.0, rtol=1e-12)
+        combos, idx = grid_combos({})                      # an empty grid: one point
+        self.assertEqual(list(smooth_scores(np.array([0.3]), idx)), [0.3])
+        self.assertTrue(np.isneginf(smooth_scores(np.array([-np.inf, -np.inf]), np.array([[0], [1]]))).all())
+
+    def test_noise_does_not_pick_the_corners(self):
+        """On iid noise every value of a dimension should be about equally
+        likely. Averaging only the neighbours that exist picked the two
+        extremes of an 11-value dimension 20 %+ of the time each and those of
+        a 4-value one 45 % (9 % and 25 % are uniform); the half-weighted
+        fill is close to uniform at the ends and next to them, and still
+        finds a broad optimum at the edge."""
+        rng = np.random.default_rng(0)
+        combos, idx = grid_combos({"n": list(range(11)), "x": list(range(8)), "s": [0, 1, 2, 3]})
+        picks = idx[[select_params(rng.standard_normal(len(combos)), idx) for _ in range(1500)]]
+        freq = np.bincount(picks[:, 0], minlength=11) / len(picks)
+        for k in (0, 1, 9, 10):
+            self.assertLess(abs(freq[k] - 1 / 11), 0.04, f"n value {k}: {freq[k]:.3f}")
+        freq = np.bincount(picks[:, 2], minlength=4) / len(picks)
+        self.assertLess(np.abs(freq - 0.25).max(), 0.06, freq)
+        edge = -0.15 * np.abs(idx[:, 0] - 10)
+        hits = [abs(idx[select_params(edge + rng.standard_normal(len(combos)), idx), 0] - 10) <= 1
+                for _ in range(300)]
+        self.assertGreater(np.mean(hits), 0.7)
+
+    def test_both_values_of_a_two_value_dimension_tie_bit_for_bit(self):
+        """With -inf cells around, the two points of a two-value dimension
+        keep identical neighbourhoods, so identical smoothed scores, and the
+        raw score decides between them."""
+        rng = np.random.default_rng(5)
+        combos, idx = grid_combos({"n": list(range(7)), "stop": [3.0, 6.0]})
+        for _ in range(200):
+            s = rng.standard_normal(len(combos)) * 10 ** rng.uniform(-3, 3)
+            s[rng.random(len(s)) < 0.2] = -np.inf
+            sm = smooth_scores(s, idx)
+            for i in range(0, len(s), 2):          # (n, 3.0) and (n, 6.0) are adjacent rows
+                if np.isfinite(s[i]) and np.isfinite(s[i + 1]):
+                    self.assertEqual(sm[i], sm[i + 1])
+
+
+class ScoreCapTests(unittest.TestCase):
+    def test_ratio_metrics_are_bounded_but_keep_their_order(self):
+        """Above SCORE_CAP a ratio is compressed, not clipped: two strong
+        windows keep their order (a hard cap tied them at 10 and grid order
+        chose), and nothing, not even no drawdown or no losing trade, can
+        score high enough to swamp a plateau average."""
+        from walkforward import score_stats, SCORE_CAP
+        st = lambda r, dd, pf=1.0: dict(n_trades=9, sharpe=1.0, total_return=r, max_drawdown=dd, profit_factor=pf)  # noqa: E731
+        self.assertAlmostEqual(score_stats(st(0.3, -0.1), "return_over_dd", 5), 3.0)  # below the cap: unchanged
+        a = score_stats(st(0.0584, -0.0025), "return_over_dd", 5)                    # 23.4
+        b = score_stats(st(0.0730, -0.0025), "return_over_dd", 5)                    # 29.2
+        self.assertTrue(SCORE_CAP < a < b < 15.0)
+        self.assertLess(score_stats(st(0.1, 0.0), "return_over_dd", 5), 25.0)       # the 1e-6 floor
+        self.assertLess(score_stats(st(0.1, -0.1, np.inf), "profit_factor", 5), 25.0)
+        self.assertLess(score_stats(st(0.1, -0.1, 12.0), "profit_factor", 5),
+                        score_stats(st(0.1, -0.1, 30.0), "profit_factor", 5))
+        self.assertEqual(score_stats(st(0.1, -0.1, 7.0), "profit_factor", 5), 7.0)
+        self.assertTrue(np.isfinite(score_stats(st(0.1, -0.1, np.inf), "profit_factor", 5)))
+        # the plateau picks the higher of two strong points that tie on their neighbourhood
+        combos, idx = grid_combos({"n": [20, 40, 60], "target": [3.0, 4.0]})
+        scores = np.array([1.0, 1.0, 1.0, 1.0, a, b])
+        self.assertEqual(combos[select_params(scores, idx, "plateau")], {"n": 60, "target": 4.0})

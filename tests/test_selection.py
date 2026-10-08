@@ -123,7 +123,11 @@ class ObjectiveTests(unittest.TestCase):
         no_dd = dict(self.STATS, max_drawdown=0.0)
         self.assertTrue(np.isfinite(score_stats(no_dd, "return_over_dd", 5)))
         never_lost = dict(self.STATS, profit_factor=np.inf)
-        self.assertEqual(score_stats(never_lost, "profit_factor", 5), 10.0, "capped, or it always wins")
+        # bounded, or one never-losing window swamps every plateau average it is in; it still
+        # ranks above a finite profit factor (a hard cap tied them and grid order chose)
+        top = score_stats(never_lost, "profit_factor", 5)
+        self.assertTrue(np.isfinite(top) and top < 25.0)
+        self.assertGreater(top, score_stats(dict(self.STATS, profit_factor=50.0), "profit_factor", 5))
         with self.assertRaises(ValueError):
             score_stats(self.STATS, "sortino", 5)
 
@@ -351,7 +355,7 @@ class CpcvSelectionRuleTests(unittest.TestCase):
             res = evaluate_template(df, tpl, grid, train_bars=300, test_bars=100, cpcv_groups=6, cpcv_k=2,
                                     cscv_partitions_n=8, metric=metric, min_trades=mt)
             ref = cpcv(R, E, idx, n_groups=6, k_test=2, embargo_bars=cpcv_embargo(tpl, combos),
-                       metric=metric, min_trades=mt, P=P, X=X)
+                       metric=metric, min_trades=mt, P=P, X=X, additive=True)   # trial_returns' P&L is additive
             np.testing.assert_allclose(res["cpcv"]["path_sharpes"], ref["path_sharpes"])
 
     def test_nothing_trades_enough_stays_flat(self):

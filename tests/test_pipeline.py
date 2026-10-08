@@ -765,7 +765,7 @@ class WideLadderTests(unittest.TestCase):
 
     def test_the_ladder_is_fixed_in_advance_and_labelled(self):
         spec = HEDGE_LADDERS["hedge_wide"]
-        self.assertEqual(HEDGE_CHANNELS, ("hedge", "hedge_wide", "hedge_slow", "hedge_wide_slow", "hedge_split"))
+        self.assertEqual(HEDGE_CHANNELS, ("hedge", "hedge_wide", "hedge_slow", "hedge_wide_slow", "hedge_long", "hedge_split"))
         self.assertEqual([e.label for e in hedge_ladder("trend")], [f"follow_{n}" for n in HEDGE_LADDER])
         self.assertEqual(len(spec), 2 * len(HEDGE_LADDER))
         for mode in ("trend", "countertrend", "learned"):
@@ -818,6 +818,23 @@ class WideLadderTests(unittest.TestCase):
         warm = hedge_warmup(20, "hedge_slow")
         full = hedge_weights(df, 20, "learned", 5.0, "hedge_slow")
         part = hedge_weights(df.iloc[300:], 20, "learned", 5.0, "hedge_slow")
+        np.testing.assert_allclose(full[300 + warm:], part[warm:], atol=1e-12)
+
+    def test_long_ladder_is_the_plain_one_a_rung_slower_under_the_slow_learner(self):
+        self.assertEqual([e.label for e in hedge_ladder("trend", "hedge_long")],
+                         [f"follow_{n}" for n in S.HEDGE_LONG_LADDER])
+        self.assertEqual(S.HEDGE_LONG_LADDER, tuple(2 * n for n in HEDGE_LADDER))
+        self.assertEqual(hedge_learner("hedge_long"), (HEDGE_SLOW_MEMORY, HEDGE_SLOW_HORIZONS))
+        self.assertFalse(hedge_position_sized("hedge_long"))
+        self.assertEqual(hedge_warmup(20, "hedge_long"), HEDGE_SLOW_MEMORY + 2 * max(S.HEDGE_LONG_LADDER))
+        self.assertEqual(len(generate_templates("online_long")), 27)
+        self.assertTrue(all(t.channel_type == "hedge_long" for t in generate_templates("online_long")))
+        self.assertNotIn("hedge_long", {t.channel_type for t in generate_templates("full")})
+        # a window warmed on hedge_warmup bars matches the full-history run
+        df = synthetic_ohlc(1500, seed=3)
+        warm = hedge_warmup(20, "hedge_long")
+        full = hedge_weights(df, 20, "learned", 5.0, "hedge_long")
+        part = hedge_weights(df.iloc[300:], 20, "learned", 5.0, "hedge_long")
         np.testing.assert_allclose(full[300 + warm:], part[warm:], atol=1e-12)
 
     def test_bands_are_the_channels_the_fitted_templates_trade(self):

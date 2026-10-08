@@ -111,6 +111,23 @@ def warmup_bars(tpl) -> int:
     return int(max(need)) + 5
 
 
+# Soft ceiling of the ratio metrics. A training window with almost no
+# drawdown (return_over_dd divides by max(|dd|, 1e-6)) or no losing trade
+# (profit_factor) would otherwise score in the thousands, and one such point
+# swamps the plateau average of every neighbour it has. Above SCORE_CAP a
+# score grows only logarithmically (_soft_cap): 29 -> 13, 1e5 -> 21.5, an
+# infinite profit factor -> 23.8. Not a hard min(): that made every strong
+# point exactly 10, so plateau_pick's tie-break by own score, and the 'best'
+# argmax, fell back to grid order between them.
+SCORE_CAP = 10.0
+
+
+def _soft_cap(x: float) -> float:
+    if not x > SCORE_CAP:          # NaN passes through, as before
+        return x
+    return SCORE_CAP + float(np.log1p(min(x, 1e6) - SCORE_CAP))
+
+
 def score_stats(stats: dict, metric: str, min_trades: int) -> float:
     if stats["n_trades"] < min_trades:
         return -np.inf  # not enough trades to trust this window
@@ -118,24 +135,88 @@ def score_stats(stats: dict, metric: str, min_trades: int) -> float:
         return stats["sharpe"]
     if metric == "return_over_dd":
         dd = abs(stats["max_drawdown"]) or 1e-6
-        return stats["total_return"] / dd
+        return _soft_cap(stats["total_return"] / dd)
     if metric == "profit_factor":
-        return min(stats["profit_factor"], 10.0)
+        return _soft_cap(stats["profit_factor"])
     raise ValueError(f"unknown metric {metric}")
 
 
+def _box3(a: np.ndarray, axis: int) -> np.ndarray:
+    """Sum of each cell and its two neighbours along `axis`, zero beyond the
+    edges (left + centre + right, in that order: along a two-value axis both
+    cells get the same sum bit for bit)."""
+    pad = [(0, 0)] * a.ndim
+    pad[axis] = (1, 1)
+    p = np.pad(a, pad)
+    n = a.shape[axis]
+    take = lambda k: np.take(p, np.arange(k, k + n), axis=axis)  # noqa: E731
+    return take(0) + take(1) + take(2)
+
+
+# Weight of a missing neighbour in the plateau average (see smooth_scores):
+# 0 averages only the neighbours that exist, 1 counts every missing one at the
+# window median. 0.5 is where iid noise picks every grid value about equally
+# often (calibrated on an 11 x 8 x 4 lattice, the wide grid's shape then: the shortest and the
+# longest n_entry 8 % each against 9 % uniform, the four hard stops 24-26 %
+# against 25 %); 0 piled noise onto the edges (21-24 %, the stops 45 / 5 / 5 /
+# 45 %) and 1 pushed it one step in (3 % at the ends, 11-12 % next to them).
+PLATEAU_FILL_WEIGHT = 0.5
+
+
 def smooth_scores(scores: np.ndarray, idx: np.ndarray) -> np.ndarray:
-    """Average each grid point's score with its lattice neighbours
-    (Chebyshev distance <= 1 in index space). Points that scored -inf
-    (too few trades) stay -inf and are excluded from neighbours' means."""
+    """Average each grid point's score over its lattice neighbourhood
+    (Chebyshev distance <= 1 in index space). The neighbourhood has
+    prod over dimensions of min(3, values) cells; a cell that is missing --
+    beyond the edge of the grid, or a neighbour that scored -inf (too few
+    trades) -- counts at the median of the window's finite scores with
+    weight PLATEAU_FILL_WEIGHT, the cells that exist with weight 1. Points
+    that scored -inf stay -inf. Adding a constant to every score adds it to
+    every smoothed one, and scaling scales them (the median moves along), so
+    the metric's scale does not matter.
+
+    Averaging only the neighbours that exist gives an edge point a noisier
+    average than an interior one, and on noise the grid's corners won far
+    too often. Counting every missing cell at the median over-corrects: an
+    extreme is then chosen only when the cells beyond it would have been
+    below the median, and on a surface whose best value really is at the
+    edge the pick steps one value inside it. Half weight is unbiased on
+    noise; the price, on a planted optimum at the edge of an 11-value
+    dimension, is that it is picked exactly about a fifth of the time and
+    its neighbour most of the rest (the old rule's 81 % was mostly its edge
+    bias), and a planted interior optimum is found within a step 88 % of
+    the time (78 % before)."""
+    scores = np.asarray(scores, dtype=float)
+    out = np.full(scores.shape, -np.inf)
     finite = np.isfinite(scores)
-    out = np.full_like(scores, -np.inf, dtype=float)
-    for i in range(len(scores)):
-        if not finite[i]:
-            continue
-        nb = np.all(np.abs(idx - idx[i]) <= 1, axis=1) & finite
-        out[i] = scores[nb].mean()
+    if not finite.any():
+        return out
+    idx = np.asarray(idx, dtype=int).reshape(len(scores), -1)
+    if idx.shape[1] == 0:          # an empty grid: one point, nothing to smooth
+        out[finite] = scores[finite]
+        return out
+    shape = tuple(int(n) for n in idx.max(axis=0) + 1)
+    at = tuple(idx[finite].T)
+    total, count = np.zeros(shape), np.zeros(shape)
+    total[at], count[at] = scores[finite], 1.0
+    for axis in range(len(shape)):          # the Chebyshev box is separable
+        total, count = _box3(total, axis), _box3(count, axis)
+    full = float(np.prod([min(3, n) for n in shape]))
+    fill = float(np.median(scores[finite]))
+    miss = PLATEAU_FILL_WEIGHT * (full - count[at])
+    out[finite] = (total[at] + miss * fill) / (count[at] + miss)
     return out
+
+
+def plateau_pick(scores: np.ndarray, idx: np.ndarray) -> int:
+    """The grid point with the best smoothed score (see `smooth_scores`),
+    ties broken by its own score. Along a dimension of two values both
+    points have the same neighbourhood, so their smoothed scores are
+    bit-identical: a bare argmax would always return the first value and
+    the second could never be chosen (a 6-ATR hard stop next to a 3-ATR
+    one, n_exit 20 next to 10). The tie-break lets their own scores decide."""
+    sm = smooth_scores(scores, idx)
+    top = np.flatnonzero(sm == sm.max())
+    return int(top[np.argmax(scores[top])])
 
 
 def select_params(scores: np.ndarray, idx: np.ndarray, method: str = "plateau") -> int | None:
@@ -144,7 +225,7 @@ def select_params(scores: np.ndarray, idx: np.ndarray, method: str = "plateau") 
     if method == "best":
         return int(np.argmax(scores))
     if method == "plateau":
-        return int(np.argmax(smooth_scores(scores, idx)))
+        return plateau_pick(scores, idx)
     raise ValueError(f"unknown selection method {method}")
 
 
@@ -270,7 +351,11 @@ def optimize_window(df: pd.DataFrame, tpl, combos: list, idx: np.ndarray, start:
 
     A window that starts before the grid's longest warm-up (the first rolling
     window, every anchored one) has no earlier bars to warm up on, so it is
-    scored from bar `warm` on. Left at `start`, its dead bars would dilute
+    scored from bar `warm` on; a window that ENDS before it is skipped (best
+    None), since no bar of it has every grid point's indicators formed. A
+    rolling indicator would have nothing to trade on there anyway, but an
+    EMA (a Keltner channel) trades from a cold start, on a channel a trader
+    with the full history would not see. Left at `start`, its dead bars would dilute
     the IS return and Sharpe against an OOS window that has none (inflating
     Pardo's WFE), and a short-lookback grid point would trade, and be scored,
     on more bars than a long-lookback one.
@@ -278,8 +363,11 @@ def optimize_window(df: pd.DataFrame, tpl, combos: list, idx: np.ndarray, start:
     Returns dict(best=index into combos or None, scores, stats, warmup,
     start=the first bar actually scored)."""
     warm = max(warmup_bars(tpl.with_params(**p)) for p in combos)
-    if warm < end - 1:  # otherwise nothing can trade and the window is skipped anyway
-        start = max(int(start), warm)
+    if warm >= end - 1:
+        # no bar of the window is warm for every grid point: skip it
+        return dict(best=None, scores=np.full(len(combos), -np.inf), stats=[None] * len(combos),
+                    warmup=warm, start=int(start))
+    start = max(int(start), warm)
     scores = np.empty(len(combos))
     stats_list = []
     for j, params in enumerate(combos):
