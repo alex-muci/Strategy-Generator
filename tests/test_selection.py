@@ -351,7 +351,7 @@ class CpcvSelectionRuleTests(unittest.TestCase):
             res = evaluate_template(df, tpl, grid, train_bars=300, test_bars=100, cpcv_groups=6, cpcv_k=2,
                                     cscv_partitions_n=8, metric=metric, min_trades=mt)
             ref = cpcv(R, E, idx, n_groups=6, k_test=2, embargo_bars=cpcv_embargo(tpl, combos),
-                       metric=metric, min_trades=mt, P=P, X=X)
+                       metric=metric, min_trades=mt, P=P, X=X, additive=True)   # trial_returns' P&L is additive
             np.testing.assert_allclose(res["cpcv"]["path_sharpes"], ref["path_sharpes"])
 
     def test_nothing_trades_enough_stays_flat(self):

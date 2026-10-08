@@ -562,3 +562,70 @@ class PlateauSelectionTests(unittest.TestCase):
         scores = np.array([0.9, -0.5, 0.4, 0.5, 0.45, -0.2, -0.3])
         self.assertEqual(combos[select_params(scores, idx, "plateau")]["n_entry"], 40)
         self.assertEqual(combos[select_params(scores, idx, "best")]["n_entry"], 10)
+
+    def test_smoothing_averages_a_fixed_neighbourhood(self):
+        """Every point averages prod(min(3, values)) cells; a cell beyond the
+        grid or a -inf neighbour counts at the median of the finite scores,
+        with weight PLATEAU_FILL_WEIGHT. Checked against a direct per-point
+        sum on random lattices, with the rows of idx in any order."""
+        from walkforward import PLATEAU_FILL_WEIGHT as w
+        rng = np.random.default_rng(3)
+        for grid in ({"a": [1, 2, 3, 4, 5], "b": [1, 2], "c": [1, 2, 3]}, {"a": [1]}, {"a": [1, 2]},
+                     {"a": list(range(11)), "b": list(range(8)), "c": [1, 2, 3, 4]}):
+            combos, idx = grid_combos(grid)
+            full = np.prod(np.minimum(3, idx.max(axis=0) + 1))
+            for _ in range(10):
+                s = rng.standard_normal(len(combos))
+                s[rng.random(len(combos)) < 0.3] = -np.inf
+                if not np.isfinite(s).any():
+                    continue
+                f = np.isfinite(s)
+                m = np.median(s[f])
+                ref = np.full(len(s), -np.inf)
+                for i in np.flatnonzero(f):
+                    nb = np.all(np.abs(idx - idx[i]) <= 1, axis=1) & f
+                    miss = w * (full - nb.sum())
+                    ref[i] = (s[nb].sum() + miss * m) / (nb.sum() + miss)
+                np.testing.assert_allclose(smooth_scores(s, idx), ref, rtol=1e-12)
+                perm = rng.permutation(len(s))
+                np.testing.assert_allclose(smooth_scores(s[perm], idx[perm]), ref[perm], rtol=1e-12)
+                # shift and scale move every smoothed score along
+                sm = smooth_scores(s, idx)
+                np.testing.assert_allclose(smooth_scores(3.0 * s - 2.0, idx)[f], 3.0 * sm[f] - 2.0, rtol=1e-12)
+        combos, idx = grid_combos({})                      # an empty grid: one point
+        self.assertEqual(list(smooth_scores(np.array([0.3]), idx)), [0.3])
+        self.assertTrue(np.isneginf(smooth_scores(np.array([-np.inf, -np.inf]), np.array([[0], [1]]))).all())
+
+    def test_noise_does_not_pick_the_corners(self):
+        """On iid noise every value of a dimension should be about equally
+        likely. Averaging only the neighbours that exist picked the two
+        extremes of an 11-value dimension 20 %+ of the time each and those of
+        a 4-value one 45 % (9 % and 25 % are uniform); the half-weighted
+        fill is close to uniform at the ends and next to them, and still
+        finds a broad optimum at the edge."""
+        rng = np.random.default_rng(0)
+        combos, idx = grid_combos({"n": list(range(11)), "x": list(range(8)), "s": [0, 1, 2, 3]})
+        picks = idx[[select_params(rng.standard_normal(len(combos)), idx) for _ in range(1500)]]
+        freq = np.bincount(picks[:, 0], minlength=11) / len(picks)
+        for k in (0, 1, 9, 10):
+            self.assertLess(abs(freq[k] - 1 / 11), 0.04, f"n value {k}: {freq[k]:.3f}")
+        freq = np.bincount(picks[:, 2], minlength=4) / len(picks)
+        self.assertLess(np.abs(freq - 0.25).max(), 0.06, freq)
+        edge = -0.15 * np.abs(idx[:, 0] - 10)
+        hits = [abs(idx[select_params(edge + rng.standard_normal(len(combos)), idx), 0] - 10) <= 1
+                for _ in range(300)]
+        self.assertGreater(np.mean(hits), 0.7)
+
+    def test_both_values_of_a_two_value_dimension_tie_bit_for_bit(self):
+        """With -inf cells around, the two points of a two-value dimension
+        keep identical neighbourhoods, so identical smoothed scores, and the
+        raw score decides between them."""
+        rng = np.random.default_rng(5)
+        combos, idx = grid_combos({"n": list(range(7)), "stop": [3.0, 6.0]})
+        for _ in range(200):
+            s = rng.standard_normal(len(combos)) * 10 ** rng.uniform(-3, 3)
+            s[rng.random(len(s)) < 0.2] = -np.inf
+            sm = smooth_scores(s, idx)
+            for i in range(0, len(s), 2):          # (n, 3.0) and (n, 6.0) are adjacent rows
+                if np.isfinite(s[i]) and np.isfinite(s[i + 1]):
+                    self.assertEqual(sm[i], sm[i + 1])
