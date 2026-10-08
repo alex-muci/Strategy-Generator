@@ -405,7 +405,7 @@ class ParseArgsTests(unittest.TestCase):
         a = M.parse_args([])
         self.assertEqual((a.family, a.train, a.test, a.interval), ("quick", 500, 125, "1d"))
         self.assertIsNone(a.real)
-        self.assertFalse(a.anchored or a.no_matrix or a.require_pardo or a.wide_grid or a.slow_grid)
+        self.assertFalse(a.anchored or a.no_matrix or a.require_pardo or a.wide_grid)
         # the sizing the run uses is the engine's own default unless asked otherwise
         tpl = S.StrategyTemplate(name="x")
         self.assertEqual((a.cost_bps, a.risk_pct, a.max_leverage), (tpl.cost_bps, tpl.risk_pct, tpl.max_leverage))

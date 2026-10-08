@@ -815,7 +815,7 @@ def _slot_signal(slot: dict, df: pd.DataFrame, cfg: dict, live: dict, args,
         # Research sized each template on its own account (RESEARCH_EQUITY, carried
         # window to window), not on this slot's share of yours: with whole
         # units the two fits can differ, and the live one is the one you trade
-        fit = refit_params(df, base, param_grid_for(base, wide=cfg["wide_grid"], slow=cfg.get("slow_grid", False)),
+        fit = refit_params(df, base, param_grid_for(base, wide=cfg["wide_grid"]),
                            train_bars=train, metric=cfg["metric"],
                            selection=cfg["selection"], anchored=cfg["anchored"],
                            initial_equity=equity)

@@ -74,11 +74,10 @@ def add_research_args(p: argparse.ArgumentParser, *, start: str) -> argparse.Arg
     p.add_argument("--anchored", action="store_true", help="expanding instead of rolling training window")
     p.add_argument("--selection", default="plateau", choices=["plateau", "best"])
     p.add_argument("--metric", default="sharpe", choices=["sharpe", "return_over_dd", "profit_factor"])
-    p.add_argument("--wide-grid", action="store_true")
-    p.add_argument("--slow-grid", action="store_true",
-                   help="fit the slow horizon band: n_entry 60-250 bars (3-12 months on daily bars) with the exits "
-                        "and the hard stop widened to match (generator.param_grid_for). Same number of trials as "
-                        "the default grid; with --wide-grid, the wide version of it")
+    p.add_argument("--wide-grid", action="store_true",
+                   help="search every horizon band in one lattice: n_entry 10-250 bars (two weeks to a year on daily "
+                        "bars), exits and the hard stop stretched to match (generator.param_grid_for). Many times the "
+                        "trials of the default grid, and every window warms up to its longest lookback")
     p.add_argument("--cost-bps", type=float, default=5.0,
                    help="commission+slippage per side, bps of notional. A cash asset's cost: an instrument with a "
                         "margin is costed per unit only (--cost-per-unit), its bps cost is 0")
@@ -196,7 +195,6 @@ def eval_config(args, interval: str) -> dict:
         periods_per_year=periods_per_year_for_interval(interval, bars_per_day),
         train_bars=args.train, test_bars=args.test, anchored=args.anchored,
         metric=args.metric, selection=args.selection, wide_grid=args.wide_grid,
-        slow_grid=bool(getattr(args, "slow_grid", False)),
         cost_bps=args.cost_bps, risk_pct=args.risk_pct, max_leverage=args.max_leverage,
         vol_target=args.vol_target, vol_target_n=args.vol_target_n,
         point_value=args.point_value, cost_per_unit=args.cost_per_unit, margin_per_unit=args.margin_per_unit,
@@ -324,7 +322,7 @@ def evaluate_slot(job):
     df = _DATA[asset]
     tpl = _costed(tpl, c, asset)
     wfa = evaluate_template(
-        df, tpl, param_grid_for(tpl, wide=c["wide_grid"], slow=c.get("slow_grid", False)),
+        df, tpl, param_grid_for(tpl, wide=c["wide_grid"]),
         train_bars=c["train_bars"], test_bars=c["test_bars"],
         cpcv_groups=c["cpcv_groups"], cpcv_k=c["cpcv_k"],
         cscv_partitions_n=cscv_partitions_for(len(df)), **_wfa_kwargs(c),
@@ -338,7 +336,7 @@ def matrix_cell(job):
     already been through `evaluate_slot` (it carries the run's costs)."""
     name, asset, tpl, tr, te = job
     c = _CFG
-    row = matrix_row(_DATA[asset], tpl, param_grid_for(tpl, wide=c["wide_grid"], slow=c.get("slow_grid", False)), tr, te, **_wfa_kwargs(c))
+    row = matrix_row(_DATA[asset], tpl, param_grid_for(tpl, wide=c["wide_grid"]), tr, te, **_wfa_kwargs(c))
     return name, row
 
 

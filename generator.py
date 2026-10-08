@@ -226,10 +226,14 @@ def generate_templates(
     return templates
 
 
-SLOW_HARD_STOP = 6.0   # ATRs: the hard stop of the slow grid (param_grid_for), at the top of its trails
+# The hard stop of the wide grid (param_grid_for): the template default and
+# twice it. The hard stop works whatever the exit, and at 3 ATR(20) a 160- or
+# 250-bar breakout is stopped out by noise long before its channel or trail
+# exit is reached; at 6 ATR it sits at the top of the wide trails.
+WIDE_HARD_STOPS = [3.0, 6.0]
 
 
-def param_grid_for(tpl: StrategyTemplate, wide: bool = False, slow: bool = False) -> dict:
+def param_grid_for(tpl: StrategyTemplate, wide: bool = False) -> dict:
     """Return the numeric-parameter search grid to walk-forward optimize
     for this template. Only the params relevant to this template's
     switches are varied; everything else stays at the template default.
@@ -237,53 +241,43 @@ def param_grid_for(tpl: StrategyTemplate, wide: bool = False, slow: bool = False
     The grid is a LATTICE (each param a sorted list) so that the
     walk-forward 'plateau' selection can look at parameter neighbours.
     Kept deliberately small so a full sweep across hundreds of templates
-    finishes in minutes; `wide=True` roughly triples it.
+    finishes in minutes.
 
-    `slow=True` moves every horizon of the grid (the entry and exit
-    lookbacks, the time stop) about three times slower, with the ATR exits
-    widened to match: on daily bars n_entry 60-250, i.e. the 3-12 month
-    breakouts of classic trend following, which the default grid (20-60)
-    never trades. The hard stop, always working whatever the exit, is set
-    to SLOW_HARD_STOP ATRs (one value, not a search dimension): at the
-    default 3 ATR(20) a 250-bar breakout is stopped out by noise long
-    before its channel or trail exit is reached. Under --risk-pct sizing
-    the wider stop trades proportionally fewer units (same risk per trade);
-    under --vol-target it changes no size. It is the same number of values,
-    so the same number of trials, on another horizon band, not a finer
-    grid: run it as its own research and compare, rather than merging the
-    two grids into one search.
-    The longest lookback lengthens the warm-up (walkforward.warmup_bars), so
-    give it a training window of at least two of them (--train 500 or more on
-    daily bars)."""
+    `wide=True` searches every horizon band in one lattice: n_entry from 10
+    to 250 bars (on daily bars two weeks to a year: the default grid's 20-60
+    and the 3-12 month breakouts of classic trend following), with the exit
+    lookbacks, the time stop and the ATR exits stretched to match, and the
+    hard stop searched at WIDE_HARD_STOPS on the fitted channels (target_stop
+    searches its own; an online template keeps nothing to fit, stance has no
+    stop at all). It is many
+    times the default grid's trials, which PBO, the DSR and the Reality
+    Check charge for. And one long lookback in a lattice delays every
+    combination: a window is warmed up to the grid's LONGEST warm-up
+    (walkforward.optimize_window), so the short lookbacks lose the first
+    windows too, a Keltner template most (its EMA(250) settles in ~1150
+    bars). Load the history for it."""
     grid = {}
     if tpl.channel_type in FORECAST_CHANNELS:
         return grid      # the forecaster learns online and the stance has no exit: nothing to fit
     online = tpl.channel_type in HEDGE_CHANNELS   # lookbacks (and widths) are learned online, not fitted
-
-    def pick(base, wider, slow_base, slow_wider):
-        if slow:
-            return slow_wider if wide else slow_base
-        return wider if wide else base
-
     if not online:
-        grid["n_entry"] = pick([20, 40, 60], [10, 20, 30, 40, 55, 70, 90],
-                               [60, 120, 250], [50, 80, 120, 160, 200, 250, 300])
+        grid["n_entry"] = [20, 40, 60] if not wide else [10, 20, 30, 40, 55, 70, 90, 120, 160, 250]
 
     if tpl.channel_type in ("keltner", "bollinger"):
         grid["channel_k"] = [1.5, 2.5] if not wide else [1.0, 1.5, 2.0, 2.5, 3.0]
 
     if tpl.exit_style == "channel" and not online:
-        grid["n_exit"] = pick([10, 20], [5, 10, 15, 20, 30], [20, 50], [15, 20, 30, 50, 80])
+        grid["n_exit"] = [10, 20] if not wide else [5, 10, 15, 20, 30, 50, 80]
     elif tpl.exit_style == "atr_trail":
-        grid["atr_mult_trail"] = pick([2.5, 3.5], [1.5, 2.0, 2.5, 3.0, 3.5, 4.5], [4.0, 6.0], [3.5, 4.0, 5.0, 6.0, 7.0, 8.0])
+        grid["atr_mult_trail"] = [2.5, 3.5] if not wide else [1.5, 2.0, 2.5, 3.0, 3.5, 4.5, 6.0]
     elif tpl.exit_style == "target_stop":
-        grid["atr_mult_stop"] = pick([2.0, 3.0], [1.5, 2.0, 2.5, 3.0, 4.0], [4.0, 6.0], [3.0, 4.0, 5.0, 6.0, 8.0])
-        grid["atr_mult_target"] = pick([3.0, 4.0], [2.0, 3.0, 4.0, 5.0, 6.0], [8.0, 12.0], [6.0, 8.0, 10.0, 12.0, 16.0])
+        grid["atr_mult_stop"] = [2.0, 3.0] if not wide else [1.5, 2.0, 2.5, 3.0, 4.0, 6.0]
+        grid["atr_mult_target"] = [3.0, 4.0] if not wide else [2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 12.0]
     elif tpl.exit_style == "time_stop":
-        grid["max_hold_bars"] = pick([10, 20], [5, 10, 15, 20, 30, 40], [40, 80], [30, 40, 60, 80, 120, 160])
+        grid["max_hold_bars"] = [10, 20] if not wide else [5, 10, 15, 20, 30, 40, 60, 80, 120]
 
-    if slow and "atr_mult_stop" not in grid and tpl.entry_style != "stance":
-        grid["atr_mult_stop"] = [SLOW_HARD_STOP]   # the stance entry has no stop
+    if wide and not online and "atr_mult_stop" not in grid:
+        grid["atr_mult_stop"] = list(WIDE_HARD_STOPS)   # an online template keeps nothing to fit
 
     if tpl.entry_style == "pullback":
         grid["pullback_atr_mult"] = [0.4, 0.7] if not wide else [0.25, 0.5, 0.75, 1.0]
