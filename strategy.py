@@ -3209,8 +3209,10 @@ def _stance_backtest(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: fl
         if want != level:
             new_side = int(np.sign(want))
             qty = target_units(want, i - 1, open_[i], cash) if new_side != 0 else 0.0
-            if new_side == pos and pos != 0 and qty == shares:
-                pass                                            # the same whole units: nothing to trade
+            if new_side == pos and pos != 0 and not fixed_capital and cash <= 0.0:
+                pass                                            # underwater at the open: cannot resize, close decides ruin
+            elif new_side == pos and pos != 0 and qty == shares:
+                level = want                                    # the same whole units: nothing to trade
             elif new_side == pos and pos != 0 and qty > 0:
                 # same side, new size: the trade is closed and a new one opened at
                 # the open, charged on the units actually traded
@@ -3220,6 +3222,7 @@ def _stance_backtest(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: fl
                 cash -= c
                 pos = new_side; shares = float(qty); e_bar = i; e_px = float(open_[i]); e_cost = c
                 entries[i] = 1.0
+                level = want
             else:
                 if pos != 0:
                     close_trade(i, open_[i])
@@ -3227,7 +3230,7 @@ def _stance_backtest(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: fl
                     pos = new_side; shares = float(qty); e_bar = i; e_px = float(open_[i])
                     e_cost = cost_rate * shares * pv * abs(e_px) + tpl.cost_per_unit * shares
                     cash -= e_cost; entries[i] = 1.0
-            level = want if pos != 0 else 0.0
+                level = want if pos != 0 else 0.0
         if pos != 0:
             cash += pos * shares * pv * (close[i] - open_[i])
             if roll[i] > 0.0 and tpl.roll_cost_per_unit > 0.0:
