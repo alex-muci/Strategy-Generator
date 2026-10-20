@@ -395,11 +395,13 @@ class CpcvSelectionRuleTests(unittest.TestCase):
     def test_the_embargo_runs_on_until_a_carried_trade_closes(self):
         T = 100
         bounds = np.array([0, 20, 40, 60, 80, 100])
-        E = np.zeros((T, 3), dtype=np.int8); X = np.zeros((T, 3), dtype=np.int8)
+        E = np.zeros((T, 4), dtype=np.int8); X = np.zeros((T, 4), dtype=np.int8)
         E[30, 0] = 1; X[70, 0] = 1        # opened in the test group, closes long after the embargo
         E[45, 1] = 1; X[48, 1] = 1        # opened AND closed inside the embargo: nothing to extend
         E[42, 2] = 1                      # opened in the embargo, still open at the end
         E[60, 1] = 1; X[65, 1] = 1        # opened after the embargo: clean
+        E[10, 3] = 1; X[30, 3] = 1        # stance resize at bar 30: trade 1 exits and trade 2 enters on bar 30,
+        E[30, 3] = 1; X[70, 3] = 1        # then trade 2 stays open past the embargo until bar 70
         M = robustness.train_masks(T, bounds, (1,), 5, 0, E, X)       # test 20..39, embargo 40..44
         base = robustness.train_masks(T, bounds, (1,), 5)
         self.assertEqual(base.shape, (T,))
@@ -407,6 +409,7 @@ class CpcvSelectionRuleTests(unittest.TestCase):
         self.assertFalse(M[45:71, 0].any()); self.assertTrue(M[71:, 0].all())
         self.assertTrue((M[:, 1] == base).all())
         self.assertFalse(M[45:, 2].any())
+        self.assertFalse(M[45:71, 3].any()); self.assertTrue(M[71:, 3].all())
 
     def test_training_rows_do_not_see_test_prices(self):
         """What the embargo exists for, on real backtests. After a test
@@ -445,13 +448,14 @@ class CpcvSelectionRuleTests(unittest.TestCase):
                 StrategyTemplate("chan", exit_style="channel"),
                 StrategyTemplate("pb", entry_style="pullback", exit_style="target_stop",
                                  regime_indicator="cti", regime_filter="trend_only"),
-                StrategyTemplate("hdg", channel_type="hedge", exit_style="atr_trail")]
+                StrategyTemplate("hdg", channel_type="hedge", exit_style="atr_trail"),
+                StrategyTemplate("st", channel_type="hedge", entry_style="stance")]
         rng = np.random.default_rng(0)
         carried_without_extension = short_embargo_leaks = 0
         for tpl in tpls:
             emb = cpcv_embargo(tpl, [{}])
             pb = tpl.entry_style == "pullback"
-            r0 = backtest(df, tpl); E0, X0, t0, spans = trades(r0, df, pb)
+            r0 = backtest(df, tpl, fixed_capital=tpl.entry_style == "stance"); E0, X0, t0, spans = trades(r0, df, pb)
             for groups in list(combinations(range(6), 2))[::3]:
                 M0 = robustness.train_masks(T, bounds, groups, emb, 0, E0, X0)[:, 0]
                 fixed = robustness.train_masks(T, bounds, groups, emb)
@@ -468,10 +472,12 @@ class CpcvSelectionRuleTests(unittest.TestCase):
                 f = np.exp(np.cumsum(rng.normal(0, 0.01, len(rows))))
                 for c in ("Open", "High", "Low", "Close"):
                     d1.iloc[rows, d1.columns.get_loc(c)] *= f
-                r1 = backtest(d1, tpl); E1, X1, t1, _ = trades(r1, d1, pb)
+                r1 = backtest(d1, tpl, fixed_capital=tpl.entry_style == "stance"); E1, X1, t1, _ = trades(r1, d1, pb)
                 same = t0 == t1
                 m = M0 & robustness.train_masks(T, bounds, groups, emb, 0, E1, X1)[:, 0] & same
-                self.assertGreater(m.sum(), T // 8)
+                # enough rows checked: an eighth of the series, or (the stance learner's ~600-bar
+                # embargo leaves some splits under 200 training rows) most of what the split trains on
+                self.assertGreater(m.sum(), min(T // 8, fixed.sum() // 2), f"{tpl.name} {groups}")
                 d = np.abs(r1["returns"].to_numpy() - r0["returns"].to_numpy())
                 np.testing.assert_allclose(d[m], 0.0, rtol=0, atol=1e-12, err_msg=f"{tpl.name} {groups}")
                 short = (robustness.train_masks(T, bounds, groups, 2, 0, E0, X0)[:, 0]
@@ -528,9 +534,9 @@ class CpcvSelectionRuleTests(unittest.TestCase):
         T = 120
         R = np.zeros((T, 2)); E = np.zeros((T, 2), dtype=np.int8); P = np.zeros((T, 2))
         mask = np.ones(T, bool); mask[40:60] = False                 # a test group
-        E[30, 0] = 1; P[70, 0] = 1000.0                              # held across 40..59: must not count
         E[5, 0] = 1;  P[10, 0] = -10.0                                # fully in training
-        E[80, 0] = 1; P[85, 0] = 5.0
+        E[30, 0] = 1; P[70, 0] = 1000.0                              # held across 40..59: must not count, even when
+        E[70, 0] = 1; P[85, 0] = 5.0                                 # a stance resize opens the next trade on row 70
         E[62, 1] = 1; P[65, 1] = 3.0                                  # inside, after the gap
         E[100, 1] = 1; P[100, 1] = -1.0                               # same-bar exit
         inside = robustness._trades_inside(E, P, mask)

@@ -169,20 +169,27 @@ def _sharpe_cols(R: np.ndarray, mask: np.ndarray) -> np.ndarray:
     return sr
 
 
-def _trades_inside(E, P, mask: np.ndarray) -> np.ndarray:
+def _trades_inside(E, P, mask: np.ndarray, X=None) -> np.ndarray:
     """T x N: True on the exit row of each trade that lies ENTIRELY in the
     rows `mask` selects (T or T x N). A trade that runs through a test group
     (or its embargo) and exits in training must not bring the test period's
-    P&L into the training score. A trial holds one position at a time and
-    never re-enters on its exit bar, so a trade's entry is the latest entry
-    flag in E at or before its exit row. Without E only the exit row is
-    checked."""
+    P&L into the training score. A trial holds one position at a time; when a
+    `stance` trial resizes or reverses at the open, the old trade exits and the
+    new one enters on that same bar, so the k-th exit closes the k-th entry.
+    Without E only the exit row is checked."""
     T, N = P.shape
     M = _as_cols(mask, N)
     if E is None:
         return M.copy()
     rows = np.arange(T)[:, None]
     entry = np.maximum.accumulate(np.where(E > 0, rows, -1), axis=0)     # T x N
+    exits = (X > 0) if X is not None else (P != 0)
+    both = (E > 0) & exits
+    if both.any():
+        for j in np.flatnonzero(both.any(axis=0)):
+            ent, ext = np.flatnonzero(E[:, j] > 0), np.flatnonzero(exits[:, j])
+            m = min(len(ent), len(ext))
+            entry[ext[:m], j] = ent[:m]
     outside = np.vstack([np.zeros((1, N), int), np.cumsum(~M, axis=0)])   # rows not selected, up to t
     ok = entry >= 0
     e = np.where(ok, entry, 0)
@@ -221,7 +228,9 @@ def train_masks(T: int, bounds, test_groups, embargo_bars: int, purge_bars: int 
             k = np.searchsorted(ent, e0) - 1          # the last entry before e0 ...
             if k < 0:
                 continue
-            x = np.searchsorted(ext, ent[k])          # ... and its exit (none: open to the end)
+            # ... and its exit (when `stance` resizes/reverses on ent[k], ext has the
+            # previous trade's exit at ent[k] too; the k prior entries own the first k exits)
+            x = max(int(k), int(np.searchsorted(ext, ent[k])))
             end = ext[x] if x < len(ext) else T - 1
             if end >= e0:
                 M[e0:end + 1, j] = False
@@ -242,7 +251,7 @@ def _drawdown_cols(eq: np.ndarray, additive: bool) -> np.ndarray:
 
 
 def _score_cols(R: np.ndarray, E, P, mask: np.ndarray, metric: str, min_trades: int,
-                additive: bool = False) -> np.ndarray:
+                additive: bool = False, X=None) -> np.ndarray:
     """Walk-forward objective (walkforward.score_stats, incl. its min-trades
     rule) of each column of R over the rows selected by mask (T, or T x N for
     one mask per column). The rows are treated as one concatenated track
@@ -261,7 +270,7 @@ def _score_cols(R: np.ndarray, E, P, mask: np.ndarray, metric: str, min_trades: 
     if metric == "profit_factor":
         if P is None:
             raise ValueError("cpcv(metric='profit_factor') needs P (trial_returns(..., with_trades=True))")
-        pn = np.where(_trades_inside(E, P, M), P, 0.0)
+        pn = np.where(_trades_inside(E, P, M, X), P, 0.0)
         wins, losses = np.where(pn > 0, pn, 0).sum(axis=0), -np.where(pn < 0, pn, 0).sum(axis=0)
     out = np.empty(N)
     for j in range(N):
@@ -341,7 +350,7 @@ def cpcv(
 
     for c, test_groups in enumerate(combos):
         train_mask = train_masks(T, bounds, test_groups, embargo_bars, purge_bars, E, X)
-        scores = _score_cols(R, E, P, train_mask, metric, min_trades, additive)
+        scores = _score_cols(R, E, P, train_mask, metric, min_trades, additive, X=X)
         if not np.isfinite(scores).any():
             # nothing traded enough in training: flat, as walk_forward does
             chosen[c] = -1
