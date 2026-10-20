@@ -475,7 +475,9 @@ class CpcvSelectionRuleTests(unittest.TestCase):
                 r1 = backtest(d1, tpl, fixed_capital=tpl.entry_style == "stance"); E1, X1, t1, _ = trades(r1, d1, pb)
                 same = t0 == t1
                 m = M0 & robustness.train_masks(T, bounds, groups, emb, 0, E1, X1)[:, 0] & same
-                self.assertGreater(m.sum(), T // 8)
+                # enough rows checked: an eighth of the series, or (the stance learner's ~600-bar
+                # embargo leaves some splits under 200 training rows) most of what the split trains on
+                self.assertGreater(m.sum(), min(T // 8, fixed.sum() // 2), f"{tpl.name} {groups}")
                 d = np.abs(r1["returns"].to_numpy() - r0["returns"].to_numpy())
                 np.testing.assert_allclose(d[m], 0.0, rtol=0, atol=1e-12, err_msg=f"{tpl.name} {groups}")
                 short = (robustness.train_masks(T, bounds, groups, 2, 0, E0, X0)[:, 0]
