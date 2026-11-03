@@ -57,7 +57,7 @@ import pipeline
 from data import synthetic_ohlc
 from pipeline import worker_pool, pool_map, hedge_share_of
 from portfolio import close_after_ruin
-from strategy import StrategyTemplate, annualized_sharpe, set_periods_per_year, set_hedge_share, RESEARCH_EQUITY
+from strategy import StrategyTemplate, annualized_sharpe, set_annualization, set_hedge_share, RESEARCH_EQUITY
 from walkforward import window_backtest
 
 MANIFEST_VERSION = 1
@@ -399,7 +399,7 @@ def replay_target(run: dict, which: str, pool=None, *, template: str | None = No
     stored_port = run["portfolio_returns"]
     # every Sharpe and vol-target size below reads the run's annualization
     # (worker_pool sets it for the pool; this covers a direct call too)
-    set_periods_per_year(m["config"]["periods_per_year"])
+    set_annualization(m["config"])
     set_hedge_share(hedge_share_of(m["config"]))
     if which == "best":
         name = template or m["best_template"]

@@ -36,12 +36,15 @@ from robustness import (
 )
 from strategy import (
     annualized_sharpe, max_drawdown, periods_per_year, set_periods_per_year, compound,
-    periods_per_year_for_interval, SIDES, HEDGE_SHARE, HEDGE_SHARES, set_hedge_share,
+    periods_per_year_for_interval, infer_annualization, annualization_of, set_annualization,
+    sessions_per_year, session_cut_minutes,
+    SIDES, HEDGE_SHARE, HEDGE_SHARES, set_hedge_share,
 )
 from walkforward import matrix_cells, matrix_row, matrix_frame
 
 
 SYNTHETIC_INTERVAL = "1d"   # data.synthetic_ohlc is always business-daily
+ANNUALIZATION_MODES = ("data", "interval")
 
 
 # --------------------------------------------------------------------------
@@ -65,9 +68,14 @@ def add_research_args(p: argparse.ArgumentParser, *, start: str) -> argparse.Arg
                         "'both' for quick and default). On an asset with a drift, e.g. --sides long_only")
     p.add_argument("--start", default=start)
     p.add_argument("--bars-per-day", type=float, default=None,
-                   help="intraday bars per trading day, replacing the US-equity session --interval assumes "
-                        "(7 '1h' bars): e.g. 23 for '1h' bars of a future on a ~23 h session. Sets the "
-                        "annualization (252 x this bars a year); intraday intervals only")
+                   help="intraday bars per trading day, replacing the bars a year read off the data (or, with "
+                        "--annualization interval, the US-equity session: 7 '1h' bars): e.g. 23 for '1h' bars "
+                        "of a future on a ~23 h session. Sets 252 x this bars a year; intraday intervals only")
+    p.add_argument("--annualization", default="data", choices=ANNUALIZATION_MODES,
+                   help="'data' (default): read the bars a year off the data's timestamps, and on intraday "
+                        "bars measure the Sharpe ratio and volatility on returns compounded per session "
+                        "(independent of the interval: works for volume or tick bars); 'interval': the "
+                        "--interval table with per-bar statistics. The synthetic series is daily either way")
     p.add_argument("--bars", type=int, default=3000, help="synthetic bars (per asset)")
     p.add_argument("--train", type=int, default=500, help="training window (bars)")
     p.add_argument("--test", type=int, default=125, help="test window (bars)")
@@ -184,15 +192,56 @@ def cscv_partitions_for(T: int) -> int:
     return 16 if T >= 1600 else 8
 
 
-def eval_config(args, interval: str) -> dict:
+def annualization_for(interval: str, bars_per_day: float | None = None, index=None, mode: str = "data") -> dict:
+    """How a run annualizes (`strategy.set_annualization`).
+
+    mode 'data' (the default) reads it off `index`, the bars' stamps
+    (`strategy.infer_annualization`): the bars a year the data actually
+    holds, and on intraday bars a session clock, so that the Sharpe ratio
+    and volatility are compounded per session -- independent of the
+    interval, and usable for bars that have none (volume, tick bars).
+    `bars_per_day`, when given, still sets the bars a year. Mode 'interval',
+    no index (the synthetic series, a config built before the data is
+    loaded) or an index too short to measure: the interval's table and
+    per-bar statistics, as before the data was asked."""
+    table = periods_per_year_for_interval(interval, bars_per_day)     # validates both
+    out = dict(periods_per_year=table, sessions_per_year=None, session_cut_minutes=0, annualization="interval")
+    if mode not in ANNUALIZATION_MODES:
+        raise ValueError(f"unknown annualization {mode!r}, expected one of {ANNUALIZATION_MODES}")
+    inferred = infer_annualization(index) if mode == "data" and index is not None else None
+    if inferred is None:
+        return out
+    if bars_per_day is not None:
+        inferred["periods_per_year"] = table
+    return inferred | dict(annualization="data")
+
+
+def annualization_text(c: dict | None = None) -> str:
+    """One phrase on how a run annualizes, for a report (default: how this
+    process currently does)."""
+    if c is None:
+        c = dict(periods_per_year=periods_per_year(), sessions_per_year=sessions_per_year(),
+                 session_cut_minutes=session_cut_minutes())
+    a = annualization_of(c)
+    src = " (read off the data)" if c.get("annualization") == "data" else ""
+    text = f"annualized at {a['periods_per_year']} bars/year{src}"
+    if a["sessions_per_year"] is not None:
+        h, m = divmod(a["session_cut_minutes"], 60)
+        text += (f"; Sharpe and volatility on session-compounded returns, {a['sessions_per_year']} sessions/year "
+                 f"(sessions cut at {h:02d}:{m:02d})")
+    return text
+
+
+def eval_config(args, interval: str, index=None) -> dict:
     """The evaluation settings of a research run, as a plain (picklable,
     JSON-able) dict read off an argparse namespace. `cost_bps` is the
     run-wide one as given: `instrument_of` zeroes it for an instrument with a
-    margin."""
+    margin. `index` is the stamps of the bars the run trades: with it the
+    annualization is read off the data (`annualization_for`)."""
     bars_per_day = getattr(args, "bars_per_day", None)
     return dict(
         interval=interval, bars_per_day=bars_per_day,
-        periods_per_year=periods_per_year_for_interval(interval, bars_per_day),
+        **annualization_for(interval, bars_per_day, index, getattr(args, "annualization", "data")),
         train_bars=args.train, test_bars=args.test, anchored=args.anchored,
         metric=args.metric, selection=args.selection, wide_grid=args.wide_grid,
         cost_bps=args.cost_bps, risk_pct=args.risk_pct, max_leverage=args.max_leverage,
@@ -293,7 +342,7 @@ def init_worker(data: dict, cfg: dict) -> None:
     _DATA, _CFG = data, cfg
     # a fresh process re-imports strategy at the daily default; without this every
     # annualized number computed in the pool would be wrong for intraday bars
-    set_periods_per_year(cfg["periods_per_year"])
+    set_annualization(cfg)
     set_hedge_share(hedge_share_of(cfg))
 
 
@@ -514,7 +563,8 @@ def against_benchmark(r: pd.Series, bh: pd.Series) -> dict:
     if len(y) < 3 or x.std(ddof=1) == 0 or y.std(ddof=1) == 0:
         return dict(beta=np.nan, corr=np.nan, info_ratio=np.nan)
     beta = float(np.cov(x, y, ddof=1)[0, 1] / x.var(ddof=1))
-    return dict(beta=beta, corr=float(np.corrcoef(x, y)[0, 1]), info_ratio=annualized_sharpe(y - beta * x))
+    return dict(beta=beta, corr=float(np.corrcoef(x, y)[0, 1]),
+                info_ratio=annualized_sharpe(y - beta * x, index=r.index))
 
 
 BENCH_BUY_HOLD = "buy and hold"
