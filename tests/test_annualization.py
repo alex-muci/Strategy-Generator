@@ -297,6 +297,9 @@ class VolumeBarsEndToEndTests(_KeepAnnualization):
 
     @classmethod
     def setUpClass(cls):
+        # main.main sets the process-wide annualization: put it back after
+        cls._saved_cls = dict(periods_per_year=S.periods_per_year(), sessions_per_year=S.sessions_per_year(),
+                              session_cut_minutes=S.session_cut_minutes())
         cls.dir = tempfile.mkdtemp()
         idx, _ = volume_bars("2023-01-01", "2023-06-30", seed=7, lo=10, hi=30)
         df = synthetic_ohlc(n_bars=len(idx), seed=7, trend_vol=0.002, range_vol=0.0012).set_axis(idx)
@@ -312,6 +315,7 @@ class VolumeBarsEndToEndTests(_KeepAnnualization):
 
     @classmethod
     def tearDownClass(cls):
+        S.set_annualization(cls._saved_cls)
         shutil.rmtree(cls.dir, ignore_errors=True)
 
     def test_the_run_annualizes_on_the_data(self):

@@ -1721,11 +1721,15 @@ class AnnualizationTests(unittest.TestCase):
 
     def setUp(self):
         import strategy as S
-        self._saved = S.periods_per_year()
+        self._saved = dict(periods_per_year=S.periods_per_year(), sessions_per_year=S.sessions_per_year(),
+                           session_cut_minutes=S.session_cut_minutes())
+        # from the daily default: an earlier run in this process (main.main on a
+        # CSV) leaves the annualization it read off its data
+        S.set_annualization(dict(periods_per_year=252))
 
     def tearDown(self):
         import strategy as S
-        S.set_periods_per_year(self._saved)
+        S.set_annualization(self._saved)
 
     def test_sharpe_scales_with_the_bar_frequency(self):
         import strategy as S
