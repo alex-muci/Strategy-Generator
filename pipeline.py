@@ -225,6 +225,34 @@ def annualization_for(interval: str, bars_per_day: float | None = None, index=No
     return inferred | dict(annualization="data")
 
 
+MIN_WINDOW_SESSIONS = 20      # a training window's Sharpe on fewer sessions than this is mostly noise
+MIN_TEST_SESSIONS = 5
+
+
+def window_sessions_note(index, train_bars: int, test_bars: int) -> str | None:
+    """A NOTE when, on intraday bars, the walk-forward windows hold too few
+    sessions for the session Sharpe they are scored on (None otherwise).
+    Every Sharpe is one observation per session, but --train / --test count
+    bars: on 1-minute bars the default 500-bar training window is ~1.3
+    sessions, and the parameters would be ranked on the Sharpe of 1 or 2
+    numbers -- noise, and silent."""
+    starts = session_starts(index)
+    if starts is None or len(starts) == 0:
+        return None
+    per_session = len(index) / len(starts)
+    train_s, test_s = train_bars / per_session, test_bars / per_session
+    if train_s >= MIN_WINDOW_SESSIONS and test_s >= MIN_TEST_SESSIONS:
+        return None
+    need_train = int(np.ceil(MIN_WINDOW_SESSIONS * per_session))
+    need_test = int(np.ceil(MIN_TEST_SESSIONS * per_session))
+    return (f"NOTE: the data holds ~{per_session:.0f} bars a session, so a {train_bars}-bar training window is "
+            f"~{train_s:.1f} sessions and a {test_bars}-bar test window ~{test_s:.1f}: every Sharpe is measured "
+            f"on session returns, and one of so few sessions is mostly noise (the optimizer ranks parameters on "
+            f"it). Use at least --train {max(need_train, train_bars)} --test {max(need_test, test_bars)} "
+            f"(~{MIN_WINDOW_SESSIONS} and ~{MIN_TEST_SESSIONS} sessions), coarser bars, or "
+            f"--annualization interval for per-bar statistics")
+
+
 def annualization_text(c: dict | None = None) -> str:
     """One phrase on how a run annualizes, for a report (default: how this
     process currently does)."""
@@ -561,7 +589,7 @@ def curve_stats(r: pd.Series, additive: bool = False) -> dict:
     else:
         cagr = float(eq.iloc[-1] ** (1.0 / years) - 1) if eq.iloc[-1] > 0 else -1.0
         max_dd = max_drawdown(eq, start=1.0)      # funded at 1 before the first bar
-    return dict(sharpe=annualized_sharpe(r), cagr=cagr, max_dd=max_dd, n_bars=n)
+    return dict(sharpe=annualized_sharpe(r, additive=additive), cagr=cagr, max_dd=max_dd, n_bars=n)
 
 
 def against_benchmark(r: pd.Series, bh: pd.Series) -> dict:
@@ -578,7 +606,9 @@ def against_benchmark(r: pd.Series, bh: pd.Series) -> dict:
         return dict(beta=np.nan, corr=np.nan, info_ratio=np.nan)
     beta = float(np.cov(x, y, ddof=1)[0, 1] / x.var(ddof=1))
     return dict(beta=beta, corr=float(np.corrcoef(x, y)[0, 1]),
-                info_ratio=annualized_sharpe(y - beta * x, index=r.index))
+                # a residual of two return streams is a difference, not a
+                # return: summed per session (intraday data), never compounded
+                info_ratio=annualized_sharpe(y - beta * x, index=r.index, additive=True))
 
 
 BENCH_BUY_HOLD = "buy and hold"

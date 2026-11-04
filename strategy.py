@@ -492,8 +492,10 @@ def session_frame(frame: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(X, index=frame.index[starts], columns=frame.columns)
 
 
-def session_returns(rets, index=None) -> np.ndarray:
-    """Per-bar simple returns compounded into one return per session.
+def session_returns(rets, index=None, additive: bool = False) -> np.ndarray:
+    """Per-bar simple returns compounded into one return per session --
+    summed for `additive` returns (P&L over a fixed capital, a one-unit
+    benchmark, a residual of returns: they add up to their curve).
     `rets` is a Series with a DatetimeIndex, or an array with `index`;
     NaN bars are dropped. The index must be sorted."""
     if index is None:
@@ -505,7 +507,7 @@ def session_returns(rets, index=None) -> np.ndarray:
         r, idx = r[ok], idx[ok]
     if len(r) == 0:
         return r
-    return np.multiply.reduceat(1.0 + r, _session_starts(idx)) - 1.0
+    return aggregate_sessions(r, _session_starts(idx), additive)
 
 
 def observations(rets, index=None) -> tuple[np.ndarray, int]:
@@ -517,15 +519,15 @@ def observations(rets, index=None) -> tuple[np.ndarray, int]:
     return _per_session(rets, index)
 
 
-def _per_session(rets, index=None):
+def _per_session(rets, index=None, additive: bool = False):
     """(observations, per year) the annualized statistics use: the session
-    returns and sessions a year on intraday data whose stamps are known,
-    else the bars and bars a year."""
+    returns (summed when `additive`, else compounded) and sessions a year on
+    intraday data whose stamps are known, else the bars and bars a year."""
     if SESSIONS_PER_YEAR is not None:
         if index is None and isinstance(rets, pd.Series) and isinstance(rets.index, pd.DatetimeIndex):
             index = rets.index
         if isinstance(index, pd.DatetimeIndex) and len(index) > 0:
-            return session_returns(rets, index), SESSIONS_PER_YEAR
+            return session_returns(rets, index, additive), SESSIONS_PER_YEAR
     return np.asarray(rets, dtype=float), PERIODS_PER_YEAR
 
 
@@ -3551,7 +3553,8 @@ def _stance_backtest(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: fl
                              target=np.nan, trail_extreme=np.nan, bars_held=int(n - 1 - e_bar),
                              unrealized=float(pos * shares * pv * (close[-1] - e_px)), is_trend=True)
     pnls = np.array([t["pnl"] for t in trades]); held = np.array([t["bars_held"] for t in trades], dtype=float)
-    stats = performance_stats(equity, trades, initial_equity, rets, pnls, held, index=idx)
+    stats = performance_stats(equity, trades, initial_equity, rets, pnls, held, index=idx,
+                              additive=bool(fixed_capital))
     orders = _orders_frame(np.zeros((0, 4), dtype=np.int64), np.zeros((0, 3)), idx.to_numpy()) if log_orders else None
     return {"equity": pd.Series(equity, index=idx), "returns": pd.Series(rets, index=idx), "entries": entries,
             "trades": trades, "stats": stats, "open_position": open_position, "pending_order": None,
@@ -3654,7 +3657,8 @@ def backtest(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: float = 10
     equity_s = pd.Series(equity, index=idx)
     returns = pd.Series(rets, index=idx)
     stats = performance_stats(equity, trades, initial_equity, rets, t_pnl[:n_trades],
-                               (t_exit[:n_trades] - t_entry[:n_trades]).astype(float), index=idx)
+                               (t_exit[:n_trades] - t_entry[:n_trades]).astype(float), index=idx,
+                               additive=bool(fixed_capital))
 
     open_position = None
     if f_position != 0:
@@ -3676,7 +3680,8 @@ def backtest(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: float = 10
             "last_atr": float(f_last_atr), "indicators": ind, "orders": orders}
 
 
-def annualized_sharpe(rets: pd.Series | np.ndarray, ppy: int | None = None, index=None) -> float:
+def annualized_sharpe(rets: pd.Series | np.ndarray, ppy: int | None = None, index=None,
+                      additive: bool = False) -> float:
     """Annualized Sharpe ratio of per-bar simple returns.
 
     On intraday data (a session clock is set, see `set_annualization`) and
@@ -3684,9 +3689,11 @@ def annualized_sharpe(rets: pd.Series | np.ndarray, ppy: int | None = None, inde
     -- the returns are first compounded per session and annualized by the
     sessions a year: the ratio is then the same however a day is cut into
     bars (time, volume or tick bars). Otherwise, or when `ppy` is given, it
-    is the per-bar ratio annualized by sqrt(bars a year)."""
+    is the per-bar ratio annualized by sqrt(bars a year). `additive` returns
+    (P&L over a fixed capital, a one-unit benchmark, a residual of two
+    return streams) are summed per session, not compounded."""
     if ppy is None:
-        r, ppy = _per_session(rets, index)
+        r, ppy = _per_session(rets, index, additive)
     else:
         r = np.asarray(rets, dtype=float)
     r = r[~np.isnan(r)]
@@ -3696,10 +3703,11 @@ def annualized_sharpe(rets: pd.Series | np.ndarray, ppy: int | None = None, inde
     return float(r.mean() / sd * np.sqrt(ppy)) if sd > 0 else 0.0
 
 
-def annualized_vol(rets: pd.Series | np.ndarray, index=None) -> float:
+def annualized_vol(rets: pd.Series | np.ndarray, index=None, additive: bool = False) -> float:
     """Annualized volatility of per-bar simple returns, measured like
-    `annualized_sharpe` (session-compounded on intraday data)."""
-    r, per = _per_session(rets, index)
+    `annualized_sharpe` (session-compounded on intraday data; summed when
+    `additive`)."""
+    r, per = _per_session(rets, index, additive)
     r = r[~np.isnan(r)]
     return float(r.std(ddof=1) * np.sqrt(per)) if len(r) > 1 else 0.0
 
@@ -3739,7 +3747,7 @@ def max_drawdown(equity, start: float | None = None) -> float:
 
 
 def performance_stats(equity, trades: list, initial_equity: float, rets=None, pnls=None, bars_held=None,
-                      index=None, rets_index=None) -> dict:
+                      index=None, rets_index=None, additive: bool = False) -> dict:
     """Summary stats from an equity path. Accepts a numpy array or a Series;
     `rets`, `pnls` and `bars_held` may be passed to skip recomputation.
     `index` (the equity bars' stamps; a Series' own by default) lets the
@@ -3747,7 +3755,8 @@ def performance_stats(equity, trades: list, initial_equity: float, rets=None, pn
     `annualized_sharpe` measures an out-of-sample series, and the CAGR
     divide by the calendar time covered (`elapsed_years`). The Sharpe is of
     rets[1:], stamped index[1:] unless `rets_index` says otherwise (a window
-    whose `rets` lead with the bar before it, walkforward.window_backtest)."""
+    whose `rets` lead with the bar before it, walkforward.window_backtest).
+    `additive` rets (a fixed-capital run) are summed per session."""
     if index is None and isinstance(equity, pd.Series):
         index = equity.index
     eq = np.asarray(equity, dtype=float)
@@ -3766,7 +3775,7 @@ def performance_stats(equity, trades: list, initial_equity: float, rets=None, pn
     cagr = (final / initial_equity) ** (1 / n_years) - 1 if final > 0 else -1.0
     if rets_index is None and index is not None and len(index) > 1:
         rets_index = index[1:]
-    sharpe = annualized_sharpe(rets[1:], index=rets_index)
+    sharpe = annualized_sharpe(rets[1:], index=rets_index, additive=additive)
     max_dd = max_drawdown(eq)
     wins =pnls[pnls > 0].sum()
     losses = -pnls[pnls < 0].sum()

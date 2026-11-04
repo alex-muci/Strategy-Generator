@@ -48,7 +48,7 @@ from pipeline import (
     resolve_interval, load_real, eval_config, worker_pool, evaluate_slots, walk_forward_matrices,
     family_diagnostics, build_portfolios, finalist_stats, benchmark_stats, benchmark_returns, instrument_text,
     benchmark_curve, _costed, BENCH_BUY_HOLD, add_research_args, parse_instrument_map, instrument_of,
-    annualization_text,
+    annualization_text, window_sessions_note,
 )
 from portfolio import returns_frame
 from replay import save_run, replay_run, TARGETS as REPLAY_TARGETS
@@ -143,6 +143,9 @@ def main(argv=None) -> dict:
     set_annualization(cfg)   # before anything here annualizes (the pool re-sets it)
     set_hedge_share(cfg["hedge_share"])
     print(f"Data: {len(df)} bars, {df.index[0].date()} to {df.index[-1].date()}, {annualization_text(cfg)}")
+    note = window_sessions_note(df.index, args.train, args.test)
+    if note:
+        print(note)
     table = BARS_PER_YEAR.get(interval)
     if cfg.get("annualization") == "data" and args.bars_per_day is None and table \
             and not 0.75 <= cfg["periods_per_year"] / table <= 1.33:

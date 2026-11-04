@@ -261,6 +261,16 @@ observation too, so that they test the rule the run actually applies:
 
 The train/test windows, the lookbacks and `--vol-target-n` stay in bars:
 measuring in activity rather than clock time is what volume bars are for.
+Size them in sessions, though: every Sharpe is one observation per session,
+so on fine bars the default `--train 500 --test 125` is ~1.3 and ~0.3
+sessions of 1-minute bars, and the optimizer would rank parameters on the
+Sharpe of one or two numbers. The run prints a NOTE when a training window
+holds fewer than ~20 sessions or a test window fewer than ~5, with the
+window sizes that would.
+
+Returns that add up rather than compound -- the one-unit benchmark of a
+future or a spread, a fixed-capital run, the residual behind the information
+ratio -- are summed per session, not compounded.
 
 What the dashboard shows, in the order you need it:
 

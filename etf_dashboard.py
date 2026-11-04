@@ -75,6 +75,7 @@ from pipeline import (
     family_diagnostics, build_portfolios, finalist_stats, sizing_text,
     benchmark_returns, benchmark_curve, instrument_of, _costed, BENCH_ONE_UNIT,
     add_research_args, parse_instrument_map, costs_text, hedge_share_of, annualization_text,
+    window_sessions_note,
 )
 from portfolio import returns_frame
 from walkforward import grid_combos, warmup_bars
@@ -319,6 +320,9 @@ def research(args) -> dict:
     )
     set_annualization(cfg)          # this process annualizes too (the pool re-sets it per worker)
     print(f"  {annualization_text(cfg)}")
+    note = window_sessions_note(next(iter(data.values())).index, args.train, args.test)
+    if note:
+        print(f"  {note}")
     # an instrument the sizing cannot handle fails here, per asset, not in
     # every window of the pool; settings that run but look wrong are printed
     for a in args.assets:

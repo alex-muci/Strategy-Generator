@@ -584,5 +584,114 @@ class SessionCpcvPboTests(_KeepAnnualization):
         np.testing.assert_allclose(res[0]["oos_sharpe"], res[1]["oos_sharpe"], rtol=1e-9)
 
 
+# --------------------------------------------------------------------------
+# review fixes: windows of too few sessions, additive streams
+# --------------------------------------------------------------------------
+
+def _minute_bars(n_days=40, per_day=390):
+    """US-equity '1m' bars on a UTC clock."""
+    days = pd.bdate_range("2024-01-02", periods=n_days)
+    return pd.DatetimeIndex([d + pd.Timedelta(hours=14, minutes=30) + pd.Timedelta(minutes=m * 390 // per_day)
+                             for d in days for m in range(per_day)])
+
+
+class WindowSessionsNoteTests(_KeepAnnualization):
+    """--train / --test count bars, every Sharpe counts sessions: on fine
+    bars the default windows hold one or two sessions, and the optimizer
+    would rank parameters on noise without a word."""
+
+    def test_fine_bars_with_the_default_windows_get_a_note(self):
+        idx = _minute_bars()
+        S.set_annualization(S.infer_annualization(idx))
+        note = P.window_sessions_note(idx, 500, 125)
+        self.assertIsNotNone(note)
+        self.assertIn("~390 bars a session", note)
+        self.assertIn(f"--train {20 * 390}", note)            # ~20 sessions of 1m bars
+        self.assertIn(f"--test {5 * 390}", note)
+        self.assertIsNone(P.window_sessions_note(idx, 20 * 390, 5 * 390))
+        self.assertIsNotNone(P.window_sessions_note(idx, 20 * 390, 125), "a too short test window alone")
+
+    def test_hourly_bars_daily_bars_and_per_bar_statistics_get_none(self):
+        idx = equity_hourly()
+        S.set_annualization(S.infer_annualization(idx))
+        self.assertIsNone(P.window_sessions_note(idx, 500, 125))          # ~71 and ~18 sessions
+        self.assertIsNotNone(P.window_sessions_note(idx, 70, 125))        # 10 sessions of training
+        daily = pd.bdate_range("2015-01-01", periods=2000)
+        S.set_annualization(S.infer_annualization(daily))
+        self.assertIsNone(P.window_sessions_note(daily, 50, 10))         # per bar: a bar is a session
+        S.set_annualization(dict(periods_per_year=252 * 390))            # --annualization interval
+        self.assertIsNone(P.window_sessions_note(_minute_bars(), 500, 125))
+
+    def test_main_prints_it(self):
+        d = tempfile.mkdtemp()
+        try:
+            idx = _minute_bars(n_days=12)
+            df = synthetic_ohlc(n_bars=len(idx), seed=3, trend_vol=0.0008, range_vol=0.0005).set_axis(idx)
+            df.index.name = "Datetime"
+            csv = os.path.join(d, "m1.csv")
+            df.to_csv(csv)
+            log = io.StringIO()
+            with contextlib.redirect_stdout(log):
+                M.main(["--csv", csv, "--family", "quick", "--max-templates", "2", "--train", "1500",
+                        "--test", "500", "--n-boot", "20", "--jobs", "1", "--no-matrix", "--min-sharpe", "-5",
+                        "--out", d])
+            self.assertIn("NOTE: the data holds ~390 bars a session", log.getvalue())
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+class AdditiveSessionTests(_KeepAnnualization):
+    """P&L over a fixed capital (the one-unit benchmark of a future, a
+    fixed-capital backtest) and a residual of two return streams add up:
+    per session they are summed, as robustness.cpcv sums the trial returns,
+    never compounded."""
+
+    def setUp(self):
+        super().setUp()
+        idx = equity_hourly("2023-01-01", "2023-12-31")
+        S.set_annualization(S.infer_annualization(idx))
+        rng = np.random.default_rng(17)
+        self.r = pd.Series(rng.normal(0.002, 0.04, len(idx)), index=idx)   # large: compounding would show
+        starts = S.session_starts(idx)
+        self.sums = np.add.reduceat(self.r.to_numpy(), starts)
+        self.prods = np.multiply.reduceat(1 + self.r.to_numpy(), starts) - 1
+
+    def test_sharpe_and_vol_sum_additive_returns(self):
+        sp = S.sessions_per_year()
+        self.assertAlmostEqual(S.annualized_sharpe(self.r, additive=True),
+                               self.sums.mean() / self.sums.std(ddof=1) * np.sqrt(sp), places=12)
+        self.assertAlmostEqual(S.annualized_vol(self.r, additive=True), self.sums.std(ddof=1) * np.sqrt(sp),
+                               places=12)
+        self.assertAlmostEqual(S.annualized_sharpe(self.r),
+                               self.prods.mean() / self.prods.std(ddof=1) * np.sqrt(sp), places=12)
+        self.assertNotAlmostEqual(S.annualized_sharpe(self.r, additive=True), S.annualized_sharpe(self.r), places=3)
+        np.testing.assert_allclose(S.session_returns(self.r, additive=True), self.sums, rtol=1e-12)
+
+    def test_the_one_unit_benchmark_and_the_information_ratio_are_summed(self):
+        a = P.curve_stats(self.r, additive=True)
+        self.assertAlmostEqual(a["sharpe"], S.annualized_sharpe(self.r, additive=True), places=12)
+        self.assertAlmostEqual(P.curve_stats(self.r)["sharpe"], S.annualized_sharpe(self.r), places=12)
+        x = self.r.shift(1).fillna(0.0)
+        y = 0.5 * x + self.r * 0.3
+        ir = P.against_benchmark(y, x)
+        beta = ir["beta"]
+        self.assertAlmostEqual(ir["info_ratio"], S.annualized_sharpe(y - beta * x, additive=True), places=12)
+
+    def test_a_fixed_capital_backtest_sums_its_returns(self):
+        idx = self.r.index
+        df = synthetic_ohlc(n_bars=len(idx), seed=5).set_axis(idx)
+        res = S.backtest(df, S.StrategyTemplate("t", n_entry=40), fixed_capital=True)
+        self.assertGreater(len(res["trades"]), 0)
+        self.assertAlmostEqual(res["stats"]["sharpe"],
+                               S.annualized_sharpe(res["returns"].iloc[1:], additive=True), places=12)
+
+    def test_daily_data_is_unchanged(self):
+        idx = pd.bdate_range("2015-01-01", periods=len(self.r))
+        r = pd.Series(self.r.to_numpy(), index=idx)
+        S.set_annualization(dict(periods_per_year=252))
+        self.assertEqual(S.annualized_sharpe(r, additive=True), S.annualized_sharpe(r))
+        self.assertEqual(S.annualized_vol(r, additive=True), S.annualized_vol(r))
+
+
 if __name__ == "__main__":
     unittest.main()
