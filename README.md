@@ -56,7 +56,8 @@ python main.py --csv mgc_backadj.csv --train 750 --test 250 --anchored --selecti
 python main.py --csv brent_backadj.csv --point-value 1000 --margin-per-unit 6000 --cost-per-unit 15 --max-leverage 0.5 --vol-target 0.15   # an outright Brent future from a back-adjusted file, in fractional lots (see the warning below)
 python main.py --csv brent_z25z26.csv --point-value 1000 --margin-per-unit 3000 --cost-per-unit 15 --roll-cost-per-unit 30 --max-leverage 0.5   # a futures spread from a file (prices through zero, a Roll column; see Futures and spreads)
 python main.py --csv brent_z25z26.csv --instrument-map brent_z25z26=1000,15,3000,30 --max-leverage 0.5   # the same instrument, named by the file's stem (the dashboard's syntax)
-python main.py --csv es_1h_backadj.csv --interval 1h --bars-per-day 23 --point-value 5 --margin-per-unit 2500 --cost-per-unit 1.25 --max-leverage 0.5   # hourly bars of a ~23 h future (micro S&P): 23 bars a day, not the 7 of a US equity session
+python main.py --csv es_1h_backadj.csv --interval 1h --point-value 5 --margin-per-unit 2500 --cost-per-unit 1.25 --max-leverage 0.5   # hourly bars of a ~23 h future (micro S&P): the bars a year are read off the file (see Annualization)
+python main.py --csv es_volume_bars.csv --point-value 5 --margin-per-unit 2500 --cost-per-unit 1.25 --max-leverage 0.5   # volume (or tick, dollar) bars: no interval needed, the Sharpe is compounded per session
 python main.py --trend-prob 0.8 --trend-drift 0.002  # synthetic data with a KNOWN trend edge
 ```
 
@@ -194,12 +195,82 @@ daily bar counts as closed 15 minutes after the 16:00 New York bell
 (`live.SESSION_CLOSE`); any run from then until the next open sees the same
 bars, so the European morning works as well.
 
-Add `--interval 1h` to both phases for hourly bars; every annualized statistic
-follows the bar frequency (`strategy.BARS_PER_YEAR`). Its intraday counts are a
-US equity session's (6.5 h: seven `1h` bars a day). A future trading about 23
-hours a day has 23 of them: give research `--bars-per-day 23` (annualized at
-252 x 23 bars a year; the signals phase reads it back from `portfolio.json`).
-At 7 a day its Sharpe ratios would read sqrt(23/7), about 1.8 times too low.
+Add `--interval 1h` to both phases for hourly bars (it is what Yahoo is asked
+for). Every annualized statistic follows the bars the research actually loaded,
+whatever their session (see Annualization below); the signals phase reads the
+annualization back from `portfolio.json`.
+
+### Annualization
+
+The annualization is read off the data's own timestamps
+(`strategy.infer_annualization`, `--annualization data`, the default), not off
+`--interval`: an interval cannot describe bars sampled on activity (volume,
+tick, dollar bars: a different count every day) nor a session the table does
+not know (a ~23 h future, 24/7 crypto).
+
+* **Bars a year** -- how many bars a calendar year of the data holds (the
+  median over the full calendar years covered, so a hole in the data does not
+  shrink it). It turns a per-bar quantity into an annual one and back: the vol
+  target's per-bar size and the forecast scaling. SPY daily gives 252, daily
+  crypto 365, a 23 h future's hourly bars ~23 x 252.
+* **Calendar years** -- a span of bars is measured by its stamps (first to
+  last, plus the last bar's share; `strategy.elapsed_years`), not as bars /
+  bars a year: every CAGR, each walk-forward window's annualized return (so
+  Pardo's walk-forward efficiency and pass), the years of OOS history the
+  Minimum Backtest Length is compared with. Volume bars are denser in a busy
+  market: counted in bars, a busy window would look like more years than it
+  covers and its annualized return would shrink, biasing the WFE against
+  whichever of the IS and OOS windows fell in the busier regime.
+* **Sessions** -- on intraday bars (more than 1.5 a session) the **Sharpe
+  ratio and the volatility are measured on returns compounded per session**
+  and annualized by the sessions a year (252 for an equity or a future, 365
+  for crypto). A busy day of 40 volume bars and a quiet one of 5 then count
+  once each, and intraday autocorrelation, which the per-bar sqrt(N) rule
+  ignores, is inside the daily return: the same days cut into 3, 50 or a
+  varying number of bars give the same Sharpe. This holds for the in-sample
+  Sharpe the optimizer ranks on too, so the OOS/IS ratios compare like with
+  like. A session runs between two cuts placed where no session trades: of
+  every time of day, the cut that leaves the fewest sessions (the overnight
+  gap of an equity, the daily break of a future, also when daylight saving
+  moves it on a UTC clock; the weekend joins Sunday evening to Monday).
+  Daily and coarser bars are their own sessions: their statistics are the
+  per-bar ones they always were.
+
+The run prints and saves what it found (`periods_per_year`,
+`sessions_per_year`, `session_cut_minutes` in the config). `--bars-per-day N`
+still forces 252 x N bars a year (intraday intervals only), and
+`--annualization interval` goes back to the `--interval` table
+(`strategy.BARS_PER_YEAR`, a US equity session: seven `1h` bars a day) with
+per-bar statistics and spans counted as bars / bars a year. The synthetic
+series is annualized that way (252 a year), whatever its calendar says.
+On intraday bars the robustness statistics take the session as their
+observation too, so that they test the rule the run actually applies:
+
+* the **Deflated Sharpe ratio** counts sessions as its T, takes the skew and
+  kurtosis of the session returns, and deflates by the trials' Sharpe
+  variance in per-session units (effective N clusters the slots on their
+  session returns). Per bar, hundreds of thousands of "observations" with
+  fat per-bar tails would overstate its confidence;
+* the **bootstrap p-value** and **White's Reality Check** resample blocks of
+  sessions (20 on average), keeping each day's dependence whole;
+* **CPCV** cuts its groups on session starts and scores both the training
+  selection and the test paths on session Sharpes (P&L summed per session:
+  the trial returns are on fixed capital);
+* **PBO** (CSCV) cuts its blocks on whole sessions and ranks session
+  Sharpes, the measure the walk-forward selects on.
+
+The train/test windows, the lookbacks and `--vol-target-n` stay in bars:
+measuring in activity rather than clock time is what volume bars are for.
+Size them in sessions, though: every Sharpe is one observation per session,
+so on fine bars the default `--train 500 --test 125` is ~1.3 and ~0.3
+sessions of 1-minute bars, and the optimizer would rank parameters on the
+Sharpe of one or two numbers. The run prints a NOTE when a training window
+holds fewer than ~20 sessions or a test window fewer than ~5, with the
+window sizes that would.
+
+Returns that add up rather than compound -- the one-unit benchmark of a
+future or a spread, a fixed-capital run, the residual behind the information
+ratio -- are summed per session, not compounded.
 
 What the dashboard shows, in the order you need it:
 

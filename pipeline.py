@@ -36,12 +36,16 @@ from robustness import (
 )
 from strategy import (
     annualized_sharpe, max_drawdown, periods_per_year, set_periods_per_year, compound,
-    periods_per_year_for_interval, SIDES, HEDGE_SHARE, HEDGE_SHARES, set_hedge_share,
+    periods_per_year_for_interval, infer_annualization, annualization_of, set_annualization,
+    sessions_per_year, session_cut_minutes, current_annualization, session_starts, session_frame, observations_per_year,
+    elapsed_years,
+    SIDES, HEDGE_SHARE, HEDGE_SHARES, set_hedge_share,
 )
 from walkforward import matrix_cells, matrix_row, matrix_frame
 
 
 SYNTHETIC_INTERVAL = "1d"   # data.synthetic_ohlc is always business-daily
+ANNUALIZATION_MODES = ("data", "interval")
 
 
 # --------------------------------------------------------------------------
@@ -65,9 +69,14 @@ def add_research_args(p: argparse.ArgumentParser, *, start: str) -> argparse.Arg
                         "'both' for quick and default). On an asset with a drift, e.g. --sides long_only")
     p.add_argument("--start", default=start)
     p.add_argument("--bars-per-day", type=float, default=None,
-                   help="intraday bars per trading day, replacing the US-equity session --interval assumes "
-                        "(7 '1h' bars): e.g. 23 for '1h' bars of a future on a ~23 h session. Sets the "
-                        "annualization (252 x this bars a year); intraday intervals only")
+                   help="intraday bars per trading day, replacing the bars a year read off the data (or, with "
+                        "--annualization interval, the US-equity session: 7 '1h' bars): e.g. 23 for '1h' bars "
+                        "of a future on a ~23 h session. Sets 252 x this bars a year; intraday intervals only")
+    p.add_argument("--annualization", default="data", choices=ANNUALIZATION_MODES,
+                   help="'data' (default): read the bars a year off the data's timestamps, and on intraday "
+                        "bars measure the Sharpe ratio and volatility on returns compounded per session "
+                        "(independent of the interval: works for volume or tick bars); 'interval': the "
+                        "--interval table with per-bar statistics. The synthetic series is daily either way")
     p.add_argument("--bars", type=int, default=3000, help="synthetic bars (per asset)")
     p.add_argument("--train", type=int, default=500, help="training window (bars)")
     p.add_argument("--test", type=int, default=125, help="test window (bars)")
@@ -180,19 +189,95 @@ def load_real(ticker: str, start: str, interval: str = "1d", now=None,
 
 
 def cscv_partitions_for(T: int) -> int:
-    """CSCV blocks: 16 needs >= 100 bars per block to be meaningful."""
+    """CSCV blocks: 16 needs >= 100 observations (bars, or sessions on
+    intraday data: `n_observations`) per block to be meaningful."""
     return 16 if T >= 1600 else 8
 
 
-def eval_config(args, interval: str) -> dict:
+def n_observations(index) -> int:
+    """Observations the statistics of bars stamped `index` are made of:
+    sessions on intraday data (strategy.session_starts), else bars."""
+    starts = session_starts(index)
+    return len(index) if starts is None else len(starts)
+
+
+def annualization_for(interval: str, bars_per_day: float | None = None, index=None, mode: str = "data") -> dict:
+    """How a run annualizes (`strategy.set_annualization`).
+
+    mode 'data' (the default) reads it off `index`, the bars' stamps
+    (`strategy.infer_annualization`): the bars a year the data actually
+    holds, and on intraday bars a session clock, so that the Sharpe ratio
+    and volatility are compounded per session -- independent of the
+    interval, and usable for bars that have none (volume, tick bars).
+    `bars_per_day`, when given, still sets the bars a year. Mode 'interval',
+    no index (the synthetic series, a config built before the data is
+    loaded) or an index too short to measure: the interval's table and
+    per-bar statistics, as before the data was asked."""
+    table = periods_per_year_for_interval(interval, bars_per_day)     # validates both
+    out = dict(periods_per_year=table, sessions_per_year=None, session_cut_minutes=0, annualization="interval")
+    if mode not in ANNUALIZATION_MODES:
+        raise ValueError(f"unknown annualization {mode!r}, expected one of {ANNUALIZATION_MODES}")
+    inferred = infer_annualization(index) if mode == "data" and index is not None else None
+    if inferred is None:
+        return out
+    if bars_per_day is not None:
+        inferred["periods_per_year"] = table
+    return inferred | dict(annualization="data")
+
+
+MIN_WINDOW_SESSIONS = 20      # a training window's Sharpe on fewer sessions than this is mostly noise
+MIN_TEST_SESSIONS = 5
+
+
+def window_sessions_note(index, train_bars: int, test_bars: int) -> str | None:
+    """A NOTE when, on intraday bars, the walk-forward windows hold too few
+    sessions for the session Sharpe they are scored on (None otherwise).
+    Every Sharpe is one observation per session, but --train / --test count
+    bars: on 1-minute bars the default 500-bar training window is ~1.3
+    sessions, and the parameters would be ranked on the Sharpe of 1 or 2
+    numbers -- noise, and silent."""
+    starts = session_starts(index)
+    if starts is None or len(starts) == 0:
+        return None
+    per_session = len(index) / len(starts)
+    train_s, test_s = train_bars / per_session, test_bars / per_session
+    if train_s >= MIN_WINDOW_SESSIONS and test_s >= MIN_TEST_SESSIONS:
+        return None
+    need_train = int(np.ceil(MIN_WINDOW_SESSIONS * per_session))
+    need_test = int(np.ceil(MIN_TEST_SESSIONS * per_session))
+    return (f"NOTE: the data holds ~{per_session:.0f} bars a session, so a {train_bars}-bar training window is "
+            f"~{train_s:.1f} sessions and a {test_bars}-bar test window ~{test_s:.1f}: every Sharpe is measured "
+            f"on session returns, and one of so few sessions is mostly noise (the optimizer ranks parameters on "
+            f"it). Use at least --train {max(need_train, train_bars)} --test {max(need_test, test_bars)} "
+            f"(~{MIN_WINDOW_SESSIONS} and ~{MIN_TEST_SESSIONS} sessions), coarser bars, or "
+            f"--annualization interval for per-bar statistics")
+
+
+def annualization_text(c: dict | None = None) -> str:
+    """One phrase on how a run annualizes, for a report (default: how this
+    process currently does)."""
+    if c is None:
+        c = current_annualization()
+    a = annualization_of(c)
+    src = " (read off the data)" if c.get("annualization") == "data" else ""
+    text = f"annualized at {a['periods_per_year']} bars/year{src}"
+    if a["sessions_per_year"] is not None:
+        h, m = divmod(a["session_cut_minutes"], 60)
+        text += (f"; Sharpe and volatility on session-compounded returns, {a['sessions_per_year']} sessions/year "
+                 f"(sessions cut at {h:02d}:{m:02d})")
+    return text
+
+
+def eval_config(args, interval: str, index=None) -> dict:
     """The evaluation settings of a research run, as a plain (picklable,
     JSON-able) dict read off an argparse namespace. `cost_bps` is the
     run-wide one as given: `instrument_of` zeroes it for an instrument with a
-    margin."""
+    margin. `index` is the stamps of the bars the run trades: with it the
+    annualization is read off the data (`annualization_for`)."""
     bars_per_day = getattr(args, "bars_per_day", None)
     return dict(
         interval=interval, bars_per_day=bars_per_day,
-        periods_per_year=periods_per_year_for_interval(interval, bars_per_day),
+        **annualization_for(interval, bars_per_day, index, getattr(args, "annualization", "data")),
         train_bars=args.train, test_bars=args.test, anchored=args.anchored,
         metric=args.metric, selection=args.selection, wide_grid=args.wide_grid,
         cost_bps=args.cost_bps, risk_pct=args.risk_pct, max_leverage=args.max_leverage,
@@ -293,7 +378,7 @@ def init_worker(data: dict, cfg: dict) -> None:
     _DATA, _CFG = data, cfg
     # a fresh process re-imports strategy at the daily default; without this every
     # annualized number computed in the pool would be wrong for intraday bars
-    set_periods_per_year(cfg["periods_per_year"])
+    set_annualization(cfg)
     set_hedge_share(hedge_share_of(cfg))
 
 
@@ -325,7 +410,7 @@ def evaluate_slot(job):
         df, tpl, param_grid_for(tpl, wide=c["wide_grid"]),
         train_bars=c["train_bars"], test_bars=c["test_bars"],
         cpcv_groups=c["cpcv_groups"], cpcv_k=c["cpcv_k"],
-        cscv_partitions_n=cscv_partitions_for(len(df)), **_wfa_kwargs(c),
+        cscv_partitions_n=cscv_partitions_for(n_observations(df.index)), **_wfa_kwargs(c),
     )
     wfa["asset"] = asset
     return name, wfa
@@ -423,12 +508,17 @@ def family_diagnostics(results: dict, rets: pd.DataFrame, n_boot: int = 1000) ->
     n_trials = sum(r["n_trials"] for r in results.values())
     pbo = cscv_pbo(blocks=merge_block_stats([r["trial_blocks"] for r in results.values()]))
     # PBO over the slot-level OOS curves (the selection step's trials)
-    pbo_tpl = cscv_pbo(rets.to_numpy(), n_partitions=cscv_partitions_for(len(rets))) if rets.shape[1] > 1 else None
+    # on intraday bars the slot curves' statistics are of their session
+    # returns (strategy.session_frame), like every Sharpe of the run
+    srets = session_frame(rets)
+    pbo_tpl = (cscv_pbo(srets.to_numpy(), n_partitions=cscv_partitions_for(len(srets)),
+                        per_year=observations_per_year()) if rets.shape[1] > 1 else None)
     rc = reality_check(rets, n_boot=n_boot)
     oos_sharpes = rets.apply(annualized_sharpe)
     best = oos_sharpes.idxmax()
-    # raw DSR: every slot is an independent trial (very conservative)
-    var_sr_raw = float(oos_sharpes.var()) / periods_per_year() if rets.shape[1] > 1 else 0.0
+    # raw DSR: every slot is an independent trial (very conservative); the
+    # variance in per-observation units (per session on intraday data)
+    var_sr_raw = float(oos_sharpes.var()) / observations_per_year() if rets.shape[1] > 1 else 0.0
     dsr_raw = deflated_sharpe_ratio(rets[best], n_trials=rets.shape[1], var_sr_trials=var_sr_raw)
     # effective DSR: correlated slots collapsed into clusters
     eff = effective_n_trials(rets)
@@ -438,7 +528,7 @@ def family_diagnostics(results: dict, rets: pd.DataFrame, n_boot: int = 1000) ->
         reality_check=rc, oos_sharpes=oos_sharpes, n_eff=eff["n_eff"], var_sr_period=eff["var_sr_period"],
         best_template=best, dsr_best=dsr_best, dsr_raw=dsr_raw,
         min_btl_years=min_backtest_length(eff["n_eff"], max(float(oos_sharpes.max()), 1e-6)),
-        years_available=len(rets) / periods_per_year(),
+        years_available=elapsed_years(rets.index),
     )
 
 
@@ -491,14 +581,15 @@ def curve_stats(r: pd.Series, additive: bool = False) -> dict:
     n = len(r)
     if n < 2:
         return dict(sharpe=0.0, cagr=0.0, max_dd=0.0, n_bars=n)
+    years = max(elapsed_years(r.index), 1e-9)       # calendar years when read off the data
     if additive:
         v = np.concatenate([[1.0], eq.to_numpy(dtype=float)])
-        cagr = float((v[-1] - 1.0) * periods_per_year() / n)
+        cagr = float((v[-1] - 1.0) / years)
         max_dd = float((v - np.maximum.accumulate(v)).min())
     else:
-        cagr = float(eq.iloc[-1] ** (periods_per_year() / n) - 1) if eq.iloc[-1] > 0 else -1.0
+        cagr = float(eq.iloc[-1] ** (1.0 / years) - 1) if eq.iloc[-1] > 0 else -1.0
         max_dd = max_drawdown(eq, start=1.0)      # funded at 1 before the first bar
-    return dict(sharpe=annualized_sharpe(r), cagr=cagr, max_dd=max_dd, n_bars=n)
+    return dict(sharpe=annualized_sharpe(r, additive=additive), cagr=cagr, max_dd=max_dd, n_bars=n)
 
 
 def against_benchmark(r: pd.Series, bh: pd.Series) -> dict:
@@ -514,7 +605,10 @@ def against_benchmark(r: pd.Series, bh: pd.Series) -> dict:
     if len(y) < 3 or x.std(ddof=1) == 0 or y.std(ddof=1) == 0:
         return dict(beta=np.nan, corr=np.nan, info_ratio=np.nan)
     beta = float(np.cov(x, y, ddof=1)[0, 1] / x.var(ddof=1))
-    return dict(beta=beta, corr=float(np.corrcoef(x, y)[0, 1]), info_ratio=annualized_sharpe(y - beta * x))
+    return dict(beta=beta, corr=float(np.corrcoef(x, y)[0, 1]),
+                # a residual of two return streams is a difference, not a
+                # return: summed per session (intraday data), never compounded
+                info_ratio=annualized_sharpe(y - beta * x, index=r.index, additive=True))
 
 
 BENCH_BUY_HOLD = "buy and hold"

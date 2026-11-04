@@ -74,12 +74,14 @@ from pipeline import (
     resolve_interval, load_real, eval_config, worker_pool, evaluate_slots,
     family_diagnostics, build_portfolios, finalist_stats, sizing_text,
     benchmark_returns, benchmark_curve, instrument_of, _costed, BENCH_ONE_UNIT,
-    add_research_args, parse_instrument_map, costs_text, hedge_share_of,
+    add_research_args, parse_instrument_map, costs_text, hedge_share_of, annualization_text,
+    window_sessions_note,
 )
 from portfolio import returns_frame
 from walkforward import grid_combos, warmup_bars
 from strategy import (
-    StrategyTemplate, annualized_sharpe, max_drawdown, compound, set_periods_per_year, periods_per_year,
+    StrategyTemplate, annualized_sharpe, annualized_vol, max_drawdown, compound, set_annualization,
+    periods_per_year,
     periods_per_year_for_interval, SIDES, BARS_PER_YEAR, validate_instrument, instrument_warnings,
     typical_units, set_hedge_share, RESEARCH_EQUITY,
 )
@@ -254,9 +256,12 @@ def _history_bars_needed(spec: dict) -> int:
     return int(cfg["train_bars"] * 1.25) + max(400, warm + 50)
 
 
-def _start_for_bars(n_bars: int, interval: str) -> str:
-    """A start date comfortably older than `n_bars` bars ago."""
-    per_year = periods_per_year_for_interval(interval)
+def _start_for_bars(n_bars: int, interval: str, per_year: int | None = None) -> str:
+    """A start date comfortably older than `n_bars` bars ago. `per_year` is
+    the bars a year the research measured; the interval's table is the
+    fallback, and the sparser of the two wins (a longer history is safe)."""
+    table = periods_per_year_for_interval(interval)
+    per_year = table if per_year is None else min(table, int(per_year))
     years = n_bars / per_year * 1.6 + 0.5
     return (utcnow() - pd.Timedelta(days=365.25 * years)).strftime("%Y-%m-%d")
 
@@ -303,13 +308,21 @@ def research(args) -> dict:
             by_sides[key] = generate_templates(args.family, max_templates=args.max_templates, **overrides)
         return by_sides[key]
 
-    cfg = eval_config(args, args.interval) | dict(
+    # the annualization is read off the shared bars (pipeline.annualization_for);
+    # the synthetic series is daily by construction
+    shared_index = None if args.synthetic else next(iter(data.values())).index
+    cfg = eval_config(args, args.interval, index=shared_index) | dict(
         start=args.start, family=args.family, sides=args.sides,
         sides_map={a: list(s) for a, s in sides_map.items()}, portfolio_vol=args.portfolio_vol,
         instrument_map=instrument_map, asset_sources=sources,
         min_sharpe=args.min_sharpe, corr_ceiling=args.corr_ceiling,
         weighting=args.weighting, select_method=args.select_method,
     )
+    set_annualization(cfg)          # this process annualizes too (the pool re-sets it per worker)
+    print(f"  {annualization_text(cfg)}")
+    note = window_sessions_note(next(iter(data.values())).index, args.train, args.test)
+    if note:
+        print(f"  {note}")
     # an instrument the sizing cannot handle fails here, per asset, not in
     # every window of the pool; settings that run but look wrong are printed
     for a in args.assets:
@@ -396,7 +409,7 @@ def _risk_scale(nested: dict, target: float) -> tuple[float, float]:
             keep &= ~((r.index >= pd.Timestamp(s["period_start"]))
                       & (True if nxt is None else r.index < pd.Timestamp(nxt["period_start"])))
     r = r[keep]
-    vol = float(r.std() * np.sqrt(periods_per_year())) if len(r) > 2 else 0.0
+    vol = annualized_vol(r) if len(r) > 2 else 0.0      # session-compounded on intraday bars
     if target <= 0 or vol <= 0:
         return 1.0, vol
     return float(np.clip(target / vol, *RISK_SCALE_BOUNDS)), vol
@@ -650,7 +663,7 @@ def signals(args) -> dict:
                          f"({spec.get('version')} != {SPEC_VERSION}); re-run research")
 
     cfg = spec["config"]
-    set_periods_per_year(cfg["periods_per_year"])
+    set_annualization(cfg)
     set_hedge_share(hedge_share_of(cfg))
     interval = args.interval if args.interval != "1d" or cfg["interval"] == "1d" else cfg["interval"]
     if interval != cfg["interval"]:
@@ -659,7 +672,7 @@ def signals(args) -> dict:
     now = pd.Timestamp(args.now) if args.now else None
 
     need = _history_bars_needed(spec)
-    start = _start_for_bars(need, interval)
+    start = _start_for_bars(need, interval, cfg["periods_per_year"])
     if cfg.get("anchored"):
         # an anchored walk-forward fits every window on ALL the history since
         # the research's --start; a refit on a shorter tail would choose params

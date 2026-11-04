@@ -34,7 +34,8 @@ from scipy.stats import norm, skew as _skew, kurtosis as _kurtosis
 from scipy.cluster.hierarchy import linkage, leaves_list
 from scipy.spatial.distance import squareform
 
-from strategy import backtest, periods_per_year, compound, RESEARCH_EQUITY
+from strategy import (backtest, periods_per_year, compound, RESEARCH_EQUITY, session_starts, aggregate_sessions,
+                      session_frame, observations, observations_per_year)
 from walkforward import plateau_pick, walk_forward, grid_combos, score_stats, warmup_bars
 
 EULER_GAMMA = 0.5772156649015329
@@ -136,15 +137,19 @@ def evaluate_template(
     combos, idx = grid_combos(param_grid)
     metric = wfa_kwargs.get("metric", "sharpe")
     R, E, P, X = trial_returns(df, tpl, combos, with_trades=True)
+    # on intraday bars every Sharpe below is of session returns, as the
+    # walk-forward's (None: per bar)
+    sessions = session_starts(df.index)
     # CPCV stresses the SAME selection rule the walk-forward used
     cp = cpcv(R, E, idx, n_groups=cpcv_groups, k_test=cpcv_k,
               embargo_bars=cpcv_embargo(tpl, combos), selection=selection,
-              metric=metric, min_trades=wfa_kwargs.get("min_trades", 5), P=P, X=X, additive=True)
+              metric=metric, min_trades=wfa_kwargs.get("min_trades", 5), P=P, X=X, additive=True,
+              sessions=sessions)
     wfa["cpcv"] = {k: v for k, v in cp.items()
                    if k in ("path_sharpes", "path_max_dd", "n_paths", "sharpe_mean",
                             "sharpe_std", "sharpe_min", "prob_sharpe_negative",
                             "frac_flat_splits")}
-    wfa["trial_blocks"] = cscv_block_stats(R, cscv_partitions_n)
+    wfa["trial_blocks"] = cscv_block_stats(R, cscv_partitions_n, sessions=sessions, additive=True)
     wfa["n_trials"] = R.shape[1]
     return wfa
 
@@ -155,17 +160,29 @@ def _as_cols(mask: np.ndarray, N: int) -> np.ndarray:
     return np.broadcast_to(mask[:, None], (mask.shape[0], N)) if mask.ndim == 1 else mask
 
 
-def _sharpe_cols(R: np.ndarray, mask: np.ndarray) -> np.ndarray:
+def _sharpe_cols(R: np.ndarray, mask: np.ndarray, sessions: np.ndarray | None = None,
+                 additive: bool = False) -> np.ndarray:
     """Annualized Sharpe of each column of R over the rows selected by mask
-    (one mask for all columns, T, or one per column, T x N)."""
+    (one mask for all columns, T, or one per column, T x N).
+
+    `sessions` (strategy.session_starts; intraday data): the Sharpe of the
+    selected rows aggregated per session -- summed when `additive`, else
+    compounded; a session counts when any of its rows is selected -- and
+    annualized by the sessions a year, as `strategy.annualized_sharpe`
+    measures a series. None: per row, by the bars a year."""
     M = _as_cols(mask, R.shape[1])
+    per = periods_per_year()
+    if sessions is not None:
+        R = aggregate_sessions(np.where(M, R, 0.0), sessions, additive)
+        M = np.add.reduceat(M.astype(np.int64), sessions, axis=0) > 0
+        per = observations_per_year()
     n = M.sum(axis=0)
     X = np.where(M, R, 0.0)
     with np.errstate(invalid="ignore", divide="ignore"):
         mean = X.sum(axis=0) / n
         var = (np.where(M, R - mean, 0.0) ** 2).sum(axis=0) / (n - 1)
         sd = np.sqrt(var)
-        sr = np.where((n >= 2) & (sd > 0), mean / sd * np.sqrt(periods_per_year()), 0.0)
+        sr = np.where((n >= 2) & (sd > 0), mean / sd * np.sqrt(per), 0.0)
     return sr
 
 
@@ -251,17 +268,17 @@ def _drawdown_cols(eq: np.ndarray, additive: bool) -> np.ndarray:
 
 
 def _score_cols(R: np.ndarray, E, P, mask: np.ndarray, metric: str, min_trades: int,
-                additive: bool = False, X=None) -> np.ndarray:
+                additive: bool = False, X=None, sessions: np.ndarray | None = None) -> np.ndarray:
     """Walk-forward objective (walkforward.score_stats, incl. its min-trades
     rule) of each column of R over the rows selected by mask (T, or T x N for
     one mask per column). The rows are treated as one concatenated track
     record (summed when `additive`, else compounded). Without E every column
     counts as having traded enough; profit_factor needs P (trade P&L on exit
-    bars)."""
+    bars). `sessions`: the Sharpe is of session aggregates (`_sharpe_cols`)."""
     N = R.shape[1]
     M = _as_cols(mask, N)
     n_tr = np.where(M, E, 0).sum(axis=0) if E is not None else np.full(N, max(min_trades, 0))
-    sharpe = _sharpe_cols(R, M)
+    sharpe = _sharpe_cols(R, M, sessions, additive)
     # rows left out earn 0: the concatenated track record's total and drawdown
     Xr = np.where(M, R, 0.0)
     eq = np.vstack([np.ones((1, N)), _equity_cols(Xr, additive)])
@@ -286,6 +303,21 @@ def _score_cols(R: np.ndarray, E, P, mask: np.ndarray, metric: str, min_trades: 
 # --------------------------------------------------------------------------
 # Combinatorial Purged Cross-Validation  (AFML 12.3 - 12.4)
 # --------------------------------------------------------------------------
+
+def _snap_bounds(bounds: np.ndarray, sessions: np.ndarray | None) -> np.ndarray:
+    """Group boundaries moved to the nearest session start, so that no
+    session is split between two groups; unchanged without sessions, or
+    when there are too few sessions to keep every group non-empty."""
+    if sessions is None or len(bounds) <= 2 or len(sessions) < 2:
+        return bounds
+    s = np.asarray(sessions)
+    inner = bounds[1:-1]
+    k = np.clip(np.searchsorted(s, inner), 1, len(s) - 1)
+    left, right = s[k - 1], s[k]
+    snapped = np.where(inner - left <= right - inner, left, right)
+    out = np.concatenate([[bounds[0]], snapped, [bounds[-1]]]).astype(int)
+    return out if np.all(np.diff(out) > 0) else bounds
+
 
 def cpcv_paths(n_groups: int, k_test: int):
     """Map (combination index, test group) -> path id, following AFML 12.4:
@@ -317,6 +349,7 @@ def cpcv(
     P: np.ndarray | None = None,
     X: np.ndarray | None = None,
     additive: bool = False,
+    sessions: np.ndarray | None = None,
 ) -> dict:
     """Combinatorial purged CV of the parameter selection.
 
@@ -329,6 +362,10 @@ def cpcv(
         per trial, until the trade open at its end has closed (train_masks)
     additive : R is P&L over a fixed capital (`trial_returns`): track records
         and paths are summed, not compounded
+    sessions : row positions where a session begins (strategy.session_starts,
+        intraday data): the groups are cut on session starts, so that each
+        holds whole sessions, and every Sharpe (training scores, paths) is
+        of per-session aggregates, as the walk-forward measures it
 
     The T bars are cut into n_groups contiguous groups. For every choice
     of k_test groups as the test set, the remaining groups (minus an
@@ -341,7 +378,7 @@ def cpcv(
     trades in training stays flat on its test groups (chosen trial -1).
     """
     T, N = R.shape
-    bounds = np.linspace(0, T, n_groups + 1).astype(int)
+    bounds = _snap_bounds(np.linspace(0, T, n_groups + 1).astype(int), sessions)
     groups = [np.arange(bounds[g], bounds[g + 1]) for g in range(n_groups)]
     combos, assign, n_paths = cpcv_paths(n_groups, k_test)
 
@@ -350,7 +387,7 @@ def cpcv(
 
     for c, test_groups in enumerate(combos):
         train_mask = train_masks(T, bounds, test_groups, embargo_bars, purge_bars, E, X)
-        scores = _score_cols(R, E, P, train_mask, metric, min_trades, additive, X=X)
+        scores = _score_cols(R, E, P, train_mask, metric, min_trades, additive, X=X, sessions=sessions)
         if not np.isfinite(scores).any():
             # nothing traded enough in training: flat, as walk_forward does
             chosen[c] = -1
@@ -367,7 +404,8 @@ def cpcv(
             path_returns[groups[g], p] = R[groups[g], best]
 
     assert not np.isnan(path_returns).any(), "CPCV paths not fully covered"
-    sr = np.array([_sharpe_cols(path_returns[:, [p]], np.ones(T, bool))[0] for p in range(n_paths)])
+    sr = np.array([_sharpe_cols(path_returns[:, [p]], np.ones(T, bool), sessions, additive)[0]
+                   for p in range(n_paths)])
     max_dd = _drawdown_cols(np.vstack([np.ones((1, n_paths)), _equity_cols(path_returns, additive)]), additive)
     return dict(
         path_returns=path_returns,
@@ -395,17 +433,27 @@ def cscv_partitions(T: int, n_partitions: int = 16) -> int:
     return n_partitions if n_partitions % 2 == 0 else n_partitions + 1
 
 
-def cscv_block_stats(R: np.ndarray, n_partitions: int = 16) -> dict:
+def cscv_block_stats(R: np.ndarray, n_partitions: int = 16, sessions: np.ndarray | None = None,
+                     additive: bool = False) -> dict:
     """Per-block sufficient statistics of a trials matrix: with these the
     Sharpe of ANY union of blocks is O(N), and a family of thousands of
-    templates can be pooled without ever holding all their returns."""
+    templates can be pooled without ever holding all their returns.
+
+    `sessions` (strategy.session_starts; intraday data): the rows are first
+    aggregated per session (summed when `additive`, else compounded) and the
+    blocks cut on whole sessions, so the Sharpes ranked are the session ones
+    the walk-forward selects on. `per_year` (in the result) annualizes them."""
+    per_year = periods_per_year()
+    if sessions is not None:
+        R = aggregate_sessions(R, sessions, additive)
+        per_year = observations_per_year()
     T, N = R.shape
     S = cscv_partitions(T, n_partitions)
     bounds = np.linspace(0, T, S + 1).astype(int)
     sums = np.stack([R[bounds[b]:bounds[b + 1]].sum(axis=0) for b in range(S)])
     sumsq = np.stack([(R[bounds[b]:bounds[b + 1]] ** 2).sum(axis=0) for b in range(S)])
     counts = np.array([bounds[b + 1] - bounds[b] for b in range(S)], dtype=float)
-    return dict(sums=sums, sumsq=sumsq, counts=counts)
+    return dict(sums=sums, sumsq=sumsq, counts=counts, per_year=int(per_year))
 
 
 def merge_block_stats(parts: list) -> dict:
@@ -414,15 +462,19 @@ def merge_block_stats(parts: list) -> dict:
         sums=np.concatenate([p["sums"] for p in parts], axis=1),
         sumsq=np.concatenate([p["sumsq"] for p in parts], axis=1),
         counts=parts[0]["counts"],
+        per_year=parts[0].get("per_year"),
     )
 
 
 def cscv_pbo(R: np.ndarray | None = None, n_partitions: int = 16, max_combinations: int = 20000,
-             seed: int = 0, blocks: dict | None = None) -> dict:
+             seed: int = 0, blocks: dict | None = None, per_year: int | None = None) -> dict:
     """Combinatorially Symmetric Cross-Validation.
 
     R : T x N per-bar returns of N trials (strategy variants), or pass
-    `blocks` from cscv_block_stats / merge_block_stats instead.
+    `blocks` from cscv_block_stats / merge_block_stats instead. `per_year`
+    annualizes the Sharpes (default: the blocks' own, else the bars a year;
+    pass the sessions a year for an R of session returns). PBO itself is
+    rank-based: only the reported Sharpes depend on it.
     The rows are split into n_partitions contiguous blocks; for every
     way of choosing half the blocks as in-sample (IS) the best IS trial
     is located and its RANK among all trials out-of-sample (OOS) is
@@ -436,6 +488,7 @@ def cscv_pbo(R: np.ndarray | None = None, n_partitions: int = 16, max_combinatio
         blocks = cscv_block_stats(R, n_partitions)
     sums, sumsq, counts = blocks["sums"], blocks["sumsq"], blocks["counts"]
     S, N = sums.shape
+    per = per_year or blocks.get("per_year") or periods_per_year()
 
     def sharpe_of(blk):
         n = counts[list(blk)].sum()
@@ -445,7 +498,7 @@ def cscv_pbo(R: np.ndarray | None = None, n_partitions: int = 16, max_combinatio
         var = np.maximum(q / n - mean ** 2, 0) * n / max(n - 1, 1)
         sd = np.sqrt(var)
         with np.errstate(invalid="ignore", divide="ignore"):
-            return np.where(sd > 0, mean / sd * np.sqrt(periods_per_year()), 0.0)
+            return np.where(sd > 0, mean / sd * np.sqrt(per), 0.0)
 
     all_combos = list(combinations(range(S), S // 2))
     if len(all_combos) > max_combinations:
@@ -517,10 +570,16 @@ def deflated_sharpe_ratio(returns, n_trials: int, var_sr_trials: float, ppy: int
     """Deflated Sharpe Ratio of a strategy that was the best of `n_trials`
     attempts whose per-period Sharpes had variance `var_sr_trials`.
     Returns the DSR probability, the deflating benchmark SR* (annualized
-    for readability) and the PSR against zero."""
+    for readability) and the PSR against zero.
+
+    The observations are the stream's sessions on intraday data
+    (strategy.observations: session-compounded returns, their count as T,
+    their skew and kurtosis), so `var_sr_trials` must be per session there
+    (`observations_per_year`). With `ppy` given: the rows as they are."""
+    if ppy is None:
+        returns, ppy = observations(returns)
     sr, g3, g4, T = _moments(returns)
     sr_star = expected_max_sharpe(n_trials, var_sr_trials)
-    ppy = periods_per_year() if ppy is None else ppy
     return dict(
         sharpe_annual=sr * np.sqrt(ppy),
         sr_star_annual=sr_star * np.sqrt(ppy),
@@ -544,10 +603,12 @@ def effective_n_trials(returns_frame: pd.DataFrame, max_clusters: int = 30) -> d
     clusters maximizes the silhouette score), each cluster is collapsed
     to its equal-weight average, and the DSR is then computed with
     N = number of clusters and the variance of the CLUSTER Sharpes.
-    Returns n_eff, cluster labels and the per-period variance of cluster Sharpes."""
+    Returns n_eff, cluster labels and the per-period variance of cluster Sharpes.
+    On intraday data the periods are sessions (strategy.session_frame), the
+    units `deflated_sharpe_ratio` measures the stream in."""
     from sklearn.metrics import silhouette_score
 
-    X = returns_frame.fillna(0.0)
+    X = session_frame(returns_frame.fillna(0.0))
     N = X.shape[1]
     if N < 3:
         sr = X.apply(lambda c: c.mean() / c.std(ddof=1) if c.std(ddof=1) > 0 else 0.0)
@@ -607,8 +668,12 @@ def bootstrap_sharpe_pvalue(returns, n_boot: int = 2000, mean_block: float = 20.
     The observed returns are demeaned, resampled with a stationary block
     bootstrap (keeps autocorrelation and volatility clustering), and the
     Sharpe of each resample compared with the observed one.
-    financial-hacker's rule of thumb: p < 5 % good, p > 15 % don't trust it."""
-    r = np.asarray(returns, dtype=float)
+    financial-hacker's rule of thumb: p < 5 % good, p > 15 % don't trust it.
+
+    On intraday data the observations are the stream's session returns
+    (strategy.observations), so the blocks are `mean_block` SESSIONS long and
+    the dependence inside a day is kept whole."""
+    r, per = observations(returns)
     r = r[~np.isnan(r)]
     T = len(r)
     if T < 20 or r.std() == 0:
@@ -622,7 +687,7 @@ def bootstrap_sharpe_pvalue(returns, n_boot: int = 2000, mean_block: float = 20.
     with np.errstate(invalid="ignore", divide="ignore"):
         boot = np.where(sd > 0, samples.mean(axis=1) / sd, 0.0)
     p = float((boot >= obs).mean())
-    return dict(sharpe=float(obs * np.sqrt(periods_per_year())), p_value=p, n_boot=n_boot)
+    return dict(sharpe=float(obs * np.sqrt(per)), p_value=p, n_boot=n_boot)
 
 
 def reality_check(returns_frame: pd.DataFrame, n_boot: int = 2000, mean_block: float = 20.0, seed: int = 0) -> dict:
@@ -630,8 +695,9 @@ def reality_check(returns_frame: pd.DataFrame, n_boot: int = 2000, mean_block: f
     H0: no strategy in the family beats a zero-return benchmark. The
     statistic is the best mean return in the family; its null
     distribution is obtained by bootstrapping the demeaned family jointly
-    (same resampled dates for every strategy, so cross-correlation is kept)."""
-    X = returns_frame.fillna(0.0).to_numpy(dtype=float)
+    (same resampled dates for every strategy, so cross-correlation is kept).
+    On intraday data the rows are sessions (strategy.session_frame)."""
+    X = session_frame(returns_frame.fillna(0.0)).to_numpy(dtype=float)
     T, K = X.shape
     if T < 20 or K == 0:
         return dict(best=None, statistic=0.0, p_value=1.0)

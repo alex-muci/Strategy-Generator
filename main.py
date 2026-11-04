@@ -48,11 +48,12 @@ from pipeline import (
     resolve_interval, load_real, eval_config, worker_pool, evaluate_slots, walk_forward_matrices,
     family_diagnostics, build_portfolios, finalist_stats, benchmark_stats, benchmark_returns, instrument_text,
     benchmark_curve, _costed, BENCH_BUY_HOLD, add_research_args, parse_instrument_map, instrument_of,
+    annualization_text, window_sessions_note,
 )
 from portfolio import returns_frame
 from replay import save_run, replay_run, TARGETS as REPLAY_TARGETS
 from strategy import (annualized_sharpe, max_drawdown, periods_per_year, compound, BARS_PER_YEAR, validate_instrument,
-                      instrument_warnings, typical_units, set_periods_per_year, set_hedge_share,
+                      instrument_warnings, typical_units, set_annualization, set_hedge_share,
                       RESEARCH_EQUITY)
 
 
@@ -121,11 +122,9 @@ def main(argv=None) -> dict:
     asset = asset_label(args)
     instrument_map = resolve_instrument(args, asset)
     try:
-        cfg = eval_config(args, interval) | dict(instrument_map=instrument_map)
+        eval_config(args, interval)                 # a bad --bars-per-day fails before any download
     except ValueError as e:
         raise SystemExit(f"--bars-per-day: {e}")
-    set_periods_per_year(cfg["periods_per_year"])   # before anything here annualizes (the pool re-sets it)
-    set_hedge_share(cfg["hedge_share"])
 
     if args.real:
         print(f"Loading {args.real} ({interval} bars) from yfinance...")
@@ -138,8 +137,21 @@ def main(argv=None) -> dict:
     else:
         print(f"Loading synthetic regime-switching data (trend_prob={args.trend_prob}, trend_drift={args.trend_drift})...")
         df = synthetic_ohlc(n_bars=args.bars, seed=args.seed, trend_prob=args.trend_prob, trend_drift=args.trend_drift)
-    print(f"Data: {len(df)} bars, {df.index[0].date()} to {df.index[-1].date()}, "
-          f"annualizing at {cfg['periods_per_year']} bars/year")
+    # the annualization is read off the bars themselves (pipeline.annualization_for);
+    # the synthetic series is daily by construction, whatever its calendar says
+    cfg = eval_config(args, interval, index=None if synthetic else df.index) | dict(instrument_map=instrument_map)
+    set_annualization(cfg)   # before anything here annualizes (the pool re-sets it)
+    set_hedge_share(cfg["hedge_share"])
+    print(f"Data: {len(df)} bars, {df.index[0].date()} to {df.index[-1].date()}, {annualization_text(cfg)}")
+    note = window_sessions_note(df.index, args.train, args.test)
+    if note:
+        print(note)
+    table = BARS_PER_YEAR.get(interval)
+    if cfg.get("annualization") == "data" and args.bars_per_day is None and table \
+            and not 0.75 <= cfg["periods_per_year"] / table <= 1.33:
+        print(f"NOTE: the data holds {cfg['periods_per_year']} bars a year, not the {table} of a US-equity "
+              f"'{interval}' session (activity-sampled bars, a longer session, or gaps): annualizing at the "
+              f"data's own count (--annualization interval for the table)")
 
     overrides = {"sides": args.sides} if args.sides else {}
     templates = generate_templates(args.family, max_templates=args.max_templates, **overrides)
@@ -467,7 +479,7 @@ def _report(df, results, port, nested, fam, finalists, bench, args, asset: str |
     L.append("# Ranger-style strategy generator -- run report\n\n")
     L.append(f"Data: {len(df)} bars, {df.index[0].date()} to {df.index[-1].date()}"
              f" ({_source_text(args)}),"
-             f" annualized at {periods_per_year()} bars/year\n\n")
+             f" {annualization_text()}\n\n")
     L.append(f"Walk-forward: train={args.train} test={args.test} bars, {'anchored' if args.anchored else 'rolling'}, "
              f"parameter selection = {args.selection}, objective = {args.metric}, costs = {args.cost_bps} bps/side"
              f"{' + ' + str(args.cost_per_unit) + ' per unit/side' if args.cost_per_unit else ''}"
