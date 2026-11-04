@@ -37,7 +37,8 @@ from robustness import (
 from strategy import (
     annualized_sharpe, max_drawdown, periods_per_year, set_periods_per_year, compound,
     periods_per_year_for_interval, infer_annualization, annualization_of, set_annualization,
-    sessions_per_year, session_cut_minutes,
+    sessions_per_year, session_cut_minutes, current_annualization, session_starts, session_frame, observations_per_year,
+    elapsed_years,
     SIDES, HEDGE_SHARE, HEDGE_SHARES, set_hedge_share,
 )
 from walkforward import matrix_cells, matrix_row, matrix_frame
@@ -188,8 +189,16 @@ def load_real(ticker: str, start: str, interval: str = "1d", now=None,
 
 
 def cscv_partitions_for(T: int) -> int:
-    """CSCV blocks: 16 needs >= 100 bars per block to be meaningful."""
+    """CSCV blocks: 16 needs >= 100 observations (bars, or sessions on
+    intraday data: `n_observations`) per block to be meaningful."""
     return 16 if T >= 1600 else 8
+
+
+def n_observations(index) -> int:
+    """Observations the statistics of bars stamped `index` are made of:
+    sessions on intraday data (strategy.session_starts), else bars."""
+    starts = session_starts(index)
+    return len(index) if starts is None else len(starts)
 
 
 def annualization_for(interval: str, bars_per_day: float | None = None, index=None, mode: str = "data") -> dict:
@@ -220,8 +229,7 @@ def annualization_text(c: dict | None = None) -> str:
     """One phrase on how a run annualizes, for a report (default: how this
     process currently does)."""
     if c is None:
-        c = dict(periods_per_year=periods_per_year(), sessions_per_year=sessions_per_year(),
-                 session_cut_minutes=session_cut_minutes())
+        c = current_annualization()
     a = annualization_of(c)
     src = " (read off the data)" if c.get("annualization") == "data" else ""
     text = f"annualized at {a['periods_per_year']} bars/year{src}"
@@ -374,7 +382,7 @@ def evaluate_slot(job):
         df, tpl, param_grid_for(tpl, wide=c["wide_grid"]),
         train_bars=c["train_bars"], test_bars=c["test_bars"],
         cpcv_groups=c["cpcv_groups"], cpcv_k=c["cpcv_k"],
-        cscv_partitions_n=cscv_partitions_for(len(df)), **_wfa_kwargs(c),
+        cscv_partitions_n=cscv_partitions_for(n_observations(df.index)), **_wfa_kwargs(c),
     )
     wfa["asset"] = asset
     return name, wfa
@@ -472,12 +480,17 @@ def family_diagnostics(results: dict, rets: pd.DataFrame, n_boot: int = 1000) ->
     n_trials = sum(r["n_trials"] for r in results.values())
     pbo = cscv_pbo(blocks=merge_block_stats([r["trial_blocks"] for r in results.values()]))
     # PBO over the slot-level OOS curves (the selection step's trials)
-    pbo_tpl = cscv_pbo(rets.to_numpy(), n_partitions=cscv_partitions_for(len(rets))) if rets.shape[1] > 1 else None
+    # on intraday bars the slot curves' statistics are of their session
+    # returns (strategy.session_frame), like every Sharpe of the run
+    srets = session_frame(rets)
+    pbo_tpl = (cscv_pbo(srets.to_numpy(), n_partitions=cscv_partitions_for(len(srets)),
+                        per_year=observations_per_year()) if rets.shape[1] > 1 else None)
     rc = reality_check(rets, n_boot=n_boot)
     oos_sharpes = rets.apply(annualized_sharpe)
     best = oos_sharpes.idxmax()
-    # raw DSR: every slot is an independent trial (very conservative)
-    var_sr_raw = float(oos_sharpes.var()) / periods_per_year() if rets.shape[1] > 1 else 0.0
+    # raw DSR: every slot is an independent trial (very conservative); the
+    # variance in per-observation units (per session on intraday data)
+    var_sr_raw = float(oos_sharpes.var()) / observations_per_year() if rets.shape[1] > 1 else 0.0
     dsr_raw = deflated_sharpe_ratio(rets[best], n_trials=rets.shape[1], var_sr_trials=var_sr_raw)
     # effective DSR: correlated slots collapsed into clusters
     eff = effective_n_trials(rets)
@@ -487,7 +500,7 @@ def family_diagnostics(results: dict, rets: pd.DataFrame, n_boot: int = 1000) ->
         reality_check=rc, oos_sharpes=oos_sharpes, n_eff=eff["n_eff"], var_sr_period=eff["var_sr_period"],
         best_template=best, dsr_best=dsr_best, dsr_raw=dsr_raw,
         min_btl_years=min_backtest_length(eff["n_eff"], max(float(oos_sharpes.max()), 1e-6)),
-        years_available=len(rets) / periods_per_year(),
+        years_available=elapsed_years(rets.index),
     )
 
 
@@ -540,12 +553,13 @@ def curve_stats(r: pd.Series, additive: bool = False) -> dict:
     n = len(r)
     if n < 2:
         return dict(sharpe=0.0, cagr=0.0, max_dd=0.0, n_bars=n)
+    years = max(elapsed_years(r.index), 1e-9)       # calendar years when read off the data
     if additive:
         v = np.concatenate([[1.0], eq.to_numpy(dtype=float)])
-        cagr = float((v[-1] - 1.0) * periods_per_year() / n)
+        cagr = float((v[-1] - 1.0) / years)
         max_dd = float((v - np.maximum.accumulate(v)).min())
     else:
-        cagr = float(eq.iloc[-1] ** (periods_per_year() / n) - 1) if eq.iloc[-1] > 0 else -1.0
+        cagr = float(eq.iloc[-1] ** (1.0 / years) - 1) if eq.iloc[-1] > 0 else -1.0
         max_dd = max_drawdown(eq, start=1.0)      # funded at 1 before the first bar
     return dict(sharpe=annualized_sharpe(r), cagr=cagr, max_dd=max_dd, n_bars=n)
 

@@ -1721,8 +1721,7 @@ class AnnualizationTests(unittest.TestCase):
 
     def setUp(self):
         import strategy as S
-        self._saved = dict(periods_per_year=S.periods_per_year(), sessions_per_year=S.sessions_per_year(),
-                           session_cut_minutes=S.session_cut_minutes())
+        self._saved = S.current_annualization()
         # from the daily default: an earlier run in this process (main.main on a
         # CSV) leaves the annualization it read off its data
         S.set_annualization(dict(periods_per_year=252))

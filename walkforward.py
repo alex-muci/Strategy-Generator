@@ -36,6 +36,7 @@ import pandas as pd
 
 from strategy import (
     backtest, annualized_sharpe, max_drawdown, periods_per_year, performance_stats, REGIME_INDICATORS, compound,
+    elapsed_years,
     hedge_warmup, RESEARCH_EQUITY,
     hedge_ladder_for,
     HEDGE_CHANNELS, FORECAST_CHANNELS, forecast_warmup, FC_SETTLE, STANCE_SETTLE,
@@ -230,8 +231,14 @@ def select_params(scores: np.ndarray, idx: np.ndarray, method: str = "plateau") 
 
 
 def _annualized_return(stats: dict) -> float:
-    n = max(stats.get("n_bars", 1), 1)
-    return stats["total_return"] * periods_per_year() / n
+    """A window's simple annualized return (Pardo's WFE compares the OOS and
+    IS ones): over the calendar years it covers when the stats carry them
+    (`performance_stats`, the OOS window's `years`; strategy.elapsed_years),
+    else its bars / bars a year."""
+    years = stats.get("years")
+    if years is None or not years > 0:
+        years = max(stats.get("n_bars", 1), 1) / periods_per_year()
+    return stats["total_return"] / years
 
 
 # --------------------------------------------------------------------------
@@ -284,7 +291,11 @@ def window_backtest(df: pd.DataFrame, tpl, start: int, end: int, *,
     # from the funded equity. At off == 0 the first bar is the data's, flat.
     r = res["returns"].to_numpy()
     rets = np.concatenate([[0.0], r[off:]]) if off > 0 else r
-    out["stats"] = performance_stats(eq, res["trades"], initial_equity, rets)
+    # the window's stamps: its Sharpe is session-compounded on intraday bars
+    # and its CAGR over the calendar time it covers, as the OOS series' are
+    stamps = out["equity"].index
+    out["stats"] = performance_stats(eq, res["trades"], initial_equity, rets, index=stamps,
+                                     rets_index=stamps if off > 0 else stamps[1:])
     out["stats"]["max_drawdown"] = max_drawdown(eq, start=initial_equity)
     out["window_start"] = df.index[start]
     out["exposure"] = exposure_totals(out, df["Close"].to_numpy()[start:end], point_value=tpl.point_value,
@@ -489,6 +500,7 @@ def walk_forward(
             sharpe=annualized_sharpe(oos_rets),
             n_trades=len(oos_res["trades"]),
             n_bars=len(oos_rets),
+            years=elapsed_years(oos_rets.index),
             held_bars=oos_res["exposure"]["held_bars"],
             gross_notional=oos_res["exposure"]["gross"],
             net_notional=oos_res["exposure"]["net"],
@@ -539,7 +551,8 @@ def summarize_walk_forward(windows: list, oos_returns: pd.Series) -> dict:
     eq = pd.Series(compound(oos_returns.to_numpy()), index=oos_returns.index)
     total = float(eq.iloc[-1] - 1)
     n_bars = len(oos_returns)
-    cagr = float(eq.iloc[-1] ** (periods_per_year() / n_bars) - 1) if eq.iloc[-1] > 0 else -1.0
+    years = max(elapsed_years(oos_returns.index), 1e-9)
+    cagr = float(eq.iloc[-1] ** (1.0 / years) - 1) if eq.iloc[-1] > 0 else -1.0
     max_dd = max_drawdown(eq, start=1.0)       # funded at 1 before the first OOS bar
     oos_sharpe = annualized_sharpe(oos_returns)
 

@@ -108,8 +108,7 @@ class _KeepAnnualization(unittest.TestCase):
     """Restores the process-wide annualization each test changes."""
 
     def setUp(self):
-        self._saved = dict(periods_per_year=S.periods_per_year(), sessions_per_year=S.sessions_per_year(),
-                           session_cut_minutes=S.session_cut_minutes())
+        self._saved = S.current_annualization()
 
     def tearDown(self):
         S.set_annualization(self._saved)
@@ -298,8 +297,7 @@ class VolumeBarsEndToEndTests(_KeepAnnualization):
     @classmethod
     def setUpClass(cls):
         # main.main sets the process-wide annualization: put it back after
-        cls._saved_cls = dict(periods_per_year=S.periods_per_year(), sessions_per_year=S.sessions_per_year(),
-                              session_cut_minutes=S.session_cut_minutes())
+        cls._saved_cls = S.current_annualization()
         cls.dir = tempfile.mkdtemp()
         idx, _ = volume_bars("2023-01-01", "2023-06-30", seed=7, lo=10, hi=30)
         df = synthetic_ohlc(n_bars=len(idx), seed=7, trend_vol=0.002, range_vol=0.0012).set_axis(idx)
@@ -335,6 +333,255 @@ class VolumeBarsEndToEndTests(_KeepAnnualization):
                 self.assertAlmostEqual(res["summary"]["oos_sharpe"],
                                        S.annualized_sharpe(S.session_returns(r), ppy=cfg["sessions_per_year"]),
                                        places=10)
+
+    def test_the_robustness_statistics_count_sessions_and_calendar_years(self):
+        from data import load_csv
+        idx = load_csv(self.csv).index
+        S.set_annualization(S.infer_annualization(idx))
+        n_sessions = len(S.session_starts(idx))
+        for name, res in self.out["results"].items():
+            blocks = res.get("trial_blocks")
+            if blocks is not None:
+                self.assertEqual(int(blocks["counts"].sum()), n_sessions, name)    # CSCV rows are sessions
+                self.assertEqual(blocks["per_year"], self.expected["sessions_per_year"])
+        rets = self.out["returns"]
+        span = (rets.index[-1] - rets.index[0]).total_seconds() / (86400 * 365.25)
+        self.assertAlmostEqual(self.out["family"]["years_available"], span * len(rets) / (len(rets) - 1), places=9)
+        self.assertEqual(self.out["family"]["dsr_best"]["T"], len(S.session_starts(rets.index)))
+
+
+# --------------------------------------------------------------------------
+# the walk-forward's in-sample windows are measured like its OOS series
+# --------------------------------------------------------------------------
+
+class WindowInSampleTests(_KeepAnnualization):
+    """walkforward.window_backtest is how the optimizer scores every grid
+    point of every window: its Sharpe must be the session-compounded one
+    (as the OOS series'), or the IS ranking and the OOS/IS ratio would still
+    depend on how a day was cut into bars."""
+
+    def test_window_sharpe_is_session_compounded(self):
+        from walkforward import window_backtest, warmup_bars
+        idx = equity_hourly("2021-01-01", "2022-06-30")
+        df = synthetic_ohlc(n_bars=len(idx), seed=5).set_axis(idx)
+        S.set_annualization(S.infer_annualization(idx))
+        tpl = S.StrategyTemplate("t", n_entry=40)
+        start = warmup_bars(tpl) + 50
+        for st, end in ((start, start + 900), (0, 900)):          # a warmed-up window, and one from bar 0
+            res = window_backtest(df, tpl, st, end)
+            r = res["returns"] if st > 0 else res["returns"].iloc[1:]
+            self.assertGreater(len(res["trades"]), 0)
+            self.assertAlmostEqual(res["stats"]["sharpe"], S.annualized_sharpe(r), places=12)
+            self.assertNotAlmostEqual(res["stats"]["sharpe"], S.annualized_sharpe(r.to_numpy()), places=6)
+
+
+# --------------------------------------------------------------------------
+# calendar years, not bars / bars a year
+# --------------------------------------------------------------------------
+
+def _dense_then_sparse(seed=8):
+    """Volume-bar stamps over 2021-2022: ~40 bars a day in 2021, ~10 in 2022."""
+    a, _ = volume_bars("2021-01-01", "2021-12-31", seed=seed, lo=38, hi=43)
+    b, _ = volume_bars("2022-01-01", "2022-12-31", seed=seed + 1, lo=8, hi=13)
+    return a.append(b)
+
+
+class CalendarYearsTests(_KeepAnnualization):
+
+    def test_elapsed_years_reads_the_stamps_only_when_annualizing_on_the_data(self):
+        idx = _dense_then_sparse()
+        dense = idx[idx < "2022-01-01"]
+        S.set_annualization(S.infer_annualization(idx))
+        self.assertTrue(S.CALENDAR_YEARS)
+        span = (dense[-1] - dense[0]).total_seconds() / (86400 * 365.25)
+        self.assertAlmostEqual(S.elapsed_years(dense), span * len(dense) / (len(dense) - 1), places=12)
+        self.assertAlmostEqual(S.elapsed_years(dense), 1.0, delta=0.01)
+        # bars / bars a year would read the dense year as ~1.6 years
+        self.assertGreater(len(dense) / S.periods_per_year(), 1.4)
+        # the table, the synthetic series, a config from before: bars / bars a year
+        for c in (dict(periods_per_year=252), dict(periods_per_year=252, annualization="interval")):
+            S.set_annualization(c)
+            self.assertFalse(S.CALENDAR_YEARS)
+            self.assertEqual(S.elapsed_years(dense), len(dense) / 252)
+        self.assertEqual(S.elapsed_years(None, 504), 2.0)
+        self.assertEqual(S.elapsed_years(pd.RangeIndex(252)), 1.0)
+
+    def test_cagr_and_the_walk_forward_efficiency_follow_the_calendar(self):
+        """The same +10 % year, once in dense and once in sparse bars: one
+        annualized return. Bars / bars a year would read it as ~6 % and
+        ~25 %, and Pardo's WFE between the two would be ~0.25, not 1."""
+        from walkforward import _annualized_return
+        idx = _dense_then_sparse()
+        S.set_annualization(S.infer_annualization(idx))
+        parts = (("dense", idx[idx < "2022-01-01"]), ("sparse", idx[idx >= "2022-01-01"]))
+
+        def stats():
+            out = {}
+            for name, part in parts:
+                eq = 100.0 * np.exp(np.linspace(0.0, np.log(1.10), len(part)))      # +10 % over the year
+                out[name] = S.performance_stats(pd.Series(eq, index=part), [], initial_equity=100.0)
+            return out
+        out = stats()
+        for name, st in out.items():
+            self.assertAlmostEqual(st["cagr"], 0.10, delta=0.002, msg=name)
+            self.assertAlmostEqual(st["years"], 1.0, delta=0.02, msg=name)    # the bars cover Jan 3 - Dec 30
+        self.assertAlmostEqual(_annualized_return(out["sparse"]) / _annualized_return(out["dense"]), 1.0, delta=0.02)
+        # the same bars counted as bars / bars a year
+        S.set_annualization(dict(S.infer_annualization(idx), annualization="interval"))
+        out = stats()
+        self.assertGreater(_annualized_return(out["sparse"]) / _annualized_return(out["dense"]), 3.0,
+                           "bars / bars a year: the sparse year would look 4x as profitable")
+
+    def test_curve_stats_and_the_oos_summary_use_calendar_years(self):
+        from walkforward import summarize_walk_forward
+        idx = _dense_then_sparse()
+        S.set_annualization(S.infer_annualization(idx))
+        r = pd.Series(np.full(len(idx), 1.21 ** (1 / (len(idx) - 1)) - 1), index=idx)
+        r.iloc[0] = 0.0                                         # +21 % over two calendar years
+        self.assertAlmostEqual(P.curve_stats(r)["cagr"], 0.10, delta=0.002)
+        w = dict(skipped=False, is_stats=dict(sharpe=1.0, total_return=0.1, n_bars=10, years=1.0),
+                 oos_stats=dict(total_return=0.21, n_trades=5, n_bars=len(idx), years=2.0), params_changed=False)
+        self.assertAlmostEqual(summarize_walk_forward([w, w, w], r)["oos_cagr"], 0.10, delta=0.002)
+
+
+# --------------------------------------------------------------------------
+# DSR, bootstrap, Reality Check, effective N: one observation per session
+# --------------------------------------------------------------------------
+
+def _family(n_days=780, k=5, seed=9):
+    """Daily returns of k correlated strategies (T x k)."""
+    rng = np.random.default_rng(seed)
+    common = rng.normal(0.0, 0.008, n_days)
+    own = rng.normal(0.0003, 0.006, (n_days, k))
+    return own + common[:, None] * np.linspace(0.2, 1.0, k)
+
+
+def _cut(daily: np.ndarray, seed: int, lo: int, hi: int, additive: bool = False):
+    """The days of `daily` (T or T x k) cut into volume bars: a frame of
+    per-bar returns that compound (or, `additive`, sum) to them each day."""
+    daily = np.atleast_2d(daily.T).T
+    idx, counts = volume_bars(seed=seed, lo=lo, hi=hi)
+    counts = counts[:len(daily)]
+    idx = idx[:counts.sum()]
+    rng = np.random.default_rng(seed)
+    cols = []
+    for j in range(daily.shape[1]):
+        if additive:
+            cols.append(np.concatenate([d * rng.dirichlet(np.ones(c)) for d, c in zip(daily[:, j], counts)]))
+        else:
+            cols.append(split_daily(daily[:, j], counts, rng))
+    return pd.DataFrame(np.column_stack(cols), index=idx)
+
+
+class SessionObservationTests(_KeepAnnualization):
+
+    def setUp(self):
+        super().setUp()
+        self.daily = _family()
+        self.cuts = [_cut(self.daily, seed=s, lo=lo, hi=hi) for s, lo, hi in ((11, 3, 6), (12, 20, 60))]
+
+    def _clock(self, frame):
+        S.set_annualization(S.infer_annualization(frame.index))
+
+    def test_dsr_and_bootstrap_are_the_same_however_the_days_are_cut(self):
+        import robustness as R
+        out = []
+        for f in self.cuts:
+            self._clock(f)
+            r = f[0]
+            dsr = R.deflated_sharpe_ratio(r, n_trials=10, var_sr_trials=1e-4)
+            boot = R.bootstrap_sharpe_pvalue(r, n_boot=300)
+            out.append((dsr, boot))
+            self.assertEqual(dsr["T"], len(self.daily))            # one observation per session
+            self.assertAlmostEqual(dsr["sharpe_annual"], S.annualized_sharpe(r), places=10)
+            ref = R.deflated_sharpe_ratio(S.session_returns(r), 10, 1e-4, ppy=S.sessions_per_year())
+            for k in ("dsr", "psr0", "skew", "kurtosis"):
+                self.assertAlmostEqual(dsr[k], ref[k], places=12)
+        for k in ("dsr", "psr0", "sharpe_annual", "skew", "kurtosis"):
+            self.assertAlmostEqual(out[0][0][k], out[1][0][k], places=8, msg=k)
+        self.assertEqual(out[0][1]["p_value"], out[1][1]["p_value"])
+        self.assertAlmostEqual(out[0][1]["sharpe"], out[1][1]["sharpe"], places=8)
+
+    def test_reality_check_and_effective_trials_work_on_sessions(self):
+        import robustness as R
+        res = []
+        for f in self.cuts:
+            self._clock(f)
+            res.append((R.reality_check(f, n_boot=200), R.effective_n_trials(f)))
+        self.assertEqual(res[0][0]["p_value"], res[1][0]["p_value"])
+        self.assertAlmostEqual(res[0][0]["statistic"], res[1][0]["statistic"], places=8)
+        self.assertEqual(res[0][1]["n_eff"], res[1][1]["n_eff"])
+        self.assertAlmostEqual(res[0][1]["var_sr_period"], res[1][1]["var_sr_period"], places=10)
+
+    def test_daily_data_is_unchanged(self):
+        import robustness as R
+        idx = pd.bdate_range("2015-01-01", periods=len(self.daily))
+        f = pd.DataFrame(self.daily, index=idx)
+        S.set_annualization(dict(periods_per_year=252))
+        self.assertIsNone(S.session_starts(idx))
+        self.assertIs(S.session_frame(f), f)
+        a = R.deflated_sharpe_ratio(f[0], 10, 1e-4)
+        b = R.deflated_sharpe_ratio(f[0].to_numpy(), 10, 1e-4, ppy=252)
+        self.assertEqual(a, b)
+        self.assertEqual(R.bootstrap_sharpe_pvalue(f[0], n_boot=200), R.bootstrap_sharpe_pvalue(f[0].to_numpy(),
+                                                                                                n_boot=200))
+
+
+# --------------------------------------------------------------------------
+# CPCV and PBO: groups and blocks of whole sessions, session Sharpes
+# --------------------------------------------------------------------------
+
+class SessionCpcvPboTests(_KeepAnnualization):
+
+    def setUp(self):
+        super().setUp()
+        self.daily = _family(n_days=600, k=12, seed=13)          # 12 "trials", fixed-capital returns
+
+    def _bars(self, lo, hi, seed):
+        f = _cut(self.daily, seed=seed, lo=lo, hi=hi, additive=True)
+        S.set_annualization(S.infer_annualization(f.index))
+        return f.to_numpy(), S.session_starts(f.index)
+
+    def test_cpcv_groups_hold_whole_sessions(self):
+        import robustness as R
+        R_, starts = self._bars(5, 40, seed=21)
+        b = R._snap_bounds(np.linspace(0, len(R_), 7).astype(int), starts)
+        self.assertTrue(np.isin(b[:-1], starts).all())
+        self.assertEqual((b[0], b[-1]), (0, len(R_)))
+        self.assertIs(R._snap_bounds(b, None), b)
+
+    def test_cpcv_is_the_same_however_the_days_are_cut(self):
+        """A constant number of bars a day puts the group bounds on the same
+        sessions, so two cuts must select the same trials and give the same
+        path Sharpes -- those of the daily matrix itself."""
+        import robustness as R
+        outs = []
+        for k, seed in ((3, 31), (24, 32)):
+            R_, starts = self._bars(k, k + 1, seed)
+            outs.append(R.cpcv(R_, n_groups=6, k_test=2, embargo_bars=0, selection="best", additive=True,
+                               sessions=starts))
+        np.testing.assert_array_equal(outs[0]["chosen_trials"], outs[1]["chosen_trials"])
+        np.testing.assert_allclose(outs[0]["path_sharpes"], outs[1]["path_sharpes"], rtol=1e-9)
+        spy = S.sessions_per_year()
+        S.set_annualization(dict(periods_per_year=spy))       # the daily matrix, per row at the same count
+        daily = R.cpcv(self.daily, n_groups=6, k_test=2, embargo_bars=0, selection="best", additive=True)
+        np.testing.assert_array_equal(daily["chosen_trials"], outs[0]["chosen_trials"])
+        np.testing.assert_allclose(daily["path_sharpes"], outs[0]["path_sharpes"], rtol=1e-9)
+
+    def test_pbo_ranks_session_sharpes(self):
+        import robustness as R
+        res = []
+        for lo, hi, seed in ((3, 6, 41), (10, 80, 42)):          # any cut: the blocks are session rows
+            R_, starts = self._bars(lo, hi, seed)
+            blocks = R.cscv_block_stats(R_, 8, sessions=starts, additive=True)
+            self.assertEqual(int(blocks["counts"].sum()), len(self.daily))
+            self.assertEqual(blocks["per_year"], S.sessions_per_year())
+            merged = R.merge_block_stats([blocks, blocks])
+            self.assertEqual(merged["per_year"], blocks["per_year"])
+            res.append(R.cscv_pbo(blocks=blocks))
+        self.assertEqual(res[0]["pbo"], res[1]["pbo"])
+        np.testing.assert_allclose(res[0]["is_sharpe"], res[1]["is_sharpe"], rtol=1e-9)
+        np.testing.assert_allclose(res[0]["oos_sharpe"], res[1]["oos_sharpe"], rtol=1e-9)
 
 
 if __name__ == "__main__":

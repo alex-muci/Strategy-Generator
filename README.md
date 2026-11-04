@@ -211,8 +211,16 @@ not know (a ~23 h future, 24/7 crypto).
 * **Bars a year** -- how many bars a calendar year of the data holds (the
   median over the full calendar years covered, so a hole in the data does not
   shrink it). It turns a per-bar quantity into an annual one and back: the vol
-  target's per-bar size, the forecast scaling, CAGR, the DSR. SPY daily
-  gives 252, daily crypto 365, a 23 h future's hourly bars ~23 x 252.
+  target's per-bar size and the forecast scaling. SPY daily gives 252, daily
+  crypto 365, a 23 h future's hourly bars ~23 x 252.
+* **Calendar years** -- a span of bars is measured by its stamps (first to
+  last, plus the last bar's share; `strategy.elapsed_years`), not as bars /
+  bars a year: every CAGR, each walk-forward window's annualized return (so
+  Pardo's walk-forward efficiency and pass), the years of OOS history the
+  Minimum Backtest Length is compared with. Volume bars are denser in a busy
+  market: counted in bars, a busy window would look like more years than it
+  covers and its annualized return would shrink, biasing the WFE against
+  whichever of the IS and OOS windows fell in the busier regime.
 * **Sessions** -- on intraday bars (more than 1.5 a session) the **Sharpe
   ratio and the volatility are measured on returns compounded per session**
   and annualized by the sessions a year (252 for an equity or a future, 365
@@ -233,10 +241,26 @@ The run prints and saves what it found (`periods_per_year`,
 still forces 252 x N bars a year (intraday intervals only), and
 `--annualization interval` goes back to the `--interval` table
 (`strategy.BARS_PER_YEAR`, a US equity session: seven `1h` bars a day) with
-per-bar statistics. The synthetic series is annualized daily (252) either way.
-The robustness statistics that work bar by bar (CPCV paths, PBO, the
-bootstrap, the DSR's moments) stay per bar: PBO is rank-based and the DSR's
-theory is per observation; only their annualized display uses the bars a year.
+per-bar statistics and spans counted as bars / bars a year. The synthetic
+series is annualized that way (252 a year), whatever its calendar says.
+On intraday bars the robustness statistics take the session as their
+observation too, so that they test the rule the run actually applies:
+
+* the **Deflated Sharpe ratio** counts sessions as its T, takes the skew and
+  kurtosis of the session returns, and deflates by the trials' Sharpe
+  variance in per-session units (effective N clusters the slots on their
+  session returns). Per bar, hundreds of thousands of "observations" with
+  fat per-bar tails would overstate its confidence;
+* the **bootstrap p-value** and **White's Reality Check** resample blocks of
+  sessions (20 on average), keeping each day's dependence whole;
+* **CPCV** cuts its groups on session starts and scores both the training
+  selection and the test paths on session Sharpes (P&L summed per session:
+  the trial returns are on fixed capital);
+* **PBO** (CSCV) cuts its blocks on whole sessions and ranks session
+  Sharpes, the measure the walk-forward selects on.
+
+The train/test windows, the lookbacks and `--vol-target-n` stay in bars:
+measuring in activity rather than clock time is what volume bars are for.
 
 What the dashboard shows, in the order you need it:
 

@@ -271,6 +271,13 @@ def periods_per_year_for_interval(interval: str, bars_per_day: float | None = No
 # session): every statistic is then the per-bar one it always was.
 SESSIONS_PER_YEAR: int | None = None
 SESSION_CUT_MINUTES = 0
+# True when the annualization was read off the data: a span of bars is then
+# measured in CALENDAR years (its first to last stamp), not as bars / bars a
+# year -- activity-sampled bars are denser in a busy market, so a window's
+# bar count overstates the time it covers there and understates it in a
+# quiet one. False (the interval table, the synthetic series, a config from
+# before) keeps bars / PERIODS_PER_YEAR.
+CALENDAR_YEARS = False
 # above this many bars per session on average the data is intraday
 _INTRADAY_BARS_PER_SESSION = 1.5
 _YEAR_DAYS = 365.25
@@ -364,7 +371,8 @@ def infer_annualization(index) -> dict | None:
     """The annualization the timestamps of a frame imply (see the block
     above): dict(periods_per_year, sessions_per_year, session_cut_minutes),
     `sessions_per_year` None for daily and coarser bars. None when the index
-    is no DatetimeIndex or covers no time to measure (fewer than 3 bars)."""
+    is no DatetimeIndex or covers no time to measure (fewer than 3 bars).
+    `annualization` is 'data': spans are then measured in calendar years."""
     if not isinstance(index, pd.DatetimeIndex) or len(index) < 3:
         return None
     idx = index.sort_values()
@@ -375,9 +383,9 @@ def infer_annualization(index) -> dict | None:
     labels = session_labels(idx, cut)
     sessions = labels.unique()
     if len(idx) / len(sessions) <= _INTRADAY_BARS_PER_SESSION or len(sessions) < 3:
-        return dict(periods_per_year=ppy, sessions_per_year=None, session_cut_minutes=0)
+        return dict(periods_per_year=ppy, sessions_per_year=None, session_cut_minutes=0, annualization="data")
     return dict(periods_per_year=ppy, sessions_per_year=_per_year(pd.DatetimeIndex(sessions)),
-                session_cut_minutes=cut)
+                session_cut_minutes=cut, annualization="data")
 
 
 def annualization_of(c: dict) -> dict:
@@ -386,20 +394,51 @@ def annualization_of(c: dict) -> dict:
     spy = c.get("sessions_per_year")
     return dict(periods_per_year=int(c["periods_per_year"]),
                 sessions_per_year=None if spy in (None, 0) else int(spy),
-                session_cut_minutes=int(c.get("session_cut_minutes", 0) or 0))
+                session_cut_minutes=int(c.get("session_cut_minutes", 0) or 0),
+                annualization=c.get("annualization") or "interval")
 
 
 def set_annualization(c: dict) -> None:
     """Set the bars per year AND the session clock from a config (or an
     `infer_annualization` dict). Like set_periods_per_year: once, before
     anything annualizes, and in every worker process."""
-    global SESSIONS_PER_YEAR, SESSION_CUT_MINUTES
+    global SESSIONS_PER_YEAR, SESSION_CUT_MINUTES, CALENDAR_YEARS
     a = annualization_of(c)
     set_periods_per_year(a["periods_per_year"])
     if a["sessions_per_year"] is not None and a["sessions_per_year"] < 1:
         raise ValueError(f"sessions_per_year must be >= 1, got {a['sessions_per_year']}")
     SESSIONS_PER_YEAR = a["sessions_per_year"]
     SESSION_CUT_MINUTES = a["session_cut_minutes"] % 1440
+    CALENDAR_YEARS = a["annualization"] == "data"
+
+
+def current_annualization() -> dict:
+    """What this process currently annualizes with (`set_annualization`'s
+    input form): save it before a run changes it, to restore it after."""
+    return dict(periods_per_year=PERIODS_PER_YEAR, sessions_per_year=SESSIONS_PER_YEAR,
+                session_cut_minutes=SESSION_CUT_MINUTES,
+                annualization="data" if CALENDAR_YEARS else "interval")
+
+
+def observations_per_year() -> int:
+    """Observations a year of the annualized statistics: sessions on
+    intraday data (session-compounded returns), else bars."""
+    return SESSIONS_PER_YEAR if SESSIONS_PER_YEAR is not None else PERIODS_PER_YEAR
+
+
+def elapsed_years(index=None, n_bars: int | None = None) -> float:
+    """The time `n_bars` bars stamped `index` cover, in years. With the
+    annualization read off the data (CALENDAR_YEARS) and the stamps known:
+    the span from the first to the last stamp, plus the last bar's share
+    (span x n / (n - 1)), in years of 365.25 days -- what a CAGR or an
+    annualized return divides by, whatever the bars' density there.
+    Otherwise bars / bars a year."""
+    n = len(index) if n_bars is None and index is not None else int(n_bars or 0)
+    if CALENDAR_YEARS and isinstance(index, pd.DatetimeIndex) and len(index) >= 2:
+        span = (index[-1] - index[0]).total_seconds() / (86400.0 * _YEAR_DAYS)
+        if span > 0:
+            return span * n / (len(index) - 1)
+    return n / PERIODS_PER_YEAR
 
 
 _SESSION_STARTS: dict = {}
@@ -422,6 +461,37 @@ def _session_starts(index) -> np.ndarray:
     return s
 
 
+def session_starts(index) -> np.ndarray | None:
+    """Row positions where a new session begins in the sorted stamps
+    `index`, or None when the statistics are per bar (no session clock, or
+    no stamps): what the matrix statistics (robustness.cpcv, the CSCV
+    blocks) aggregate their rows by."""
+    if SESSIONS_PER_YEAR is None or not isinstance(index, pd.DatetimeIndex) or len(index) == 0:
+        return None
+    return _session_starts(index)
+
+
+def aggregate_sessions(X, starts: np.ndarray, additive: bool = False) -> np.ndarray:
+    """Rows of per-bar returns X (T, or T x N) aggregated per session
+    (`starts` from `session_starts`): compounded, or summed for `additive`
+    returns (P&L over a fixed capital, which add up to their curve)."""
+    X = np.asarray(X, dtype=float)
+    if additive:
+        return np.add.reduceat(X, starts, axis=0)
+    return np.multiply.reduceat(1.0 + X, starts, axis=0) - 1.0
+
+
+def session_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    """A frame of per-bar returns as one row of compounded returns per
+    session (indexed by the session's first stamp) on intraday data; the
+    frame itself otherwise. NaN counts as a flat bar (0)."""
+    starts = session_starts(frame.index)
+    if starts is None:
+        return frame
+    X = aggregate_sessions(frame.fillna(0.0).to_numpy(dtype=float), starts)
+    return pd.DataFrame(X, index=frame.index[starts], columns=frame.columns)
+
+
 def session_returns(rets, index=None) -> np.ndarray:
     """Per-bar simple returns compounded into one return per session.
     `rets` is a Series with a DatetimeIndex, or an array with `index`;
@@ -436,6 +506,15 @@ def session_returns(rets, index=None) -> np.ndarray:
     if len(r) == 0:
         return r
     return np.multiply.reduceat(1.0 + r, _session_starts(idx)) - 1.0
+
+
+def observations(rets, index=None) -> tuple[np.ndarray, int]:
+    """(observations, observations a year) of a return stream for the
+    statistics that work on its observations (DSR, bootstrap): its session
+    returns and sessions a year on intraday data whose stamps are known
+    (a Series with a DatetimeIndex, or `index`), else its bars and bars a
+    year."""
+    return _per_session(rets, index)
 
 
 def _per_session(rets, index=None):
@@ -3660,12 +3739,15 @@ def max_drawdown(equity, start: float | None = None) -> float:
 
 
 def performance_stats(equity, trades: list, initial_equity: float, rets=None, pnls=None, bars_held=None,
-                      index=None) -> dict:
+                      index=None, rets_index=None) -> dict:
     """Summary stats from an equity path. Accepts a numpy array or a Series;
     `rets`, `pnls` and `bars_held` may be passed to skip recomputation.
-    `index` (the bars' stamps; a Series' own by default) lets the Sharpe
-    ratio be session-compounded on intraday data, as `annualized_sharpe`
-    measures an out-of-sample series."""
+    `index` (the equity bars' stamps; a Series' own by default) lets the
+    Sharpe ratio be session-compounded on intraday data, as
+    `annualized_sharpe` measures an out-of-sample series, and the CAGR
+    divide by the calendar time covered (`elapsed_years`). The Sharpe is of
+    rets[1:], stamped index[1:] unless `rets_index` says otherwise (a window
+    whose `rets` lead with the bar before it, walkforward.window_backtest)."""
     if index is None and isinstance(equity, pd.Series):
         index = equity.index
     eq = np.asarray(equity, dtype=float)
@@ -3678,11 +3760,13 @@ def performance_stats(equity, trades: list, initial_equity: float, rets=None, pn
         pnls = np.array([t.get("pnl", 0.0) for t in trades], dtype=float)
     if bars_held is None:
         bars_held = np.array([t.get("bars_held", 0) for t in trades], dtype=float)
-    n_years = max(n_bars / periods_per_year(), 1e-6)
+    n_years = max(elapsed_years(index, n_bars), 1e-6)
     final = float(eq[-1])
     total_return = final / initial_equity - 1
     cagr = (final / initial_equity) ** (1 / n_years) - 1 if final > 0 else -1.0
-    sharpe = annualized_sharpe(rets[1:], index=index[1:] if index is not None and n_bars > 1 else None)
+    if rets_index is None and index is not None and len(index) > 1:
+        rets_index = index[1:]
+    sharpe = annualized_sharpe(rets[1:], index=rets_index)
     max_dd = max_drawdown(eq)
     wins =pnls[pnls > 0].sum()
     losses = -pnls[pnls < 0].sum()
@@ -3699,6 +3783,7 @@ def performance_stats(equity, trades: list, initial_equity: float, rets=None, pn
         avg_bars_held=float(bars_held.mean()) if n_tr else 0.0,
         exposure=float(bars_held.sum() / n_bars) if n_bars else 0.0,
         n_bars=n_bars,
+        years=float(n_years),
     )
 
 
