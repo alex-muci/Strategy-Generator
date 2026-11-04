@@ -25,6 +25,15 @@ import numpy as np
 import pandas as pd
 
 
+def as_float64(df: pd.DataFrame) -> pd.DataFrame:
+    """`df` with its numeric columns of pandas' nullable dtypes (Int64,
+    Float64, boolean, ...) as numpy float64, <NA> as NaN: the indicators
+    assume numpy columns (np.where on a nullable one raises)."""
+    cols = {c: np.float64 for c in df.columns
+            if isinstance(df[c].dtype, pd.api.extensions.ExtensionDtype) and pd.api.types.is_numeric_dtype(df[c])}
+    return df.astype(cols) if cols else df
+
+
 def load_yfinance(
     ticker: str,
     start: str,
@@ -89,7 +98,7 @@ def load_yfinance(
             f"{min_bars}. Widen the date range or use a coarser interval."
         )
     df.index.name = "Date"
-    return df
+    return as_float64(df)
 
 
 def load_csv(path: str, interval: str = "1d", min_bars: int = 200, drop_no_trade_rows: bool = True) -> pd.DataFrame:
@@ -141,7 +150,7 @@ def load_csv(path: str, interval: str = "1d", min_bars: int = 200, drop_no_trade
     if len(df) < min_bars:
         raise ValueError(f"{path!r}: only {len(df)} usable bars, need at least {min_bars}.")
     df.index.name = "Date"
-    return df
+    return as_float64(df)
 
 
 # how far back Yahoo serves intraday bars (a request that starts earlier comes

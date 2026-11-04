@@ -310,3 +310,38 @@ class RollColumnTests(unittest.TestCase):
             d = load_csv(dpath)
             self.assertEqual(float(d["Roll"].loc[idx[59]]), 1.0)
             self.assertEqual(float(d["Close"].loc[idx[59]]), 1.2)
+
+
+class NullableDtypeTests(unittest.TestCase):
+    """The indicators assume numpy float64 columns: on pandas' nullable
+    dtypes np.where raises (adx). Every way data enters is converted."""
+
+    def setUp(self):
+        import strategy as S
+        self.S = S
+        self.df = D.synthetic_ohlc(600, seed=1)
+        self.nullable = self.df.astype({"Open": "Float64", "High": "Float64", "Low": "Float64",
+                                        "Close": "Float64", "Volume": "Int64"})
+
+    def test_the_assumption(self):
+        with self.assertRaises(TypeError):
+            self.S.adx(self.nullable, 14)
+
+    def test_as_float64(self):
+        df = pd.DataFrame({"a": pd.array([1, None], dtype="Int64"), "b": pd.array([True, None], dtype="boolean"),
+                           "c": pd.array([0.5, None], dtype="Float64"), "d": [1, 2], "s": ["x", "y"]})
+        out = D.as_float64(df)
+        self.assertTrue(all(out[c].dtype == np.float64 for c in "abc"))
+        self.assertEqual((out["d"].dtype, out["s"].dtype), (df["d"].dtype, df["s"].dtype))   # numpy: untouched
+        self.assertTrue(np.isnan(out["a"].iloc[1]) and np.isnan(out["b"].iloc[1]))
+        self.assertIs(D.as_float64(self.df), self.df)                # already float64: untouched
+
+    def test_backtest_and_walk_forward_take_nullable_frames(self):
+        from walkforward import walk_forward
+        tpl = self.S.StrategyTemplate("t", regime_filter="trend_only", regime_indicator="adx")
+        a, b = self.S.backtest(self.nullable, tpl), self.S.backtest(self.df, tpl)
+        pd.testing.assert_series_equal(a["equity"], b["equity"])
+        grid = {"n_entry": [20, 40]}
+        wa, wb = (walk_forward(d, tpl, grid, train_bars=300, test_bars=100) for d in (self.nullable, self.df))
+        pd.testing.assert_series_equal(wa["oos_returns"], wb["oos_returns"])
+

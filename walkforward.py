@@ -34,6 +34,7 @@ from itertools import product as iproduct
 import numpy as np
 import pandas as pd
 
+from data import as_float64
 from strategy import (
     backtest, annualized_sharpe, max_drawdown, periods_per_year, performance_stats, REGIME_INDICATORS, compound,
     elapsed_years,
@@ -434,6 +435,7 @@ def walk_forward(
       summary     : robustness summary incl. Pardo's WFE and criteria
       template    : tpl
     """
+    df = as_float64(df)      # once here, not in every window's backtest
     n = len(df)
     combos, idx = grid_combos(param_grid)
     windows = []

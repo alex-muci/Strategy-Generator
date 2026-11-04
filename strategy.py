@@ -166,6 +166,8 @@ import math
 import numpy as np
 import pandas as pd
 
+from data import as_float64
+
 # Bars per year, used for every annualization (Sharpe, CAGR, WFE, DSR...).
 # Do NOT import this by value: `from strategy import PERIODS_PER_YEAR` freezes it
 # at import time and set_periods_per_year() can then no longer be honoured.
@@ -3591,6 +3593,7 @@ def backtest(df: pd.DataFrame, tpl: StrategyTemplate, initial_equity: float = 10
     works on price differences, and adding a constant to every price leaves
     the trades, the P&L and the equity unchanged.
     """
+    df = as_float64(df)      # nullable dtypes -> float64 (a no-op on float64 data)
     if tpl.entry_style == "stance":
         return _stance_backtest(df, tpl, initial_equity, first_trade_bar, log_orders, fixed_capital)
     n = len(df)
