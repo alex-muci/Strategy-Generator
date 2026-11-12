@@ -158,6 +158,41 @@ class InferenceTests(unittest.TestCase):
         self.assertEqual(a["sessions_per_year"], 365)
         self.assertEqual(a["session_cut_minutes"], 0)
 
+    def test_24_7_bars_are_cut_at_midnight_whatever_the_ends_and_holes(self):
+        h = pd.date_range
+        outage = h("2022-01-01 10:00", "2023-12-30 15:00", freq="h")
+        for a, b in (("2022-03-10 05:00", "2022-03-12 18:00"), ("2022-09-01 20:00", "2022-09-05 02:00")):
+            outage = outage[(outage < a) | (outage > b)]
+        cases = {
+            "starts 10:00, ends 15:00": h("2022-01-01 10:00", "2023-12-30 15:00", freq="h"),
+            "multi-day outages": outage,
+            "a month of 15m bars": h("2022-01-01 07:30", "2022-01-31 12:00", freq="15min"),
+            "ten days of 1m bars": h("2022-01-01 13:17", "2022-01-11 09:00", freq="min"),
+            "tz-aware 4h bars": h("2022-01-01 02:00", "2023-06-30", freq="4h", tz="UTC"),
+        }
+        for name, idx in cases.items():
+            with self.subTest(name):
+                self.assertEqual(S._session_cut(idx), 0)
+
+    def test_a_daily_break_on_seven_day_data_is_found(self):
+        idx = pd.date_range("2022-01-01", "2023-12-31", freq="15min")
+        idx = idx[idx.hour != 3]                                  # an hour's maintenance at 03:00
+        cut = S._session_cut(idx)
+        self.assertTrue(3 * 60 <= cut < 4 * 60, cut)
+
+    def test_fx_keeps_the_sunday_evening_open(self):
+        def fx(start, end):
+            s = pd.date_range(start, end, freq="h").to_series()
+            shut = (((s.dt.dayofweek == 4) & (s.dt.hour >= 22)) | (s.dt.dayofweek == 5)
+                    | ((s.dt.dayofweek == 6) & (s.dt.hour < 22)))
+            return pd.DatetimeIndex(s[~shut].index)
+        for name, (a, b) in {"two years": ("2022-01-02 22:00", "2023-12-29 21:00"),
+                             "two weeks": ("2022-01-02 22:00", "2022-01-14 21:00")}.items():
+            with self.subTest(name):
+                self.assertEqual(S._session_cut(fx(a, b)), 22 * 60, "Sunday evening opens Monday's session")
+        # a single week cannot tell its one Sunday evening from the ends of the data
+        self.assertEqual(S._session_cut(fx("2022-01-02 22:00", "2022-01-07 21:00")), 0)
+
     def test_volume_bars(self):
         idx, counts = volume_bars()
         a = S.infer_annualization(idx)
@@ -684,6 +719,27 @@ class AdditiveSessionTests(_KeepAnnualization):
         self.assertGreater(len(res["trades"]), 0)
         self.assertAlmostEqual(res["stats"]["sharpe"],
                                S.annualized_sharpe(res["returns"].iloc[1:], additive=True), places=12)
+
+    def test_templates_beat_the_one_unit_benchmark_on_its_reported_sharpe(self):
+        bh = self.r
+        summed, compounded = S.annualized_sharpe(bh, additive=True), S.annualized_sharpe(bh)
+        target = 0.5 * (summed + compounded)
+        # a template whose Sharpe falls between the benchmark's summed and compounded ones
+        lo, hi = -0.01, 0.01
+        for _ in range(100):
+            d = 0.5 * (lo + hi)
+            lo, hi = (d, hi) if S.annualized_sharpe(0.01 * bh + d) < target else (lo, d)
+        tpl = 0.01 * bh + d
+        sharpe = S.annualized_sharpe(tpl)
+        self.assertLess(min(summed, compounded), sharpe)
+        self.assertLess(sharpe, max(summed, compounded))
+        rets = pd.DataFrame({"t": tpl}, index=bh.index)
+        port = dict(portfolio_returns=tpl)
+        b = P.benchmark_stats(bh, rets, port, port, kind=P.BENCH_ONE_UNIT)
+        self.assertAlmostEqual(b["buy_hold"]["sharpe"], summed, places=12)
+        self.assertEqual(b["n_templates_beat_bh"], int(sharpe > summed))
+        b = P.benchmark_stats(bh, rets, port, port)          # a return benchmark: compounded
+        self.assertEqual(b["n_templates_beat_bh"], int(sharpe > compounded))
 
     def test_daily_data_is_unchanged(self):
         idx = pd.bdate_range("2015-01-01", periods=len(self.r))

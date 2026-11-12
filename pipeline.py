@@ -658,15 +658,18 @@ def benchmark_stats(bh_returns: pd.Series, rets: pd.DataFrame, port: dict, neste
     bh = bh_returns.reindex(rets.index).fillna(0.0)
     additive = kind == BENCH_ONE_UNIT
     tpl_sharpes = rets.apply(annualized_sharpe)
+    buy_hold = curve_stats(bh, additive)
     out = dict(
         kind=kind,
         additive=additive,
         returns=bh,
-        buy_hold=curve_stats(bh, additive),
+        buy_hold=buy_hold,
         n_templates=int(rets.shape[1]),
         # a template that never traded has a Sharpe of 0: sitting flat "beats" a losing
-        # benchmark without being evidence of anything, so only templates that traded count
-        n_templates_beat_bh=int(((tpl_sharpes > annualized_sharpe(bh)) & rets.ne(0.0).any()).sum()),
+        # benchmark without being evidence of anything, so only templates that traded count.
+        # Against the reported benchmark Sharpe: a one-unit benchmark's P&L is summed per
+        # session (additive), not compounded like a return
+        n_templates_beat_bh=int(((tpl_sharpes > buy_hold["sharpe"]) & rets.ne(0.0).any()).sum()),
         static=None, nested=None, buy_hold_nested_period=None,
     )
     pr = port["portfolio_returns"]
