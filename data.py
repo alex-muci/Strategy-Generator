@@ -101,6 +101,23 @@ def load_yfinance(
     return as_float64(df)
 
 
+def _stamps(values: pd.Index) -> pd.DatetimeIndex:
+    """Stamps that pandas did not parse to one DatetimeIndex on reading: UTC
+    offsets that differ (a DST change), or stamps that vary in shape
+    (fractional seconds on only some rows, seconds left off some -- what a
+    volume or tick sampler writes). Read as UTC, with the format inferred
+    from the first stamp as before; failing that, as ISO 8601 row by row.
+    Anything else that fails raises the first error, unchanged: a day-first
+    date (13/01/2020) is not guessed at."""
+    try:
+        return pd.DatetimeIndex(pd.to_datetime(values, utc=True), name=values.name)
+    except ValueError as first:
+        try:
+            return pd.DatetimeIndex(pd.to_datetime(values, format="ISO8601", utc=True), name=values.name)
+        except (ValueError, TypeError):
+            raise first from None
+
+
 def load_csv(path: str, interval: str = "1d", min_bars: int = 200, drop_no_trade_rows: bool = True) -> pd.DataFrame:
     """OHLC(V) bars from a local CSV: the first column is the bar's timestamp,
     the others hold Open, High, Low, Close and optionally Volume and Roll
@@ -120,9 +137,10 @@ def load_csv(path: str, interval: str = "1d", min_bars: int = 200, drop_no_trade
     """
     raw = pd.read_csv(path, index_col=0, parse_dates=True)
     if not isinstance(raw.index, pd.DatetimeIndex):
-        # stamps with mixed UTC offsets (a DST change) parse to objects: read
-        # them all as UTC, which `_naive_index` then strips like yfinance's
-        raw.index = pd.to_datetime(raw.index, utc=True)
+        # stamps with mixed UTC offsets (a DST change) or of mixed shapes stay
+        # strings: read them all as UTC, which `_naive_index` then strips like
+        # yfinance's
+        raw.index = _stamps(raw.index)
     by_name = {str(c).strip().lower(): c for c in raw.columns}
     missing = [c for c in ("open", "high", "low", "close") if c not in by_name]
     if missing:

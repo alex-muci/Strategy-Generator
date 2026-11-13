@@ -210,6 +210,38 @@ class CsvLoaderTests(unittest.TestCase):
         self.assertNotIn(self.df.index[30], out.index)
         self.assertEqual(float(out.loc[self.df.index[20], "Close"]), 0.0)
 
+    def _stamped(self, name, stamps):
+        path = os.path.join(self.dir, name)
+        df = self.df.iloc[:len(stamps)].copy()
+        df.index = pd.Index(stamps, name="Datetime")
+        df.to_csv(path, float_format="%.17g")
+        return path
+
+    def test_stamps_of_mixed_shapes_are_read(self):
+        """A volume or tick sampler writes fractional seconds only where it
+        has them (and some tools drop zero seconds): pandas infers one
+        format from the first stamp and the rest fail it."""
+        t = pd.date_range("2023-01-02 14:30", periods=300, freq="37min")
+        frac = t + pd.to_timedelta(np.where(np.arange(300) % 3 == 0, 250, 0), unit="ms")
+        cases = {
+            "fractional on some rows": ([str(x) for x in frac], frac),
+            "seconds on some rows": ([x.strftime("%Y-%m-%d %H:%M" + (":%S" if i % 2 else "")) for i, x in enumerate(t)], t),
+        }
+        ny = pd.date_range("2023-03-01 14:30", periods=300, freq="3h", tz="America/New_York")   # crosses DST
+        ny = ny + pd.to_timedelta(np.where(np.arange(300) % 3 == 0, 250, 0), unit="ms")
+        cases["fractional and a DST change"] = ([x.isoformat() for x in ny], ny.tz_convert("UTC").tz_localize(None))
+        for name, (stamps, want) in cases.items():
+            with self.subTest(name):
+                out = D.load_csv(self._stamped(name.replace(" ", "_") + ".csv", stamps), interval="1h")
+                self.assertIsNone(out.index.tz)
+                self.assertTrue(out.index.equals(pd.DatetimeIndex(want)), out.index[:3])
+                self.assertEqual(len(out), 300)
+
+    def test_a_day_first_date_is_not_guessed_at(self):
+        stamps = [x.strftime("%d/%m/%Y") for x in pd.bdate_range("2020-01-01", periods=300)]
+        with self.assertRaisesRegex(ValueError, "13/01/2020"):
+            D.load_csv(self._stamped("dayfirst.csv", stamps))
+
     def test_columns_match_any_case_and_volume_is_optional(self):
         df = self.df.rename(columns=str.lower).drop(columns="volume")
         df.index.name = "timestamp"
