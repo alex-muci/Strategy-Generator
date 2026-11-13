@@ -21,6 +21,8 @@ Three sources are provided:
 """
 
 from __future__ import annotations
+import re
+import warnings
 import numpy as np
 import pandas as pd
 
@@ -118,6 +120,52 @@ def _stamps(values: pd.Index) -> pd.DatetimeIndex:
             raise first from None
 
 
+# a numeric date with the day and the month in either order: 02.01.2023,
+# 1/2/23, 02-01-2023 14:30 (a year-first or ISO stamp never matches)
+_NUMERIC_DATE = re.compile(r"^\s*(\d{1,2})[./-](\d{1,2})[./-]\d{2,4}(?:\D|$)")
+
+
+def _day_first(stamps: pd.Series, path: str) -> bool:
+    """Whether the numeric dates of a CSV put the day first (European: 13.01.2023)
+    rather than the month (US: 01/13/2023), read off the whole column.
+
+    * a first field above 12 somewhere, and no second one: day first; a
+      second field above 12 and no first one: month first;
+    * every date ambiguous (both fields <= 12): the reading whose stamps run
+      in order and span far less time (a day of bars, not months of jumps);
+    * still ambiguous: month first, pandas' own reading, with a NOTE.
+
+    False for stamps that are not numeric dates: pandas parses those as it
+    always has."""
+    s = stamps.dropna().astype(str)
+    m = s.str.extract(_NUMERIC_DATE)
+    if len(s) == 0 or m[0].isna().any():
+        return False
+    first, second = m[0].astype(int), m[1].astype(int)
+    if (first > 12).any() or (second > 12).any():
+        return bool((first > 12).any() and not (second > 12).any())
+    spans = {}
+    for day_first in (True, False):
+        try:
+            with warnings.catch_warnings():          # "parsing ... when dayfirst=False"
+                warnings.simplefilter("ignore", UserWarning)
+                t = pd.Series(pd.to_datetime(s.to_numpy(), dayfirst=day_first, utc=True))
+        except (ValueError, TypeError):
+            continue
+        steps = t.diff().dropna()
+        if (steps >= pd.Timedelta(0)).all() or (steps <= pd.Timedelta(0)).all():
+            spans[day_first] = t.max() - t.min()
+    if len(spans) == 1:
+        return next(iter(spans))
+    if len(spans) == 2 and spans[True] * 2 <= spans[False]:
+        return True
+    if len(spans) == 2 and spans[False] * 2 <= spans[True]:
+        return False
+    print(f"NOTE: {path}: every date reads both day first and month first (e.g. {s.iloc[0]!r}); "
+          f"reading them month first (US). Write the stamps as ISO 8601 (2023-01-02) to be sure")
+    return False
+
+
 def load_csv(path: str, interval: str = "1d", min_bars: int = 200, drop_no_trade_rows: bool = True) -> pd.DataFrame:
     """OHLC(V) bars from a local CSV: the first column is the bar's timestamp,
     the others hold Open, High, Low, Close and optionally Volume and Roll
@@ -136,6 +184,14 @@ def load_csv(path: str, interval: str = "1d", min_bars: int = 200, drop_no_trade
     of a repeated stamp) and sorted, like `load_yfinance`'s.
     """
     raw = pd.read_csv(path, index_col=0, parse_dates=True)
+    stamps = pd.read_csv(path, usecols=[0], dtype=str).iloc[:, 0].to_numpy()
+    if _day_first(pd.Series(stamps), path):
+        # pandas guesses the order from the first stamp alone: 02.01.2023 as
+        # 1 February, and then every 13.01.2023 fails
+        try:
+            raw.index = pd.DatetimeIndex(pd.to_datetime(stamps, dayfirst=True), name=raw.index.name)
+        except ValueError:                       # UTC offsets that differ (a DST change)
+            raw.index = pd.DatetimeIndex(pd.to_datetime(stamps, dayfirst=True, utc=True), name=raw.index.name)
     if not isinstance(raw.index, pd.DatetimeIndex):
         # stamps with mixed UTC offsets (a DST change) or of mixed shapes stay
         # strings: read them all as UTC, which `_naive_index` then strips like
