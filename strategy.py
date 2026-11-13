@@ -244,7 +244,8 @@ def periods_per_year_for_interval(interval: str, bars_per_day: float | None = No
     most = 24 * 60 / INTRADAY_MINUTES[interval]
     if not 0 < bars_per_day <= most:
         raise ValueError(f"bars_per_day {bars_per_day:g} for {interval} bars: must be in (0, {most:g}] "
-                         "(a day has 24 hours)")
+                         "(a day has 24 hours). Volume or tick bars need none: leave it out and the "
+                         "annualization is read off their stamps")
     return max(1, int(round(TRADING_DAYS_PER_YEAR * bars_per_day)))
 
 
@@ -416,6 +417,29 @@ def infer_annualization(index) -> dict | None:
         return dict(periods_per_year=ppy, sessions_per_year=None, session_cut_minutes=0, annualization="data")
     return dict(periods_per_year=ppy, sessions_per_year=_per_year(pd.DatetimeIndex(sessions)),
                 session_cut_minutes=cut, annualization="data")
+
+
+# below this share of steps at the typical spacing, intraday bars are
+# sampled on activity (volume, tick bars), not on the clock
+_REGULAR_SHARE = 0.5
+
+
+def irregular_bars(index) -> bool:
+    """Whether intraday stamps are sampled on activity (volume, tick, dollar
+    bars) rather than on a clock: fewer than half the steps between bars are
+    the typical one. Clock bars step at their interval but for the overnight
+    gaps, weekends and missing bars. False for daily and coarser bars, and
+    for an index too short to tell."""
+    if not isinstance(index, pd.DatetimeIndex) or len(index) < 3:
+        return False
+    steps = np.diff(_wall_clock(index).sort_values().as_unit("ns").asi8)
+    steps = steps[steps > 0]
+    if len(steps) == 0:
+        return False
+    typical = np.median(steps)
+    if typical >= 86_400 * 10**9:
+        return False
+    return float(np.mean(np.abs(steps - typical) <= 10**9)) < _REGULAR_SHARE    # within a second
 
 
 def annualization_of(c: dict) -> dict:

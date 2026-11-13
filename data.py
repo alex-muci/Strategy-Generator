@@ -134,7 +134,10 @@ def load_csv(path: str, interval: str = "1d", min_bars: int = 200, drop_no_trade
         df["Roll"] = _roll_flags(raw[by_name["roll"]], path)
     # in time order first (a file can be newest-first), then one print per
     # stamp (the last), a roll on any of the duplicates kept with it
-    df = df.set_axis(_naive_index(df.index, interval)).sort_index(kind="stable")
+    # intraday by the interval OR by the stamps: a CSV of volume bars left at
+    # the default '1d' is still put on the UTC clock of intraday bars
+    intraday = _is_intraday(interval) or _stamps_intraday(df.index)
+    df = df.set_axis(_naive_index(df.index, interval, intraday)).sort_index(kind="stable")
     if "Roll" in df.columns:
         df["Roll"] = df["Roll"].groupby(level=0).transform("max")
     df = df[~df.index.duplicated(keep="last")]
@@ -218,7 +221,18 @@ def _is_intraday(interval: str) -> bool:
     return interval.endswith(("m", "h")) and not interval.endswith("mo")
 
 
-def _naive_index(index: pd.Index, interval: str) -> pd.Index:
+def _stamps_intraday(index: pd.Index) -> bool:
+    """Whether stamps are intraday whatever an interval string says: the
+    typical step between them is under a day (bars sampled on activity --
+    volume, tick, dollar bars -- have no interval of their own)."""
+    if not isinstance(index, pd.DatetimeIndex) or len(index) < 3:
+        return False
+    steps = np.diff(index.sort_values().as_unit("ns").asi8)
+    steps = steps[steps > 0]
+    return len(steps) > 0 and float(np.median(steps)) < 86_400 * 1e9
+
+
+def _naive_index(index: pd.Index, interval: str, intraday: bool | None = None) -> pd.Index:
     """The project's one timestamp convention: every index is tz-NAIVE.
 
     * intraday bars: naive UTC (yfinance stamps them in the exchange's zone).
@@ -227,10 +241,15 @@ def _naive_index(index: pd.Index, interval: str) -> pd.Index:
     * daily and longer bars: the exchange-local DATE (Yahoo's own convention
       for them), which `drop_forming_bar` resolves against the exchange's
       closing time.
+
+    `intraday` overrides what `interval` says (`load_csv` reads it off the
+    stamps too).
     """
     if not isinstance(index, pd.DatetimeIndex) or index.tz is None:
         return index
-    if _is_intraday(interval):
+    if intraday is None:
+        intraday = _is_intraday(interval)
+    if intraday:
         return index.tz_convert("UTC").tz_localize(None)
     return index.tz_localize(None)
 

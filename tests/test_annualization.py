@@ -222,6 +222,31 @@ class InferenceTests(unittest.TestCase):
         span_years = (holed[-1] - holed[0]).days / 365.25
         self.assertLess(len(holed) / span_years, 230, "the bars over the span would be fooled by the hole")
 
+    def test_activity_sampled_bars_are_told_from_clock_bars(self):
+        idx, _ = volume_bars("2023-01-01", "2023-06-30")
+        clock = pd.date_range("2022-01-01", "2022-03-01", freq="min")
+        clock = clock.delete(np.random.default_rng(2).choice(len(clock), 2000, replace=False))   # missing bars
+        for name, i, irregular in (("volume bars", idx, True), ("equity hourly", equity_hourly(), False),
+                                   ("futures hourly", futures_hourly(), False),
+                                   ("24/7 hourly", pd.date_range("2021-01-01", "2022-01-01", freq="h"), False),
+                                   ("1m with holes", clock, False),
+                                   ("business days", pd.bdate_range("2015-01-01", "2020-12-31"), False),
+                                   ("too short", idx[:2], False)):
+            with self.subTest(name):
+                self.assertIs(S.irregular_bars(i), irregular)
+
+    def test_activity_sampled_bars_take_no_bars_per_day_nor_the_interval_table(self):
+        idx, _ = volume_bars("2023-01-01", "2023-06-30")
+        with self.assertRaisesRegex(ValueError, "--bars-per-day"):
+            P.annualization_for("1h", 20, idx)
+        with self.assertRaisesRegex(ValueError, "--annualization data"):
+            P.annualization_for("1h", None, idx, mode="interval")
+        self.assertEqual(P.annualization_for("1d", None, idx)["sessions_per_year"],
+                         S.infer_annualization(idx)["sessions_per_year"])
+        # clock bars keep both
+        self.assertEqual(P.annualization_for("1h", 23, futures_hourly())["periods_per_year"], 252 * 23)
+        self.assertEqual(P.annualization_for("1h", None, equity_hourly(), mode="interval")["periods_per_year"], 252 * 7)
+
     def test_too_little_to_measure(self):
         self.assertIsNone(S.infer_annualization(pd.DatetimeIndex(["2020-01-01", "2020-01-02"])))
         self.assertIsNone(S.infer_annualization(pd.RangeIndex(100)))
@@ -365,6 +390,22 @@ class VolumeBarsEndToEndTests(_KeepAnnualization):
     def tearDownClass(cls):
         S.set_annualization(cls._saved_cls)
         shutil.rmtree(cls.dir, ignore_errors=True)
+
+    def test_no_table_mismatch_note_for_activity_sampled_bars(self):
+        self.assertNotIn("bars a year, not the", self.log.getvalue())
+
+    def test_a_tz_aware_csv_of_volume_bars_is_put_on_the_utc_clock(self):
+        from data import load_csv
+        idx, _ = volume_bars("2023-01-02", "2023-03-01", seed=3, lo=10, hi=30)   # one UTC offset: no DST change
+        idx = idx.floor("s").unique()                          # one stamp format in the file
+        df = synthetic_ohlc(n_bars=len(idx), seed=3).set_axis(idx)
+        df.index = df.index.tz_localize("UTC").tz_convert("America/New_York")
+        df.index.name = "Datetime"
+        path = os.path.join(self.dir, "vbars_ny.csv")
+        df.to_csv(path)
+        out = load_csv(path)                                   # the default interval, '1d'
+        self.assertIsNone(out.index.tz)
+        self.assertTrue(out.index.equals(idx), "stamps on naive UTC, not New York wall time")
 
     def test_the_run_annualizes_on_the_data(self):
         import json
