@@ -244,7 +244,8 @@ def periods_per_year_for_interval(interval: str, bars_per_day: float | None = No
     most = 24 * 60 / INTRADAY_MINUTES[interval]
     if not 0 < bars_per_day <= most:
         raise ValueError(f"bars_per_day {bars_per_day:g} for {interval} bars: must be in (0, {most:g}] "
-                         "(a day has 24 hours)")
+                         "(a day has 24 hours). Volume or tick bars need none: leave it out and the "
+                         "annualization is read off their stamps")
     return max(1, int(round(TRADING_DAYS_PER_YEAR * bars_per_day)))
 
 
@@ -320,22 +321,43 @@ def _session_cut(idx: pd.DatetimeIndex) -> int:
     trading (the overnight gap of an equity, the daily break of a future --
     also when daylight saving moves the break by an hour on a UTC clock --
     and the weekend joins Sunday evening to Monday's session). Candidates are
-    every `width` minutes (~ the bar spacing); of the tied best, the middle
-    of the longest run (the middle of an overnight gap). 24/7 data, where
-    every cut ties, is cut at midnight."""
+    every `width` minutes (~ the bar spacing).
+
+    The counts are compared up to a margin (`_near`): a partly covered first
+    or last day, or an outage of a day or more, moves a cut's count by one or
+    two whatever the calendar, and an exact comparison would then pick a cut
+    at random on 24/7 data. Of the cuts with (nearly) the fewest sessions,
+    those that slice the fewest bar-to-bar steps of continuous trading are
+    kept: a daily break on data that trades seven days a week (a crypto
+    venue's maintenance window) leaves every cut one session a day, and only
+    the bars it falls between tell where the break is. Of the best, the
+    middle of the longest run (the middle of an overnight gap). 24/7 data,
+    where every cut ties, is cut at midnight."""
     idx = _wall_clock(idx)
-    gaps = np.diff(idx.as_unit("ns").asi8) / 6e10        # minutes (whatever the index's resolution)
-    gaps = gaps[gaps > 0]
+    ns = idx.as_unit("ns").asi8
+    steps = np.diff(ns) / 6e10                            # minutes (whatever the index's resolution)
+    gaps = steps[steps > 0]
     spacing = float(np.median(gaps)) if len(gaps) else 1440.0
     width = next((w for w in (15, 30, 60, 120, 240) if w >= spacing), 240)
     nb = 1440 // width
-    ns = idx.as_unit("ns").asi8
+    trading = steps <= 1.5 * spacing                      # a step inside continuous trading
     day = 86_400 * 10**9
     n_sessions = np.empty(nb, dtype=np.int64)
+    n_sliced = np.empty(nb, dtype=np.int64)
     for k in range(nb):
         lab = (ns - k * width * 60 * 10**9) // day       # the session's day number
-        n_sessions[k] = 1 + np.count_nonzero(lab[1:] != lab[:-1])
-    low = n_sessions == n_sessions.min()
+        new = lab[1:] != lab[:-1]
+        n_sessions[k] = 1 + np.count_nonzero(new)
+        n_sliced[k] = np.count_nonzero(new & trading)
+    fewest = n_sessions <= n_sessions.min() + _near(n_sessions.min())
+    low = fewest
+    sliced = n_sliced[fewest]
+    # only a break counts: a cut that (almost) never slices trading. On
+    # activity-sampled bars (volume, tick) the steps are irregular and the
+    # quiet hours long, and how many "continuous" steps a cut slices varies
+    # from one cut to the next with no break anywhere
+    if sliced.min() <= _near(int(np.median(sliced))):
+        low = fewest & (n_sliced <= sliced.min() + _near(sliced.min()))
     if low.all():
         return 0
     # longest circular run of the best cuts
@@ -353,6 +375,13 @@ def _session_cut(idx: pd.DatetimeIndex) -> int:
         else:
             run_len = 0
     return int(((best_start + (best_len - 1) // 2) % nb) * width)
+
+
+def _near(count: int) -> int:
+    """The margin two cuts' counts are equal within (`_session_cut`): one, or
+    1 % of the count -- the ends and the outages of the data, against a real
+    calendar's one more session every trading day or every week."""
+    return max(1, int(0.01 * count))
 
 
 def _wall_clock(idx: pd.DatetimeIndex) -> pd.DatetimeIndex:
@@ -388,6 +417,29 @@ def infer_annualization(index) -> dict | None:
         return dict(periods_per_year=ppy, sessions_per_year=None, session_cut_minutes=0, annualization="data")
     return dict(periods_per_year=ppy, sessions_per_year=_per_year(pd.DatetimeIndex(sessions)),
                 session_cut_minutes=cut, annualization="data")
+
+
+# below this share of steps at the typical spacing, intraday bars are
+# sampled on activity (volume, tick bars), not on the clock
+_REGULAR_SHARE = 0.5
+
+
+def irregular_bars(index) -> bool:
+    """Whether intraday stamps are sampled on activity (volume, tick, dollar
+    bars) rather than on a clock: fewer than half the steps between bars are
+    the typical one. Clock bars step at their interval but for the overnight
+    gaps, weekends and missing bars. False for daily and coarser bars, and
+    for an index too short to tell."""
+    if not isinstance(index, pd.DatetimeIndex) or len(index) < 3:
+        return False
+    steps = np.diff(_wall_clock(index).sort_values().as_unit("ns").asi8)
+    steps = steps[steps > 0]
+    if len(steps) == 0:
+        return False
+    typical = np.median(steps)
+    if typical >= 86_400 * 10**9:
+        return False
+    return float(np.mean(np.abs(steps - typical) <= 10**9)) < _REGULAR_SHARE    # within a second
 
 
 def annualization_of(c: dict) -> dict:

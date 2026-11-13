@@ -36,7 +36,7 @@ from robustness import (
 )
 from strategy import (
     annualized_sharpe, max_drawdown, periods_per_year, set_periods_per_year, compound,
-    periods_per_year_for_interval, infer_annualization, annualization_of, set_annualization,
+    periods_per_year_for_interval, infer_annualization, irregular_bars, annualization_of, set_annualization,
     sessions_per_year, session_cut_minutes, current_annualization, session_starts, session_frame, observations_per_year,
     elapsed_years,
     SIDES, HEDGE_SHARE, HEDGE_SHARES, set_hedge_share,
@@ -212,7 +212,19 @@ def annualization_for(interval: str, bars_per_day: float | None = None, index=No
     `bars_per_day`, when given, still sets the bars a year. Mode 'interval',
     no index (the synthetic series, a config built before the data is
     loaded) or an index too short to measure: the interval's table and
-    per-bar statistics, as before the data was asked."""
+    per-bar statistics, as before the data was asked. Bars sampled on
+    activity (`strategy.irregular_bars`) take neither `bars_per_day` nor
+    mode 'interval': ValueError."""
+    if irregular_bars(index):
+        # activity-sampled bars have no interval: neither a count of bars a
+        # day nor the interval's table describes them, only their stamps do
+        if bars_per_day is not None:
+            raise ValueError("the bars are sampled on activity (volume or tick bars: irregular stamps), so "
+                             "there is no fixed count of bars a day; leave --bars-per-day out, the "
+                             "annualization is read off the stamps")
+        if mode == "interval":
+            raise ValueError("the bars are sampled on activity (volume or tick bars: irregular stamps), so "
+                             "the --interval table does not describe them; use --annualization data")
     table = periods_per_year_for_interval(interval, bars_per_day)     # validates both
     out = dict(periods_per_year=table, sessions_per_year=None, session_cut_minutes=0, annualization="interval")
     if mode not in ANNUALIZATION_MODES:
@@ -658,15 +670,18 @@ def benchmark_stats(bh_returns: pd.Series, rets: pd.DataFrame, port: dict, neste
     bh = bh_returns.reindex(rets.index).fillna(0.0)
     additive = kind == BENCH_ONE_UNIT
     tpl_sharpes = rets.apply(annualized_sharpe)
+    buy_hold = curve_stats(bh, additive)
     out = dict(
         kind=kind,
         additive=additive,
         returns=bh,
-        buy_hold=curve_stats(bh, additive),
+        buy_hold=buy_hold,
         n_templates=int(rets.shape[1]),
         # a template that never traded has a Sharpe of 0: sitting flat "beats" a losing
-        # benchmark without being evidence of anything, so only templates that traded count
-        n_templates_beat_bh=int(((tpl_sharpes > annualized_sharpe(bh)) & rets.ne(0.0).any()).sum()),
+        # benchmark without being evidence of anything, so only templates that traded count.
+        # Against the reported benchmark Sharpe: a one-unit benchmark's P&L is summed per
+        # session (additive), not compounded like a return
+        n_templates_beat_bh=int(((tpl_sharpes > buy_hold["sharpe"]) & rets.ne(0.0).any()).sum()),
         static=None, nested=None, buy_hold_nested_period=None,
     )
     pr = port["portfolio_returns"]

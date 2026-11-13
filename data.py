@@ -21,6 +21,8 @@ Three sources are provided:
 """
 
 from __future__ import annotations
+import re
+import warnings
 import numpy as np
 import pandas as pd
 
@@ -101,6 +103,69 @@ def load_yfinance(
     return as_float64(df)
 
 
+def _stamps(values: pd.Index) -> pd.DatetimeIndex:
+    """Stamps that pandas did not parse to one DatetimeIndex on reading: UTC
+    offsets that differ (a DST change), or stamps that vary in shape
+    (fractional seconds on only some rows, seconds left off some -- what a
+    volume or tick sampler writes). Read as UTC, with the format inferred
+    from the first stamp as before; failing that, as ISO 8601 row by row.
+    Anything else that fails raises the first error, unchanged: a day-first
+    date (13/01/2020) is not guessed at."""
+    try:
+        return pd.DatetimeIndex(pd.to_datetime(values, utc=True), name=values.name)
+    except ValueError as first:
+        try:
+            return pd.DatetimeIndex(pd.to_datetime(values, format="ISO8601", utc=True), name=values.name)
+        except (ValueError, TypeError):
+            raise first from None
+
+
+# a numeric date with the day and the month in either order: 02.01.2023,
+# 1/2/23, 02-01-2023 14:30 (a year-first or ISO stamp never matches)
+_NUMERIC_DATE = re.compile(r"^\s*(\d{1,2})[./-](\d{1,2})[./-]\d{2,4}(?:\D|$)")
+
+
+def _day_first(stamps: pd.Series, path: str) -> bool:
+    """Whether the numeric dates of a CSV put the day first (European: 13.01.2023)
+    rather than the month (US: 01/13/2023), read off the whole column.
+
+    * a first field above 12 somewhere, and no second one: day first; a
+      second field above 12 and no first one: month first;
+    * every date ambiguous (both fields <= 12): the reading whose stamps run
+      in order and span far less time (a day of bars, not months of jumps);
+    * still ambiguous: month first, pandas' own reading, with a NOTE.
+
+    False for stamps that are not numeric dates: pandas parses those as it
+    always has."""
+    s = stamps.dropna().astype(str)
+    m = s.str.extract(_NUMERIC_DATE)
+    if len(s) == 0 or m[0].isna().any():
+        return False
+    first, second = m[0].astype(int), m[1].astype(int)
+    if (first > 12).any() or (second > 12).any():
+        return bool((first > 12).any() and not (second > 12).any())
+    spans = {}
+    for day_first in (True, False):
+        try:
+            with warnings.catch_warnings():          # "parsing ... when dayfirst=False"
+                warnings.simplefilter("ignore", UserWarning)
+                t = pd.Series(pd.to_datetime(s.to_numpy(), dayfirst=day_first, utc=True))
+        except (ValueError, TypeError):
+            continue
+        steps = t.diff().dropna()
+        if (steps >= pd.Timedelta(0)).all() or (steps <= pd.Timedelta(0)).all():
+            spans[day_first] = t.max() - t.min()
+    if len(spans) == 1:
+        return next(iter(spans))
+    if len(spans) == 2 and spans[True] * 2 <= spans[False]:
+        return True
+    if len(spans) == 2 and spans[False] * 2 <= spans[True]:
+        return False
+    print(f"NOTE: {path}: every date reads both day first and month first (e.g. {s.iloc[0]!r}); "
+          f"reading them month first (US). Write the stamps as ISO 8601 (2023-01-02) to be sure")
+    return False
+
+
 def load_csv(path: str, interval: str = "1d", min_bars: int = 200, drop_no_trade_rows: bool = True) -> pd.DataFrame:
     """OHLC(V) bars from a local CSV: the first column is the bar's timestamp,
     the others hold Open, High, Low, Close and optionally Volume and Roll
@@ -119,10 +184,19 @@ def load_csv(path: str, interval: str = "1d", min_bars: int = 200, drop_no_trade
     of a repeated stamp) and sorted, like `load_yfinance`'s.
     """
     raw = pd.read_csv(path, index_col=0, parse_dates=True)
+    stamps = pd.read_csv(path, usecols=[0], dtype=str).iloc[:, 0].to_numpy()
+    if _day_first(pd.Series(stamps), path):
+        # pandas guesses the order from the first stamp alone: 02.01.2023 as
+        # 1 February, and then every 13.01.2023 fails
+        try:
+            raw.index = pd.DatetimeIndex(pd.to_datetime(stamps, dayfirst=True), name=raw.index.name)
+        except ValueError:                       # UTC offsets that differ (a DST change)
+            raw.index = pd.DatetimeIndex(pd.to_datetime(stamps, dayfirst=True, utc=True), name=raw.index.name)
     if not isinstance(raw.index, pd.DatetimeIndex):
-        # stamps with mixed UTC offsets (a DST change) parse to objects: read
-        # them all as UTC, which `_naive_index` then strips like yfinance's
-        raw.index = pd.to_datetime(raw.index, utc=True)
+        # stamps with mixed UTC offsets (a DST change) or of mixed shapes stay
+        # strings: read them all as UTC, which `_naive_index` then strips like
+        # yfinance's
+        raw.index = _stamps(raw.index)
     by_name = {str(c).strip().lower(): c for c in raw.columns}
     missing = [c for c in ("open", "high", "low", "close") if c not in by_name]
     if missing:
@@ -134,7 +208,10 @@ def load_csv(path: str, interval: str = "1d", min_bars: int = 200, drop_no_trade
         df["Roll"] = _roll_flags(raw[by_name["roll"]], path)
     # in time order first (a file can be newest-first), then one print per
     # stamp (the last), a roll on any of the duplicates kept with it
-    df = df.set_axis(_naive_index(df.index, interval)).sort_index(kind="stable")
+    # intraday by the interval OR by the stamps: a CSV of volume bars left at
+    # the default '1d' is still put on the UTC clock of intraday bars
+    intraday = _is_intraday(interval) or _stamps_intraday(df.index)
+    df = df.set_axis(_naive_index(df.index, interval, intraday)).sort_index(kind="stable")
     if "Roll" in df.columns:
         df["Roll"] = df["Roll"].groupby(level=0).transform("max")
     df = df[~df.index.duplicated(keep="last")]
@@ -218,7 +295,18 @@ def _is_intraday(interval: str) -> bool:
     return interval.endswith(("m", "h")) and not interval.endswith("mo")
 
 
-def _naive_index(index: pd.Index, interval: str) -> pd.Index:
+def _stamps_intraday(index: pd.Index) -> bool:
+    """Whether stamps are intraday whatever an interval string says: the
+    typical step between them is under a day (bars sampled on activity --
+    volume, tick, dollar bars -- have no interval of their own)."""
+    if not isinstance(index, pd.DatetimeIndex) or len(index) < 3:
+        return False
+    steps = np.diff(index.sort_values().as_unit("ns").asi8)
+    steps = steps[steps > 0]
+    return len(steps) > 0 and float(np.median(steps)) < 86_400 * 1e9
+
+
+def _naive_index(index: pd.Index, interval: str, intraday: bool | None = None) -> pd.Index:
     """The project's one timestamp convention: every index is tz-NAIVE.
 
     * intraday bars: naive UTC (yfinance stamps them in the exchange's zone).
@@ -227,10 +315,15 @@ def _naive_index(index: pd.Index, interval: str) -> pd.Index:
     * daily and longer bars: the exchange-local DATE (Yahoo's own convention
       for them), which `drop_forming_bar` resolves against the exchange's
       closing time.
+
+    `intraday` overrides what `interval` says (`load_csv` reads it off the
+    stamps too).
     """
     if not isinstance(index, pd.DatetimeIndex) or index.tz is None:
         return index
-    if _is_intraday(interval):
+    if intraday is None:
+        intraday = _is_intraday(interval)
+    if intraday:
         return index.tz_convert("UTC").tz_localize(None)
     return index.tz_localize(None)
 

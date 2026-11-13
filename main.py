@@ -54,7 +54,7 @@ from portfolio import returns_frame
 from replay import save_run, replay_run, TARGETS as REPLAY_TARGETS
 from strategy import (annualized_sharpe, max_drawdown, periods_per_year, compound, BARS_PER_YEAR, validate_instrument,
                       instrument_warnings, typical_units, set_annualization, set_hedge_share,
-                      RESEARCH_EQUITY)
+                      irregular_bars, RESEARCH_EQUITY)
 
 
 def parse_args(argv=None):
@@ -139,7 +139,10 @@ def main(argv=None) -> dict:
         df = synthetic_ohlc(n_bars=args.bars, seed=args.seed, trend_prob=args.trend_prob, trend_drift=args.trend_drift)
     # the annualization is read off the bars themselves (pipeline.annualization_for);
     # the synthetic series is daily by construction, whatever its calendar says
-    cfg = eval_config(args, interval, index=None if synthetic else df.index) | dict(instrument_map=instrument_map)
+    try:
+        cfg = eval_config(args, interval, index=None if synthetic else df.index) | dict(instrument_map=instrument_map)
+    except ValueError as e:
+        raise SystemExit(str(e))
     set_annualization(cfg)   # before anything here annualizes (the pool re-sets it)
     set_hedge_share(cfg["hedge_share"])
     print(f"Data: {len(df)} bars, {df.index[0].date()} to {df.index[-1].date()}, {annualization_text(cfg)}")
@@ -148,7 +151,7 @@ def main(argv=None) -> dict:
         print(note)
     table = BARS_PER_YEAR.get(interval)
     if cfg.get("annualization") == "data" and args.bars_per_day is None and table \
-            and not 0.75 <= cfg["periods_per_year"] / table <= 1.33:
+            and not irregular_bars(df.index) and not 0.75 <= cfg["periods_per_year"] / table <= 1.33:
         print(f"NOTE: the data holds {cfg['periods_per_year']} bars a year, not the {table} of a US-equity "
               f"'{interval}' session (activity-sampled bars, a longer session, or gaps): annualizing at the "
               f"data's own count (--annualization interval for the table)")

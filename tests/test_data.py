@@ -11,6 +11,8 @@ Run with:  python -m unittest discover -s tests -v
 
 from __future__ import annotations
 import os
+import contextlib
+import io
 import sys
 import unittest
 
@@ -209,6 +211,68 @@ class CsvLoaderTests(unittest.TestCase):
         self.assertNotIn(self.df.index[10], out.index)
         self.assertNotIn(self.df.index[30], out.index)
         self.assertEqual(float(out.loc[self.df.index[20], "Close"]), 0.0)
+
+    def _stamped(self, name, stamps):
+        path = os.path.join(self.dir, name)
+        df = self.df.iloc[:len(stamps)].copy()
+        df.index = pd.Index(stamps, name="Datetime")
+        df.to_csv(path, float_format="%.17g")
+        return path
+
+    def test_stamps_of_mixed_shapes_are_read(self):
+        """A volume or tick sampler writes fractional seconds only where it
+        has them (and some tools drop zero seconds): pandas infers one
+        format from the first stamp and the rest fail it."""
+        t = pd.date_range("2023-01-02 14:30", periods=300, freq="37min")
+        frac = t + pd.to_timedelta(np.where(np.arange(300) % 3 == 0, 250, 0), unit="ms")
+        cases = {
+            "fractional on some rows": ([str(x) for x in frac], frac),
+            "seconds on some rows": ([x.strftime("%Y-%m-%d %H:%M" + (":%S" if i % 2 else "")) for i, x in enumerate(t)], t),
+        }
+        ny = pd.date_range("2023-03-01 14:30", periods=300, freq="3h", tz="America/New_York")   # crosses DST
+        ny = ny + pd.to_timedelta(np.where(np.arange(300) % 3 == 0, 250, 0), unit="ms")
+        cases["fractional and a DST change"] = ([x.isoformat() for x in ny], ny.tz_convert("UTC").tz_localize(None))
+        for name, (stamps, want) in cases.items():
+            with self.subTest(name):
+                out = D.load_csv(self._stamped(name.replace(" ", "_") + ".csv", stamps), interval="1h")
+                self.assertIsNone(out.index.tz)
+                self.assertTrue(out.index.equals(pd.DatetimeIndex(want)), out.index[:3])
+                self.assertEqual(len(out), 300)
+
+    def test_day_first_and_month_first_dates_are_told_apart(self):
+        """pandas reads the order of day and month off the first stamp alone:
+        02.01.2023 as 1 February, after which a 13.01.2023 fails. The whole
+        column says which it is: a field above 12, else the reading whose
+        stamps run in order over the shorter span."""
+        days = pd.bdate_range("2020-01-01", periods=300)
+        bars = pd.date_range("2023-03-02 09:00", periods=300, freq="5min")     # every date ambiguous
+        berlin = pd.date_range("2023-03-01 14:30", periods=300, freq="3h", tz="Europe/Berlin")
+        cases = {
+            "d/m/Y": ([x.strftime("%d/%m/%Y") for x in days], days),
+            "d.m.Y H:M, every date ambiguous": ([x.strftime("%d.%m.%Y %H:%M") for x in bars], bars),
+            "d/m/Y with a DST change": ([x.strftime("%d/%m/%Y %H:%M:%S%z") for x in berlin],
+                                        berlin.tz_convert("UTC").tz_localize(None)),
+            "m/d/Y": ([x.strftime("%m/%d/%Y") for x in days], days),
+            "m/d/y H:M": ([x.strftime("%m/%d/%y %H:%M") for x in bars], bars),
+        }
+        for name, (stamps, want) in cases.items():
+            with self.subTest(name):
+                out = D.load_csv(self._stamped("order.csv", stamps), interval="1h")
+                self.assertTrue(out.index.equals(pd.DatetimeIndex(want)), out.index[:3])
+
+    def test_dates_that_read_both_ways_are_read_month_first_with_a_note(self):
+        bars = pd.date_range("2023-01-02 00:00", periods=300, freq="4min")    # one day: either reading fits
+        log = io.StringIO()
+        with contextlib.redirect_stdout(log):
+            out = D.load_csv(self._stamped("oneday.csv", [x.strftime("%m/%d/%Y %H:%M") for x in bars]), interval="1h")
+        self.assertTrue(out.index.equals(bars))
+        self.assertIn("month first", log.getvalue())
+
+    def test_inconsistent_dates_still_fail(self):
+        stamps = [x.strftime("%d/%m/%Y") for x in pd.bdate_range("2020-01-01", periods=150)] \
+            + [x.strftime("%m/%d/%Y") for x in pd.bdate_range("2021-01-01", periods=150)]
+        with self.assertRaises(ValueError):
+            D.load_csv(self._stamped("mixed_order.csv", stamps))
 
     def test_columns_match_any_case_and_volume_is_optional(self):
         df = self.df.rename(columns=str.lower).drop(columns="volume")

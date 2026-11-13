@@ -311,7 +311,11 @@ def research(args) -> dict:
     # the annualization is read off the shared bars (pipeline.annualization_for);
     # the synthetic series is daily by construction
     shared_index = None if args.synthetic else next(iter(data.values())).index
-    cfg = eval_config(args, args.interval, index=shared_index) | dict(
+    try:
+        annualization = eval_config(args, args.interval, index=shared_index)
+    except ValueError as e:
+        raise SystemExit(str(e))
+    cfg = annualization | dict(
         start=args.start, family=args.family, sides=args.sides,
         sides_map={a: list(s) for a, s in sides_map.items()}, portfolio_vol=args.portfolio_vol,
         instrument_map=instrument_map, asset_sources=sources,
