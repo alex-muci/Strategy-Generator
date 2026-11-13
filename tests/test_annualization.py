@@ -174,6 +174,21 @@ class InferenceTests(unittest.TestCase):
             with self.subTest(name):
                 self.assertEqual(S._session_cut(idx), 0)
 
+    def test_24_7_volume_bars_are_cut_at_midnight(self):
+        """Activity-sampled bars of a 24/7 market: irregular steps, quieter
+        hours, busier days. No hour is a break, so the cut stays at midnight
+        rather than wandering with the noise of the steps."""
+        rng = np.random.default_rng(3)
+        for season in (0.0, 0.5, 0.8):
+            stamps = []
+            for d in pd.date_range("2022-01-01", periods=730, freq="D"):
+                busy = np.exp(rng.normal(0, 0.5))
+                for h in range(24):
+                    k = rng.poisson(60 / 24 * busy * (1 + season * np.cos(2 * np.pi * (h - 15) / 24)))
+                    stamps += list(d + pd.Timedelta(hours=h) + pd.to_timedelta(np.sort(rng.uniform(0, 60, k)), unit="min"))
+            with self.subTest(season=season):
+                self.assertEqual(S._session_cut(pd.DatetimeIndex(stamps)), 0)
+
     def test_a_daily_break_on_seven_day_data_is_found(self):
         idx = pd.date_range("2022-01-01", "2023-12-31", freq="15min")
         idx = idx[idx.hour != 3]                                  # an hour's maintenance at 03:00

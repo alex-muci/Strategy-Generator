@@ -349,8 +349,14 @@ def _session_cut(idx: pd.DatetimeIndex) -> int:
         n_sessions[k] = 1 + np.count_nonzero(new)
         n_sliced[k] = np.count_nonzero(new & trading)
     fewest = n_sessions <= n_sessions.min() + _near(n_sessions.min())
-    sliced = np.where(fewest, n_sliced, np.iinfo(np.int64).max)
-    low = fewest & (sliced <= sliced.min() + _near(sliced.min()))
+    low = fewest
+    sliced = n_sliced[fewest]
+    # only a break counts: a cut that (almost) never slices trading. On
+    # activity-sampled bars (volume, tick) the steps are irregular and the
+    # quiet hours long, and how many "continuous" steps a cut slices varies
+    # from one cut to the next with no break anywhere
+    if sliced.min() <= _near(int(np.median(sliced))):
+        low = fewest & (n_sliced <= sliced.min() + _near(sliced.min()))
     if low.all():
         return 0
     # longest circular run of the best cuts
